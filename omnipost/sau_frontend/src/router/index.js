@@ -4,6 +4,7 @@ import PublishHistory from '../views/PublishHistory.vue'
 import AccountManagement from '../views/AccountManagement.vue'
 import MaterialManagement from '../views/MaterialManagement.vue'
 import DataCenter from '../views/DataCenter.vue'
+import KnowledgeBase from '../views/KnowledgeBase.vue'
 import About from '../views/About.vue'
 
 const routes = [
@@ -30,6 +31,11 @@ const routes = [
     path: '/material-management',
     name: 'MaterialManagement',
     component: MaterialManagement
+  },
+  {
+    path: '/knowledge-base',
+    name: 'KnowledgeBase',
+    component: KnowledgeBase
   },
   {
     path: '/data-center',

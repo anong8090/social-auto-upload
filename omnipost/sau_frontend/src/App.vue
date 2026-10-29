@@ -28,6 +28,10 @@
               <el-icon><User /></el-icon>
               <span>账号管理</span>
             </el-menu-item>
+            <el-menu-item index="/knowledge-base">
+              <el-icon><Folder /></el-icon>
+              <span>知识库</span>
+            </el-menu-item>
           </el-menu>
         </div>
       </el-aside>
@@ -54,7 +58,7 @@
 import { ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  User, Upload, Tickets, Fold
+  User, Upload, Tickets, Fold, Folder
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
