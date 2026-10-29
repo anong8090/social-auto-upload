@@ -80,7 +80,12 @@ async def douyin_cookie_gen(id,status_queue):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            print("监听页面跳转成功，等待会话与 Cookie 完全落定...")
+            await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             print("监听页面跳转超时")
             await page.close()
@@ -106,12 +111,22 @@ async def douyin_cookie_gen(id,status_queue):
         await browser.close()
         with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                                INSERT INTO user_info (type, filePath, userName, status)
-                                VALUES (?, ?, ?, ?)
-                                ''', (3, f"{uuid_v1}.json", id, 1))
+            cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 3", (id,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                    (f"{uuid_v1}.json", existing[0])
+                )
+                print(f"✅ 已更新已有抖音用户: id={existing[0]}, userName={id}")
+            else:
+                cursor.execute(
+                    "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                    (3, f"{uuid_v1}.json", id)
+                )
+                print(f"✅ 新增抖音用户: userName={id}")
             conn.commit()
-            print("✅ 用户状态已记录")
+            print("✅ 抖音用户状态已记录")
         status_queue.put("200")
 
 
@@ -263,7 +278,12 @@ async def get_ks_cookie(id,status_queue):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            print("监听页面跳转成功，等待会话与 Cookie 完全落定...")
+            await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             status_queue.put("500")
             print("监听页面跳转超时")
@@ -290,12 +310,22 @@ async def get_ks_cookie(id,status_queue):
 
         with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                                        INSERT INTO user_info (type, filePath, userName, status)
-                                        VALUES (?, ?, ?, ?)
-                                        ''', (4, f"{uuid_v1}.json", id, 1))
+            cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 4", (id,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                    (f"{uuid_v1}.json", existing[0])
+                )
+                print(f"✅ 已更新已有快手用户: id={existing[0]}, userName={id}")
+            else:
+                cursor.execute(
+                    "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                    (4, f"{uuid_v1}.json", id)
+                )
+                print(f"✅ 新增快手用户: userName={id}")
             conn.commit()
-            print("✅ 用户状态已记录")
+            print("✅ 快手用户状态已记录")
         status_queue.put("200")
 
 # 小红书登录
@@ -343,7 +373,12 @@ async def xiaohongshu_cookie_gen(id,status_queue):
         try:
             # 等待 URL 变化或超时
             await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
-            print("监听页面跳转成功")
+            print("监听页面跳转成功，等待会话与 Cookie 完全落定...")
+            await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             status_queue.put("500")
             print("监听页面跳转超时")
@@ -370,12 +405,22 @@ async def xiaohongshu_cookie_gen(id,status_queue):
 
         with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                           INSERT INTO user_info (type, filePath, userName, status)
-                           VALUES (?, ?, ?, ?)
-                           ''', (1, f"{uuid_v1}.json", id, 1))
+            cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 1", (id,))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                    (f"{uuid_v1}.json", existing[0])
+                )
+                print(f"✅ 已更新已有小红书用户状态: id={existing[0]}, userName={id}")
+            else:
+                cursor.execute('''
+                               INSERT INTO user_info (type, filePath, userName, status)
+                               VALUES (?, ?, ?, 1)
+                               ''', (1, f"{uuid_v1}.json", id))
+                print(f"✅ 新增小红书用户状态已记录: userName={id}")
             conn.commit()
-            print("✅ 用户状态已记录")
+            print("✅ 小红书用户状态已记录")
         status_queue.put("200")
 
 # 百家号登录（手动登录，非二维码）
@@ -405,6 +450,11 @@ async def baijiahao_cookie_gen(id, status_queue):
                     timeout=200_000,
                 )
                 print("✅ 百家号登录成功，检测到页面跳转")
+                await page.wait_for_timeout(3500)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 print("❌ 百家号登录超时")
                 status_queue.put("500")
@@ -422,10 +472,20 @@ async def baijiahao_cookie_gen(id, status_queue):
 
             with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                ''', (5, f"{uuid_v1}.json", id, 1 if result else 0))
+                cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 5", (id,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                        (f"{uuid_v1}.json", existing[0])
+                    )
+                    print(f"✅ 已更新已有百家号用户: id={existing[0]}, userName={id}")
+                else:
+                    cursor.execute(
+                        "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                        (5, f"{uuid_v1}.json", id)
+                    )
+                    print(f"✅ 新增百家号用户: userName={id}")
                 conn.commit()
                 print("✅ 百家号用户状态已记录")
             status_queue.put("200")
@@ -485,6 +545,11 @@ async def toutiao_cookie_gen(id, status_queue):
                     timeout=200_000,
                 )
                 print("✅ 今日头条登录成功，检测到进入创作者后台")
+                await page.wait_for_timeout(3500)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 print("❌ 今日头条登录超时")
                 status_queue.put("500")
@@ -503,10 +568,20 @@ async def toutiao_cookie_gen(id, status_queue):
 
             with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                ''', (7, f"{uuid_v1}.json", id, 1 if result else 0))
+                cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 7", (id,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                        (f"{uuid_v1}.json", existing[0])
+                    )
+                    print(f"✅ 已更新已有今日头条用户: id={existing[0]}, userName={id}")
+                else:
+                    cursor.execute(
+                        "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                        (7, f"{uuid_v1}.json", id)
+                    )
+                    print(f"✅ 新增今日头条用户: userName={id}")
                 conn.commit()
                 print("✅ 今日头条用户状态已记录")
             status_queue.put("200")
@@ -566,6 +641,11 @@ async def sohu_cookie_gen(id, status_queue):
                     timeout=200_000,
                 )
                 print("✅ 搜狐号登录成功，检测到进入创作者后台")
+                await page.wait_for_timeout(3500)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 print("❌ 搜狐号登录超时")
                 status_queue.put("500")
@@ -583,10 +663,20 @@ async def sohu_cookie_gen(id, status_queue):
 
             with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                ''', (8, f"{uuid_v1}.json", id, 1 if result else 0))
+                cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 8", (id,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                        (f"{uuid_v1}.json", existing[0])
+                    )
+                    print(f"✅ 已更新已有搜狐号用户: id={existing[0]}, userName={id}")
+                else:
+                    cursor.execute(
+                        "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                        (8, f"{uuid_v1}.json", id)
+                    )
+                    print(f"✅ 新增搜狐号用户: userName={id}")
                 conn.commit()
                 print("✅ 搜狐号用户状态已记录")
             status_queue.put("200")
@@ -644,6 +734,11 @@ async def zhihu_cookie_gen(id, status_queue):
                 status_queue.put("500")
                 return None
             print("✅ 知乎登录成功，已检测到 z_c0")
+            await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
 
             uuid_v1 = uuid.uuid1()
             print(f"UUID v1: {uuid_v1}")
@@ -657,10 +752,20 @@ async def zhihu_cookie_gen(id, status_queue):
 
             with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                ''', (9, f"{uuid_v1}.json", id, 1 if result else 0))
+                cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 9", (id,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                        (f"{uuid_v1}.json", existing[0])
+                    )
+                    print(f"✅ 已更新已有知乎用户: id={existing[0]}, userName={id}")
+                else:
+                    cursor.execute(
+                        "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                        (9, f"{uuid_v1}.json", id)
+                    )
+                    print(f"✅ 新增知乎用户: userName={id}")
                 conn.commit()
                 print("✅ 知乎用户状态已记录")
             status_queue.put("200")
@@ -800,6 +905,11 @@ async def tieba_cookie_gen(id, status_queue):
                 status_queue.put("500")
                 return None
             print("✅ 百度贴吧登录成功，已检测到 BDUSS 等登录凭证")
+            await page.wait_for_timeout(3500)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
 
             uuid_v1 = uuid.uuid1()
             print(f"UUID v1: {uuid_v1}")
@@ -813,10 +923,20 @@ async def tieba_cookie_gen(id, status_queue):
 
             with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO user_info (type, filePath, userName, status)
-                    VALUES (?, ?, ?, ?)
-                ''', (10, f"{uuid_v1}.json", id, 1 if result else 0))
+                cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = 10", (id,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                        (f"{uuid_v1}.json", existing[0])
+                    )
+                    print(f"✅ 已更新已有百度贴吧用户: id={existing[0]}, userName={id}")
+                else:
+                    cursor.execute(
+                        "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                        (10, f"{uuid_v1}.json", id)
+                    )
+                    print(f"✅ 新增百度贴吧用户: userName={id}")
                 conn.commit()
                 print("✅ 百度贴吧用户状态已记录")
             status_queue.put("200")

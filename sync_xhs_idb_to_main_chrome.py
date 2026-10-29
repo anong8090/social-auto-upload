@@ -54,12 +54,26 @@ async def dump_profile_image_drafts() -> list[dict]:
                 req.onsuccess = () => res(req.result);
                 req.onerror = () => rej(req.error);
             });
-            const tx = db.transaction('image-draft', 'readonly');
+            const tx = db.transaction('image-draft', 'readwrite');
             const store = tx.objectStore('image-draft');
             const vals = await new Promise((res) => {
                 const r = store.getAll();
                 r.onsuccess = () => res(r.result || []);
             });
+            // 确保只保留最新的一篇草稿，彻底防止历史已发布草稿重复录入
+            if (vals.length > 1) {
+                vals.sort((a, b) => {
+                    const ta = a.timeStamp || a.content?.draftStore?.updateTime || a.updateTime || a.createTime || 0;
+                    const tb = b.timeStamp || b.content?.draftStore?.updateTime || b.updateTime || b.createTime || 0;
+                    return ta - tb;
+                });
+                const latest = vals[vals.length - 1];
+                store.clear();
+                store.put(latest);
+                await new Promise((res) => { tx.oncomplete = () => res(true); });
+                db.close();
+                return [latest];
+            }
             db.close();
             return vals;
         }''')
