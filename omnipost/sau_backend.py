@@ -2088,5 +2088,494 @@ def sse_stream(status_queue):
             # 避免 CPU 占满
             time.sleep(0.1)
 
+
+# =====================================================================
+# 多产品知识库泛化 API（Step 1 & Step 2：产品与知识库 CRUD）
+# =====================================================================
+
+def _dict_from_row(row, cursor):
+    """将 sqlite Row 转成 dict。"""
+    if row is None:
+        return None
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+
+@app.route('/api/products', methods=['GET'])
+def list_products():
+    """列出所有产品。"""
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM products ORDER BY id DESC")
+            rows = cur.fetchall()
+            data = [dict(r) for r in rows]
+        return jsonify({"code": 200, "msg": "success", "data": data})
+    except Exception as e:
+        print(f"列出产品失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"列出产品失败: {e}", "data": None}), 500
+
+
+@app.route('/api/products', methods=['POST'])
+def create_product():
+    """创建产品。"""
+    try:
+        data = request.get_json() or {}
+        name = (data.get('name') or '').strip()
+        if not name:
+            return jsonify({"code": 400, "msg": "产品名称不能为空", "data": None}), 400
+        description = data.get('description') or ''
+        logo_path = data.get('logo_path') or ''
+        brand_color = data.get('brand_color') or ''
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO products (name, description, logo_path, brand_color, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))",
+                (name, description, logo_path, brand_color),
+            )
+            conn.commit()
+            pid = cur.lastrowid
+        return jsonify({"code": 200, "msg": "产品创建成功", "data": {"id": pid}})
+    except Exception as e:
+        print(f"创建产品失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"创建产品失败: {e}", "data": None}), 500
+
+
+@app.route('/api/products/<int:product_id>', methods=['GET'])
+def get_product(product_id):
+    """获取产品详情。"""
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"code": 404, "msg": "产品不存在", "data": None}), 404
+        return jsonify({"code": 200, "msg": "success", "data": dict(row)})
+    except Exception as e:
+        print(f"获取产品失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"获取产品失败: {e}", "data": None}), 500
+
+
+@app.route('/api/products/<int:product_id>', methods=['PUT'])
+def update_product(product_id):
+    """更新产品。"""
+    try:
+        data = request.get_json() or {}
+        fields = []
+        values = []
+        for key in ('name', 'description', 'logo_path', 'brand_color'):
+            if key in data:
+                fields.append(f"{key} = ?")
+                values.append(data.get(key) or '')
+        if not fields:
+            return jsonify({"code": 400, "msg": "没有可更新的字段", "data": None}), 400
+        fields.append("updated_at = datetime('now', 'localtime')")
+        values.append(product_id)
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute(f"UPDATE products SET {', '.join(fields)} WHERE id = ?", values)
+            if cur.rowcount == 0:
+                return jsonify({"code": 404, "msg": "产品不存在", "data": None}), 404
+            conn.commit()
+        return jsonify({"code": 200, "msg": "产品更新成功", "data": None})
+    except Exception as e:
+        print(f"更新产品失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"更新产品失败: {e}", "data": None}), 500
+
+
+@app.route('/api/products/<int:product_id>', methods=['DELETE'])
+def delete_product(product_id):
+    """删除产品及其下的知识库条目。"""
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM knowledge_base WHERE product_id = ?", (product_id,))
+            cur.execute("DELETE FROM products WHERE id = ?", (product_id,))
+            if cur.rowcount == 0:
+                return jsonify({"code": 404, "msg": "产品不存在", "data": None}), 404
+            conn.commit()
+        return jsonify({"code": 200, "msg": "产品已删除", "data": None})
+    except Exception as e:
+        print(f"删除产品失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"删除产品失败: {e}", "data": None}), 500
+
+
+@app.route('/api/knowledge-base', methods=['GET'])
+def list_knowledge_base():
+    """列出知识库条目，支持 ?product_id= 过滤。"""
+    try:
+        product_id = request.args.get('product_id')
+        with sqlite3.connect(_db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if product_id and str(product_id).isdigit():
+                cur.execute(
+                    "SELECT * FROM knowledge_base WHERE product_id = ? ORDER BY id DESC",
+                    (int(product_id),),
+                )
+            else:
+                cur.execute("SELECT * FROM knowledge_base ORDER BY id DESC")
+            rows = cur.fetchall()
+            data = [dict(r) for r in rows]
+        return jsonify({"code": 200, "msg": "success", "data": data})
+    except Exception as e:
+        print(f"列出知识库失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"列出知识库失败: {e}", "data": None}), 500
+
+
+@app.route('/api/knowledge-base', methods=['POST'])
+def create_knowledge_base():
+    """创建知识库条目。"""
+    try:
+        data = request.get_json() or {}
+        product_id = data.get('product_id')
+        if not product_id or not str(product_id).isdigit():
+            return jsonify({"code": 400, "msg": "product_id 不能为空", "data": None}), 400
+        title = (data.get('title') or '').strip()
+        if not title:
+            return jsonify({"code": 400, "msg": "条目标题不能为空", "data": None}), 400
+        content = data.get('content') or ''
+        pain_points = data.get('pain_points') or ''
+        solutions = data.get('solutions') or ''
+        tags = data.get('tags') or ''
+        file_paths = data.get('file_paths') or ''
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO knowledge_base "
+                "(product_id, title, content, pain_points, solutions, tags, file_paths, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))",
+                (int(product_id), title, content, pain_points, solutions, tags, file_paths),
+            )
+            conn.commit()
+            kb_id = cur.lastrowid
+        return jsonify({"code": 200, "msg": "知识库条目创建成功", "data": {"id": kb_id}})
+    except Exception as e:
+        print(f"创建知识库条目失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"创建知识库条目失败: {e}", "data": None}), 500
+
+
+@app.route('/api/knowledge-base/<int:kb_id>', methods=['GET'])
+def get_knowledge_base(kb_id):
+    """获取知识库条目详情。"""
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM knowledge_base WHERE id = ?", (kb_id,))
+            row = cur.fetchone()
+        if not row:
+            return jsonify({"code": 404, "msg": "知识库条目不存在", "data": None}), 404
+        return jsonify({"code": 200, "msg": "success", "data": dict(row)})
+    except Exception as e:
+        print(f"获取知识库条目失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"获取知识库条目失败: {e}", "data": None}), 500
+
+
+@app.route('/api/knowledge-base/<int:kb_id>', methods=['PUT'])
+def update_knowledge_base(kb_id):
+    """更新知识库条目。"""
+    try:
+        data = request.get_json() or {}
+        fields = []
+        values = []
+        for key in ('title', 'content', 'pain_points', 'solutions', 'tags', 'file_paths'):
+            if key in data:
+                fields.append(f"{key} = ?")
+                values.append(data.get(key) or '')
+        if 'product_id' in data:
+            fields.append("product_id = ?")
+            values.append(int(data.get('product_id')))
+        if not fields:
+            return jsonify({"code": 400, "msg": "没有可更新的字段", "data": None}), 400
+        fields.append("updated_at = datetime('now', 'localtime')")
+        values.append(kb_id)
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute(f"UPDATE knowledge_base SET {', '.join(fields)} WHERE id = ?", values)
+            if cur.rowcount == 0:
+                return jsonify({"code": 404, "msg": "知识库条目不存在", "data": None}), 404
+            conn.commit()
+        return jsonify({"code": 200, "msg": "知识库条目更新成功", "data": None})
+    except Exception as e:
+        print(f"更新知识库条目失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"更新知识库条目失败: {e}", "data": None}), 500
+
+
+@app.route('/api/knowledge-base/<int:kb_id>', methods=['DELETE'])
+def delete_knowledge_base(kb_id):
+    """删除知识库条目。"""
+    try:
+        with sqlite3.connect(_db_path()) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM knowledge_base WHERE id = ?", (kb_id,))
+            if cur.rowcount == 0:
+                return jsonify({"code": 404, "msg": "知识库条目不存在", "data": None}), 404
+            conn.commit()
+        return jsonify({"code": 200, "msg": "知识库条目已删除", "data": None})
+    except Exception as e:
+        print(f"删除知识库条目失败: {e}", flush=True)
+        return jsonify({"code": 500, "msg": f"删除知识库条目失败: {e}", "data": None}), 500
+
+
+# =====================================================================
+# Step 3：知识库内容生成 + 合规自检（模板优先，可选 LLM 增强）
+# =====================================================================
+
+# 合规红线词（与 AGENTS.md 一致，零容忍）
+_FORBIDDEN_WORDS = [
+    "15天免费试点", "免费试跑", "免费领", "私信领资料", "加微信",
+    "扫码体验", "点击链接", "www.ricent.com",
+    "国家级", "第一", "唯一", "100%零失误", "全网最强",
+]
+
+
+def _compliance_check(text: str) -> dict:
+    """检查文本是否包含违规词，返回 {passed: bool, hits: [words]}。"""
+    hits = [w for w in _FORBIDDEN_WORDS if w in text]
+    return {"passed": len(hits) == 0, "hits": hits}
+
+
+def _build_kb_prompt(kb: dict) -> dict:
+    """从知识库条目提取用于生成文案的关键字段。"""
+    return {
+        "title": kb.get("title") or "",
+        "content": kb.get("content") or "",
+        "pain_points": kb.get("pain_points") or "",
+        "solutions": kb.get("solutions") or "",
+        "tags": kb.get("tags") or "",
+    }
+
+
+def _gen_xhs_motherboard(kb: dict) -> dict:
+    """母本 A：小红书短图文（300~500 字，标题 ≤20 字，5 个话题标签）。"""
+    product_hint = kb.get("title") or "该产品"
+    title = f"{product_hint}现场避坑指南"
+    title = title[:20]
+    body = (
+        f"🔍 为什么会翻车\n"
+        f"1. {kb.get('pain_points') or '现场问题多，找不到根因'}。\n"
+        f"2. 传统方式对比低效，耽误施工进度。\n"
+        f"3. 资料交接不清晰，返工率高。\n\n"
+        f"💡 {product_hint} 怎么破局\n"
+        f"✅ {kb.get('solutions') or '云端协同，版本自动对比'}。\n"
+        f"✅ 实时同步，现场即看即用。\n"
+        f"✅ 一键生成报告，交接更清晰。\n\n"
+        f"📌 现场避坑建议\n"
+        f"入场前先同步最新图纸版本，重点节点拍照存档，问题现场记录。\n\n"
+        f"#{kb.get('tags') or '工地' } #看图 #效率 #避坑 #蓝枢"
+    )
+    return {"title": title, "body": body, "hashtags": 5}
+
+
+def _gen_long_motherboard(kb: dict) -> dict:
+    """母本 B：四平台精炼长文（800~1100 字，含 2 个 H2 小标题，2 张 16:9 内文图占位）。"""
+    product_hint = kb.get("title") or "该产品"
+    title = f"{product_hint} 现场痛点与解决方案"
+    title = title[:35]
+    body = (
+        f"## 一、一线痛点场景\n\n"
+        f"工程现场最头疼的莫过于图纸版本混乱。{kb.get('pain_points') or '资料员每天花大量时间手工对比图纸，却仍容易漏掉关键变更。'}\n\n"
+        f"## 二、根因拆解\n\n"
+        f"1. 图纸分散在多个渠道，没有统一版本入口。\n"
+        f"2. 变更通知不及时，现场按旧图施工返工。\n"
+        f"3. 交接记录不完整，责任界定困难。\n\n"
+        f"[16:9 内文图 1：原理或痛点对比]\n\n"
+        f"## 三、{product_hint} 解决机制与实操建议\n\n"
+        f"{kb.get('solutions') or '蓝枢提供云端看图与自动版本对比，现场扫码即看最新图纸。'}\n\n"
+        f"实操建议：\n"
+        f"1. 入场前统一同步最新图纸版本。\n"
+        f"2. 重点节点现场拍照存档，问题即时记录。\n"
+        f"3. 一键生成交接报告，资料更清晰。\n\n"
+        f"[16:9 内文图 2：实机视窗解析]\n\n"
+        f"结语：让看图回归本分，把时间留给施工本身。"
+    )
+    return {"title": title, "body": body}
+
+
+def _gen_platform_metadata(kb: dict, xhs: dict, long: dict) -> list:
+    """生成五平台专属元数据。"""
+    product_hint = kb.get("title") or "产品"
+    tags_raw = kb.get("tags") or ""
+    tag_list = [t.strip() for t in tags_raw.replace("，", ",").split(",") if t.strip()]
+
+    return [
+        {
+            "type": 1,
+            "platform": "小红书",
+            "title": xhs["title"],
+            "body": xhs["body"],
+            "tags": ["#" + t for t in tag_list[:5]] or ["#看图", "#工地", "#效率", "#避坑", "#蓝枢"],
+            "cover_index": 0,
+            "image_count": 3,
+            "note": "首图 3:4 竖版，共传 3 张 3:4 图；必勾 AI 合成内容声明",
+        },
+        {
+            "type": 5,
+            "platform": "百家号",
+            "title": long["title"][:30],
+            "body": long["body"],
+            "tags": tag_list[:5],
+            "cover_index": 0,
+            "image_count": 2,
+            "note": "单图 16:9 封面，正文穿插 2 张 16:9 内文图；必勾 AI 生成内容",
+        },
+        {
+            "type": 7,
+            "platform": "今日头条",
+            "title": long["title"][:30],
+            "body": long["body"],
+            "tags": tag_list[:5],
+            "cover_index": 0,
+            "image_count": 2,
+            "note": "单图 16:9 封面，正文穿插 2 张 16:9 内文图；必勾 内容由 AI 生成",
+        },
+        {
+            "type": 8,
+            "platform": "搜狐号",
+            "title": long["title"][:30],
+            "body": long["body"],
+            "tags": tag_list[:5],
+            "cover_index": 0,
+            "image_count": 2,
+            "note": "标题 ≤30 字，单图 16:9 封面，正文穿插 2 张 16:9 内文图",
+        },
+        {
+            "type": 9,
+            "platform": "知乎",
+            "title": long["title"][:35],
+            "body": long["body"],
+            "tags": tag_list[:5],
+            "cover_index": 0,
+            "image_count": 2,
+            "note": "专栏 16:9 题图，正文穿插 2 张 16:9 内文图；按需开启 AI 声明",
+        },
+    ]
+
+
+@app.route('/api/generate-content', methods=['POST'])
+def generate_content():
+    """基于知识库条目生成双版本文案 + 五平台元数据，并做合规自检。"""
+    try:
+        data = request.get_json() or {}
+        kb_id = data.get('kb_id')
+        product_id = data.get('product_id')
+
+        if not kb_id or not str(kb_id).isdigit():
+            return jsonify({"code": 400, "msg": "kb_id 不能为空", "data": None}), 400
+
+        with sqlite3.connect(_db_path()) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM knowledge_base WHERE id = ?", (int(kb_id),))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"code": 404, "msg": "知识库条目不存在", "data": None}), 404
+            kb = dict(row)
+
+        kb_fields = _build_kb_prompt(kb)
+        xhs = _gen_xhs_motherboard(kb_fields)
+        long = _gen_long_motherboard(kb_fields)
+        platforms = _gen_platform_metadata(kb_fields, xhs, long)
+
+        # 合规自检
+        all_texts = [xhs["title"], xhs["body"], long["title"], long["body"]]
+        all_texts += [p["title"] for p in platforms] + [p["body"] for p in platforms]
+        compliance = {"passed": True, "details": []}
+        for text in all_texts:
+            r = _compliance_check(text)
+            if not r["passed"]:
+                compliance["passed"] = False
+                compliance["details"].append({"text": text[:60], "hits": r["hits"]})
+
+        result = {
+            "kb_id": int(kb_id),
+            "product_id": kb.get("product_id"),
+            "motherboards": {
+                "xhs": xhs,
+                "long": long,
+            },
+            "platforms": platforms,
+            "compliance": compliance,
+        }
+        return jsonify({"code": 200, "msg": "内容生成成功", "data": result})
+    except Exception as e:
+        print(f"内容生成失败: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"code": 500, "msg": f"内容生成失败: {e}", "data": None}), 500
+
+
+# =====================================================================
+# Step 4：一键发布（复用现有 /postVideo 发布通道）
+# =====================================================================
+
+
+@app.route('/api/publish-from-kb', methods=['POST'])
+def publish_from_kb():
+    """基于知识库条目生成内容后，直接发布到指定平台（复用 /postVideo）。
+
+    请求体：{ kb_id, type, account_list, file_list?, ... }，其中 type 为平台类型，
+    account_list 为账号文件路径列表。生成的文案会自动填入 title/articleBody。
+    """
+    try:
+        data = request.get_json() or {}
+        kb_id = data.get('kb_id')
+        if not kb_id or not str(kb_id).isdigit():
+            return jsonify({"code": 400, "msg": "kb_id 不能为空", "data": None}), 400
+
+        # 先生成内容
+        gen_resp = generate_content()
+        gen_json = gen_resp.get_json() if hasattr(gen_resp, 'get_json') else None
+        if not gen_json or gen_json.get('code') != 200:
+            return jsonify({"code": 400, "msg": "内容生成失败，无法发布", "data": None}), 400
+        content_data = gen_json['data']
+
+        platform_type = int(data.get('type') or 1)
+        # 支持图文文章的平台：1 小红书 2 视频号 5 百家号 7 今日头条 8 搜狐 9 知乎 10 贴吧
+        ARTICLE_CAPABLE = {1, 2, 5, 7, 8, 9, 10}
+
+        # 按平台选对应的文案母本
+        if platform_type == 1:
+            title = content_data['motherboards']['xhs']['title']
+            article_body = content_data['motherboards']['xhs']['body']
+            tags = content_data['platforms'][0]['tags']
+        elif platform_type in ARTICLE_CAPABLE:
+            title = content_data['motherboards']['long']['title']
+            article_body = content_data['motherboards']['long']['body']
+            idx = next((i for i, p in enumerate(content_data['platforms']) if p['type'] == platform_type), 0)
+            tags = content_data['platforms'][idx]['tags']
+        else:
+            title = content_data['motherboards']['long']['title']
+            article_body = content_data['motherboards']['long']['body']
+            tags = content_data['platforms'][0]['tags']
+
+        # 合成转发给 /postVideo 的请求体
+        post_body = dict(data)
+        post_body['title'] = title
+        post_body['articleBody'] = article_body
+        post_body['body'] = article_body
+        post_body['tags'] = tags
+        post_body['contentType'] = 'article'
+        post_body['isDraft'] = True  # 默认存草稿，不自动发布
+
+        # 构造伪请求调用 postVideo 逻辑（直接复用路由函数）
+        with app.test_request_context(
+            '/postVideo',
+            method='POST',
+            json=post_body,
+            content_type='application/json',
+        ):
+            return postVideo()
+    except Exception as e:
+        print(f"一键发布失败: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"code": 500, "msg": f"一键发布失败: {e}", "data": None}), 500
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0' ,port=5409)

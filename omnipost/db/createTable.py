@@ -108,6 +108,41 @@ CREATE TABLE IF NOT EXISTS publish_drafts (
 )
 ''')
 
+# 产品主表（每个产品一行，后续可接入品牌色、Logo 等）
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    logo_path TEXT,
+    brand_color TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+''')
+
+# 知识库条目表（属于某个产品，用于生成该产品的发布文案与元数据）
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS knowledge_base (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT,
+    pain_points TEXT,
+    solutions TEXT,
+    tags TEXT,
+    file_paths TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+)
+''')
+
+# 为 publish_history 补充 product_id（可选，用于发布记录溯源）
+_pub_hist_cols = [row[1] for row in cursor.execute("PRAGMA table_info(publish_history)").fetchall()]
+if 'product_id' not in _pub_hist_cols:
+    cursor.execute("ALTER TABLE publish_history ADD COLUMN product_id INTEGER")
+
 # 提交更改
 conn.commit()
 print("✅ 表创建成功")
