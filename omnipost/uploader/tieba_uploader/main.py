@@ -29,6 +29,38 @@ TITLE_MAX_LEN = 100
 COVER_MAX_BYTES = 10 * 1024 * 1024
 COVER_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 
+# 贴吧关键步骤重试配置（应对超时/元素不可见等瞬时异常）
+TIEBA_RETRY_ATTEMPTS = 3
+TIEBA_RETRY_BASE_DELAY = 1.0  # 秒，指数退避
+
+
+async def _retry_when_transient(fn, *, label: str, attempts: int = TIEBA_RETRY_ATTEMPTS, base_delay: float = TIEBA_RETRY_BASE_DELAY):
+    """对超时、元素不可见等瞬时异常进行指数退避重试；非瞬时异常直接抛出。"""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await fn()
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            is_transient = (
+                "timeout" in msg
+                or "target page, context or browser has been closed" in msg
+                or "not visible" in msg
+                or "hidden" in msg
+                or "element is not" in msg
+                or "navigation" in msg
+            )
+            if attempt < attempts and is_transient:
+                tieba_logger.warning(
+                    f"{label} 第 {attempt} 次尝试失败（瞬时异常，{base_delay * attempt}s 后重试）: {exc}"
+                )
+                await asyncio.sleep(base_delay * attempt)
+                continue
+            tieba_logger.error(f"{label} 失败: {exc}")
+            raise
+    raise last_exc
+
 
 def _build_launch_kwargs(headless: bool) -> dict:
     options = {
@@ -194,15 +226,28 @@ class TiebaPost(object):
         context = await set_init_script(context)
         page = await context.new_page()
         try:
-            # 进入目标贴吧发表页
-            await self.goto_post_page(page)
+            # 进入目标贴吧发表页（含超时/元素不可见重试）
+            await _retry_when_transient(
+                lambda: self.goto_post_page(page),
+                label="进入贴吧发表页",
+            )
             # 检查登录态
             if _is_login_url(page.url):
                 raise RuntimeError("百度贴吧 cookie 已失效，请重新登录")
-            await self.fill_title(page)
-            await self.fill_body(page)
+            # 填写标题与正文（含瞬时异常重试）
+            await _retry_when_transient(
+                lambda: self.fill_title(page),
+                label="填写帖子标题",
+            )
+            await _retry_when_transient(
+                lambda: self.fill_body(page),
+                label="填写帖子正文",
+            )
             if self.cover_path:
-                await self.upload_cover(page)
+                await _retry_when_transient(
+                    lambda: self.upload_cover(page),
+                    label="上传帖子封面",
+                )
             # 安全底线：绝不自动点击「发布」。填完内容后等待用户手动操作。
             await self.save_draft(page)
             tieba_logger.info(

@@ -420,6 +420,10 @@
               <span class="sub-label">目标贴吧（二选一即可）：</span>
               <el-input v-model="form.tiebaFid" size="small" placeholder="贴吧 ID（fid，优先）" class="full-width" />
               <el-input v-model="form.tiebaKw" size="small" placeholder="贴吧名（kw，fid 为空时使用）" class="full-width" style="margin-top:8px" />
+              <div class="sub-label" style="color:#e6a23c; font-size:12px; margin-top:6px;">
+                ⚠️ 百度贴吧发布为半自动模式：脚本仅自动填写标题与正文，不会自动点击「发布」。
+                填写完成后，请在弹出的浏览器中自行决定点击「发布」或关闭页面。
+              </div>
             </div>
           </div>
         </el-card>
@@ -1317,6 +1321,16 @@ const confirmPublish = async () => {
   if (form.selectedAccounts.length === 0) {
     ElMessage.error('请选择至少一个发布账号')
     return
+  }
+
+  // 5. 百度贴吧目标贴吧校验（fid/kw 二选一）
+  if (form.selectedPlatform === 10) {
+    const fid = (form.tiebaFid || '').trim()
+    const kw = (form.tiebaKw || '').trim()
+    if (!fid && !kw) {
+      ElMessage.error('请输入贴吧 ID（fid）或贴吧名（kw）中的至少一项')
+      return
+    }
   }
 
   publishing.value = true

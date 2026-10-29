@@ -80,7 +80,13 @@ CREATE TABLE IF NOT EXISTS publish_history (
     error_msg TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     published_at DATETIME
-)
+)''')
+# 为已有库的 publish_history 补充贴吧 fid/kw 字段（兼容旧库，不重建表）
+_pub_hist_cols = [row[1] for row in cursor.execute("PRAGMA table_info(publish_history)").fetchall()]
+if 'tieba_fid' not in _pub_hist_cols:
+    cursor.execute("ALTER TABLE publish_history ADD COLUMN tieba_fid TEXT")
+if 'tieba_kw' not in _pub_hist_cols:
+    cursor.execute("ALTER TABLE publish_history ADD COLUMN tieba_kw TEXT")
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS publish_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

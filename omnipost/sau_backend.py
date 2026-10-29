@@ -87,7 +87,7 @@ PLATFORM_NAME_MAP = {
     10: '百度贴吧',
 }
 
-def add_publish_history(platform_type, account_name, content_type, title, content, tags, files, status='publishing'):
+def add_publish_history(platform_type, account_name, content_type, title, content, tags, files, status='publishing', tieba_fid=None, tieba_kw=None):
     try:
         platform_name = PLATFORM_NAME_MAP.get(platform_type, f'平台{platform_type}')
         tags_str = ','.join(tags) if isinstance(tags, list) else str(tags or '')
@@ -95,10 +95,10 @@ def add_publish_history(platform_type, account_name, content_type, title, conten
         with sqlite3.connect(_db_path()) as conn:
             cur = conn.cursor()
             cur.execute('''
-                INSERT INTO publish_history 
-                (platform_type, platform_name, account_name, content_type, title, content, tags, files, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
-            ''', (platform_type, platform_name, str(account_name), content_type, title, content, tags_str, files_str, status))
+                INSERT INTO publish_history
+                (platform_type, platform_name, account_name, content_type, title, content, tags, files, tieba_fid, tieba_kw, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
+            ''', (platform_type, platform_name, str(account_name), content_type, title, content, tags_str, files_str, tieba_fid or None, tieba_kw or None, status))
             conn.commit()
             return cur.lastrowid
     except Exception as e:
@@ -274,7 +274,9 @@ def retry_publish():
                     case 9:
                         post_article_zhihu(title, article_body, tags, account_list, 0, 1, ['10:00'], 0, False, thumbnail_path, None)
                     case 10:
-                        post_article_tieba(title, article_body, tags, account_list, fid=None, kw=None, enableTimer=False,
+                        tieba_fid_h = record.get('tieba_fid') or None
+                        tieba_kw_h = record.get('tieba_kw') or None
+                        post_article_tieba(title, article_body, tags, account_list, fid=tieba_fid_h, kw=tieba_kw_h, enableTimer=False,
                                            videos_per_day=1, daily_times=['10:00'], start_days=0, dry_run=False,
                                            cover_path=thumbnail_path, is_draft=True)
                 print(f"✅ 重试发布任务完成: #{history_id}", flush=True)
@@ -1084,6 +1086,10 @@ def postVideo():
     # 单选：最多保留第一项
     work_statements = work_statements[:1]
 
+    # 百度贴吧目标贴吧：优先 fid，其次 kw（前后端字段名兼容）
+    tieba_fid = data.get('tiebaFid') or data.get('fid')
+    tieba_kw = data.get('tiebaKw') or data.get('kw')
+
     videos_per_day = data.get('videosPerDay')
     daily_times = data.get('dailyTimes')
     start_days = data.get('startDays')
@@ -1125,6 +1131,8 @@ def postVideo():
         return jsonify({"code": 400, "msg": "文件列表不能为空", "data": None}), 400
     if not account_list:
         return jsonify({"code": 400, "msg": "账号列表不能为空", "data": None}), 400
+    if type == 10 and not tieba_fid and not tieba_kw:
+        return jsonify({"code": 400, "msg": "百度贴吧发帖必须指定 fid（贴吧 ID）或 kw（贴吧名）", "data": None}), 400
     if is_article and not is_xhs_article and not is_tencent_article:
         if not title or not str(title).strip():
             return jsonify({"code": 400, "msg": "文章标题不能为空", "data": None}), 400
@@ -1282,8 +1290,6 @@ def postVideo():
                         is_draft=is_draft,
                     )
                 case 10:
-                    tieba_fid = data.get('tiebaFid') or data.get('fid')
-                    tieba_kw = data.get('tiebaKw') or data.get('kw')
                     post_article_tieba(
                         title,
                         article_body,
@@ -1329,7 +1335,9 @@ def postVideo():
         content=article_body if is_article else (tags if isinstance(tags, str) else ''),
         tags=tags,
         files=file_list if (file_list and len(file_list) > 0) else (cover_images if (cover_images and len(cover_images) > 0) else ([thumbnail_path] if thumbnail_path else [])),
-        status='preview' if dry_run else 'publishing'
+        status='preview' if dry_run else 'publishing',
+        tieba_fid=tieba_fid if type == 10 else None,
+        tieba_kw=tieba_kw if type == 10 else None,
     )
 
     thread = threading.Thread(target=run_publish_task, daemon=True)
