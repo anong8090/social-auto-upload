@@ -1,0 +1,14 @@
+# 项目真实运行依赖（按 import 模块整理，与 pyproject.toml 对齐）
+# 原 requirements_utf8.txt 中 bilibiu/blinkr/cfcf/propcasync 等包在 PyPI 上不存在，
+# alembic/mako/click/etils/flask-socketio/cf-clearance 版本号也均不匹配，已移除。
+Flask==3.1.1
+flask-cors==6.0.0
+loguru==0.7.3
+qrcode==8.2
+requests==2.32.3
+segno>=1.6.6
+patchright==1.58.2
+playwright==1.52.0
+xhs==0.2.13
+opencv-python-headless==5.0.0.93
+Pillow==13.0.0

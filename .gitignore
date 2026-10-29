@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Config / secrets (local)
+conf.py
+cookies/
+cookiesFile/
+
+# Database
+db/database.db
+*.db
+*.db-journal
+
+# Frontend
+.vite/
+dist/
+node_modules/
+package-lock.json
+
+# Logs
+*.log
+logs/
+
+# Temp / debug artifacts
+debug_*.py
+debug_*.png
+qrcode.png
+uploadFile/
+videoFile/
+
+# 物料包（大量二进制资产，不纳入代码仓）
+河狸云蓝枢_自媒体物料包/
+
+# Worktrees
+.worktrees/
+
+# uv
+.uv-cache/
