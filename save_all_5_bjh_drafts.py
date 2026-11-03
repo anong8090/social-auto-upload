@@ -14,6 +14,7 @@
    由你在后台手动点击「发布」。
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -30,69 +31,31 @@ from uploader.baijiahao_uploader.main import (
 )
 from utils.log import baijiahao_logger
 from account_lookup import get_platform_account
+from draft_content_parser import parse_body_blocks
 
-DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '12_工地图纸多找详图难_一稿五投'
-IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '12_工地图纸多找详图难'
+DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '13_设计变更后图纸怎么跟_一稿五投'
+IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '13_设计变更后图纸怎么跟'
 ACCOUNT_FILE, ACCOUNT_USER = get_platform_account(5)
 ARTIFACT_DIR = BASE_DIR / 'logs' / 'screenshots'
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 ARTICLES = [
     {
-        'episode': 12,
-        'title': '工地图纸几十张，找详图翻半天怎么办？',
-        'file': '母本B_四平台精炼长文_工地图纸多找详图难.md',
-        'cover': IMG_BASE / '01_16x9_头图封面_工地图纸多找详图难.png',
+        'episode': 13,
+        'title': '设计变更一来，手上那叠图该换哪几张？',
+        'file': '母本B_四平台精炼长文_设计变更后图纸怎么跟.md',
+        'cover': IMG_BASE / '01_16x9_头图封面_设计变更后图纸怎么跟.png',
         'inline_images': [
-            IMG_BASE / '02_16x9_内文图1_工地图纸多找详图难.png',
-            IMG_BASE / '03_16x9_内文图2_工地图纸多找详图难.png',
+            IMG_BASE / '02_16x9_内文图1_设计变更后图纸怎么跟.png',
+            IMG_BASE / '03_16x9_内文图2_设计变更后图纸怎么跟.png',
         ],
     },
 ]
 
 
 def parse_article_blocks(md_path: Path, inline_images: list[Path]) -> list[tuple[str, str | Path]]:
-    raw = md_path.read_text(encoding='utf-8')
-    lines = raw.splitlines()
-    text_blocks = []
-    cur = []
-    img_idx = 0
-    seen_first_img = False
-    re = __import__('re')
-
-    for line in lines:
-        s = line.strip()
-        if s.startswith('# ') or (s.startswith('>') and not seen_first_img) or s == '---':
-            continue
-        if s.startswith('!['):
-            if not seen_first_img:
-                seen_first_img = True
-                continue
-            if cur:
-                text_blocks.append(('text', '\n'.join(cur).strip()))
-                cur = []
-            if img_idx < len(inline_images):
-                text_blocks.append(('image', inline_images[img_idx]))
-                img_idx += 1
-            continue
-
-        cleaned_line = re.sub(r'^#{2,4}\s*', '', s)
-        cleaned_line = re.sub(r'^>\s*', '', cleaned_line)
-        cleaned_line = cleaned_line.replace('**', '')
-        if cleaned_line.startswith('|'):
-            cells = [c.strip() for c in cleaned_line.strip('|').split('|')]
-            if all(set(c) <= {':', '-'} for c in cells):
-                continue
-            if cells[0] == '核心维度':
-                continue
-            cleaned_line = f"• {cells[0]}：单机工具为「{cells[1]}」；蓝枢协同中枢为「{cells[2]}」"
-        if cleaned_line:
-            cur.append(cleaned_line)
-
-    if cur:
-        text_blocks.append(('text', '\n'.join(cur).strip()))
-
-    return text_blocks
+    """统一解析：剥离元数据说明行、清洗裸露 Markdown 标记、内文图穿插。"""
+    return parse_body_blocks(md_path, inline_images, skip_cover=True)
 
 
 async def focus_editor_end(page: Page, article: BaiJiaHaoArticle):
@@ -144,9 +107,7 @@ async def focus_editor_end(page: Page, article: BaiJiaHaoArticle):
 
 async def append_text_block(page: Page, article: BaiJiaHaoArticle, text: str):
     await focus_editor_end(page, article)
-    clean_lines = [__import__('re').sub(r'^>\s*', '', ln) for ln in text.splitlines()]
-    clean_text = '\n'.join(clean_lines)
-    await page.evaluate("async (t) => { await navigator.clipboard.writeText(t); }", clean_text + "\n\n")
+    await page.evaluate("async (t) => { await navigator.clipboard.writeText(t); }", text + "\n\n")
     await page.keyboard.press("Meta+V")
     await page.wait_for_timeout(600)
 
@@ -296,7 +257,7 @@ async def save_single_bjh_draft(page: Page, item: dict):
             break
 
     await page.wait_for_timeout(2000)
-    saved_shot = ARTIFACT_DIR / f"bjh_draft_ep0{ep}_saved.png"
+    saved_shot = ARTIFACT_DIR / f"bjh_draft_ep{ep:02d}_saved.png"
     await page.screenshot(path=str(saved_shot))
     baijiahao_logger.info(f"  📸 草稿页截图已保存: {saved_shot.name}")
 
@@ -325,7 +286,7 @@ async def main():
         await page.wait_for_timeout(4500)
         await _dismiss_overlays(page)
 
-        final_shot = ARTIFACT_DIR / "bjh_ep12_draft_verified.png"
+        final_shot = ARTIFACT_DIR / f"bjh_ep{ARTICLES[0]['episode']:02d}_draft_verified.png"
         await page.screenshot(path=str(final_shot), full_page=True)
         baijiahao_logger.success(f"🏆 百家号本期草稿核验截图已保存: {final_shot}")
 
@@ -336,6 +297,9 @@ async def main():
         await context.storage_state(path=str(ACCOUNT_FILE))
 
         print("   ⏳ 等待中，浏览器保持打开，请手动发布后关闭窗口...", flush=True)
+        if os.getenv('DRAFT_NO_WAIT') == '1':
+            print('   ⏹ DRAFT_NO_WAIT=1，保存完成即退出（草稿已留在浏览器/云端）', flush=True)
+            return True
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:

@@ -10,6 +10,7 @@
    由你在后台手动点击「发布」。
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -19,79 +20,32 @@ sys.path.insert(0, str(BASE_DIR / 'omnipost'))
 
 from playwright.async_api import Page, async_playwright
 from account_lookup import get_platform_account
+from utils.base_social_media import set_init_script
+from draft_content_parser import parse_body_blocks
 
-DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '12_工地图纸多找详图难_一稿五投'
-IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '12_工地图纸多找详图难'
+DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '13_设计变更后图纸怎么跟_一稿五投'
+IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '13_设计变更后图纸怎么跟'
 COOKIE_PATH, ACCOUNT_USER = get_platform_account(7)
 ARTIFACT_DIR = BASE_DIR / 'logs' / 'screenshots'
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 ARTICLES = [
     {
-        'episode': 12,
-        'title': '工地图纸几十张，找详图翻半天怎么办？',
-        'file': '母本B_四平台精炼长文_工地图纸多找详图难.md',
-        'cover': IMG_BASE / '01_16x9_头图封面_工地图纸多找详图难.png',
+        'episode': 13,
+        'title': '设计变更一来，手上那叠图该换哪几张？',
+        'file': '母本B_四平台精炼长文_设计变更后图纸怎么跟.md',
+        'cover': IMG_BASE / '01_16x9_头图封面_设计变更后图纸怎么跟.png',
         'inline_images': [
-            IMG_BASE / '02_16x9_内文图1_工地图纸多找详图难.png',
-            IMG_BASE / '03_16x9_内文图2_工地图纸多找详图难.png',
+            IMG_BASE / '02_16x9_内文图1_设计变更后图纸怎么跟.png',
+            IMG_BASE / '03_16x9_内文图2_设计变更后图纸怎么跟.png',
         ],
     },
 ]
 
 
 def parse_markdown_content(file_path: Path, inline_images: list | None = None):
-    raw_text = file_path.read_text(encoding='utf-8')
-    lines = raw_text.splitlines()
-    elements = []
-    current_text = []
-    is_header_meta = True
-    first_image_seen = False
-    re = __import__('re')
-    inline_images = inline_images or []
-
-    def flush_text():
-        nonlocal current_text
-        if current_text:
-            elements.append(('text', '\n\n'.join(current_text)))
-            current_text = []
-
-    for line in lines:
-        sline = line.strip()
-        if is_header_meta:
-            if sline.startswith('#'):
-                continue
-            if sline.startswith('>') or sline.startswith('---'):
-                continue
-            if sline:
-                is_header_meta = False
-        img_match = re.search(r'!\[(.*?)\]\((.*?)\)', sline)
-        if img_match:
-            if not first_image_seen:
-                first_image_seen = True
-                continue
-            flush_text()
-            abs_img_path = (file_path.parent / img_match.group(2)).resolve()
-            if abs_img_path.exists():
-                elements.append(('image', abs_img_path))
-            continue
-        if not sline:
-            flush_text()
-            continue
-        current_text.append(sline)
-    flush_text()
-
-    # 将内文配图穿插到文本块之间：第2个文本块后插第1张，第4个文本块后插第2张
-    text_block_indices = [i for i, e in enumerate(elements) if e[0] == 'text']
-    insertions = []
-    for n, img_path in enumerate(inline_images[:2]):
-        if n < len(text_block_indices):
-            pos = text_block_indices[n] + 1 + n  # 加上前面已插入的图片数
-            insertions.append((pos, img_path))
-    for pos, img_path in reversed(insertions):
-        elements.insert(pos, ('image', img_path))
-
-    return elements
+    """统一解析：剥离元数据说明行、清洗裸露 Markdown 标记、内文图穿插。"""
+    return parse_body_blocks(file_path, inline_images, skip_cover=True)
 
 
 async def dismiss_masks_and_drawers(page):
@@ -231,6 +185,11 @@ async def upload_article_cover(page, cover_path: Path):
 
 
 async def click_toutiao_draft_button(page: Page) -> bool:
+    """今日头条网页端没有独立「存草稿」按钮。
+
+    通过点击底部「预览」按钮触发云端草稿保存接口（预览本身不会发布）。
+    顺序：先找真实存在的草稿按钮，找不到再走「预览」路径。
+    """
     candidates = [
         'button:has-text("存草稿")',
         'button:has-text("保存草稿")',
@@ -248,9 +207,26 @@ async def click_toutiao_draft_button(page: Page) -> bool:
                 return True
         except Exception:
             continue
+
+    # 头条无独立草稿按钮：点击底部「预览」强制触发云端草稿保存
+    preview_selectors = [
+        'button.publish-btn:has-text("预览")',
+        'button:has-text("预览")',
+    ]
+    for sel in preview_selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(force=True, timeout=5000)
+                await page.wait_for_timeout(2500)
+                print(f'  💾 已点击「{sel}」触发云端草稿保存（预览不发布）')
+                return True
+        except Exception:
+            continue
+
     try:
         clicked = await page.evaluate("""() => {
-            const texts = ['存草稿', '保存草稿', '暂存'];
+            const texts = ['存草稿', '保存草稿', '暂存', '预览'];
             const btns = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'));
             const match = btns.find(el => {
                 const t = (el.innerText || el.textContent || '').trim();
@@ -266,7 +242,7 @@ async def click_toutiao_draft_button(page: Page) -> bool:
             return false;
         }""")
         if clicked:
-            print('  💾 已通过 JS 点击「存草稿」')
+            print('  💾 已通过 JS 点击「存草稿」/「预览」')
             await page.wait_for_timeout(1500)
             return True
     except Exception as e:
@@ -327,7 +303,7 @@ async def save_one_article(page, item: dict):
     if not draft_ok:
         print('  ⚠️ 未找到可点击的「存草稿」按钮，页面保持打开供手动存草稿')
 
-    screenshot_path = ARTIFACT_DIR / f'toutiao_draft_ep0{ep}_saved.png'
+    screenshot_path = ARTIFACT_DIR / f'toutiao_draft_ep{ep:02d}_saved.png'
     await page.screenshot(path=str(screenshot_path), full_page=True)
     print(f'  📸 发布页截图已保存: {screenshot_path.name}', flush=True)
 
@@ -344,6 +320,8 @@ async def main():
             args=['--disable-blink-features=AutomationControlled','--lang=zh-CN','--start-maximized']
         )
         context = await browser.new_context(storage_state=str(COOKIE_PATH), viewport={'width': 1440, 'height': 900})
+        # 注入 stealth 抹除 navigator.webdriver，防止字节跳动 SecSDK 风控返回 code: 7050
+        context = await set_init_script(context)
         page = await context.new_page()
 
         page.on("dialog", lambda d: asyncio.create_task(d.accept()))
@@ -359,6 +337,9 @@ async def main():
         await context.storage_state(path=str(COOKIE_PATH))
 
         print("   ⏳ 等待中，浏览器保持打开，请手动发布后关闭窗口...", flush=True)
+        if os.getenv('DRAFT_NO_WAIT') == '1':
+            print('   ⏹ DRAFT_NO_WAIT=1，保存完成即退出（草稿已留在浏览器/云端）', flush=True)
+            return True
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:

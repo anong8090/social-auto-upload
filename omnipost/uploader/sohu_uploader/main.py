@@ -503,10 +503,13 @@ class SoHuArticle(object):
             if not selected:
                 sohu_logger.warning("封面上传后未检测到「已选择」，尝试继续点确定")
 
-            # 确认按钮是 <p class="positive-button">确定</p>，不是原生 button
+            # 确认按钮是 <p class="positive-button">确定</p>，不是原生 button。
+            # 必须在当前激活的 modal 内精确定位，避免匹配到弹窗外隐藏的公式按钮。
             clicked = False
             try:
-                confirm = dialog.locator("p.positive-button, .positive-button").filter(has_text="确定").first
+                confirm = dialog.locator(
+                    "p.positive-button, .positive-button, button"
+                ).filter(has_text="确定").first
                 if await confirm.count():
                     await confirm.click(force=True, timeout=5000)
                     clicked = True
@@ -517,14 +520,26 @@ class SoHuArticle(object):
             if not clicked:
                 clicked = await page.evaluate(
                     """() => {
+                      // 只在当前可见（激活）的弹窗内找「确定」，避免误点隐藏的公式按钮
                       const dialogs = [...document.querySelectorAll('.el-dialog')];
                       for (const d of dialogs) {
                         const wrap = d.closest('.el-dialog__wrapper') || d.parentElement;
                         if (wrap && getComputedStyle(wrap).display === 'none') continue;
+                        const st = getComputedStyle(d);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+                        const rect = d.getBoundingClientRect();
+                        if (rect.width < 100 || rect.height < 100) continue;
                         const t = d.innerText || '';
                         if (!(t.includes('已选择') || t.includes('最多可选择') || t.includes('正文图片'))) continue;
                         const oks = [...d.querySelectorAll('p.positive-button, .positive-button, button, .el-button')]
-                          .filter(b => (b.innerText || '').trim() === '确定');
+                          .filter(b => {
+                            const bt = (b.innerText || b.textContent || '').replace(/\\s/g, '');
+                            if (bt !== '确定') return false;
+                            const br = b.getBoundingClientRect();
+                            if (br.width < 10 || br.height < 10) return false;
+                            const bs = getComputedStyle(b);
+                            return bs.display !== 'none' && bs.visibility !== 'hidden';
+                          });
                         oks.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
                         if (!oks.length) continue;
                         oks[0].click();

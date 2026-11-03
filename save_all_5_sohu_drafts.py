@@ -11,6 +11,7 @@
    由你在后台手动点击「发布」。
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -20,63 +21,30 @@ sys.path.insert(0, str(BASE_DIR / 'omnipost'))
 
 from playwright.async_api import Page, async_playwright
 from account_lookup import get_platform_account
+from draft_content_parser import parse_body_blocks, clean_markdown_body
 
-DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '12_工地图纸多找详图难_一稿五投'
-IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '12_工地图纸多找详图难'
+DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '13_设计变更后图纸怎么跟_一稿五投'
+IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '13_设计变更后图纸怎么跟'
 COOKIE_PATH, ACCOUNT_USER = get_platform_account(8)
 ARTIFACT_DIR = BASE_DIR / 'logs' / 'screenshots'
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 ARTICLES = [
     {
-        'episode': 12,
-        'title': '工地图纸几十张，找详图翻半天怎么办？',
-        'file': '母本B_四平台精炼长文_工地图纸多找详图难.md',
-        'cover': IMG_BASE / '01_16x9_头图封面_工地图纸多找详图难.png',
+        'episode': 13,
+        'title': '设计变更一来，手上那叠图该换哪几张？',
+        'file': '母本B_四平台精炼长文_设计变更后图纸怎么跟.md',
+        'cover': IMG_BASE / '01_16x9_头图封面_设计变更后图纸怎么跟.png',
         'inline_images': [
-            IMG_BASE / '02_16x9_内文图1_工地图纸多找详图难.png',
-            IMG_BASE / '03_16x9_内文图2_工地图纸多找详图难.png',
+            IMG_BASE / '02_16x9_内文图1_设计变更后图纸怎么跟.png',
+            IMG_BASE / '03_16x9_内文图2_设计变更后图纸怎么跟.png',
         ],
     },
 ]
 
 def parse_sohu_blocks(md_path: Path, inline_images: list | None = None) -> list:
-    raw = md_path.read_text(encoding='utf-8')
-    blocks, cur = [], []
-    inline_images = inline_images or []
-
-    def flush_text():
-        nonlocal cur
-        if cur:
-            blocks.append(('text', '\n'.join(cur).strip()))
-            cur = []
-
-    for line in raw.splitlines():
-        s = line.strip()
-        if s.startswith('# ') or s == '---':
-            continue
-        if s.startswith('>') and not inline_images:
-            continue
-        cl = s.replace('**', '')
-        if not cl:
-            flush_text()
-            continue
-        if cl.startswith('|'):
-            continue
-        cur.append(cl)
-    flush_text()
-
-    # 将内文配图穿插到文本块之间：第2个文本块后插第1张，第4个文本块后插第2张
-    text_block_indices = [i for i, e in enumerate(blocks) if e[0] == 'text']
-    insertions = []
-    for n, img_path in enumerate(inline_images[:2]):
-        if n < len(text_block_indices):
-            pos = text_block_indices[n] + 1 + n
-            insertions.append((pos, img_path))
-    for pos, img_path in reversed(insertions):
-        blocks.insert(pos, ('image', img_path))
-
-    return blocks
+    """统一解析：剥离元数据说明行、清洗裸露 Markdown 标记、内文图穿插。"""
+    return parse_body_blocks(md_path, inline_images, skip_cover=True)
 
 
 async def _wait_image_input(page: Page, timeout_s: int = 10):
@@ -93,7 +61,7 @@ async def insert_sohu_inline_image(page: Page, img_path: Path) -> bool:
     try:
         before = await page.locator('.ql-editor img').count()
         editor = page.locator('.ql-editor').first
-        await editor.click()
+        await editor.click(force=True)
         await page.wait_for_timeout(300)
 
         # 点击正文配图按钮（尝试多个选择器）
@@ -157,19 +125,129 @@ async def insert_sohu_inline_image(page: Page, img_path: Path) -> bool:
 
 
 def parse_markdown_clean_body(file_path: Path) -> str:
-    raw_text = file_path.read_text(encoding='utf-8')
-    lines = raw_text.splitlines()
-    clean_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('# ') or stripped.startswith('> '):
-            continue
-        if stripped == '---':
-            continue
-        if stripped.startswith('!['):
-            continue
-        clean_lines.append(line)
-    return '\n'.join(clean_lines).strip()
+    """统一正文清洗（剥离元数据说明行 + 清洗裸露 Markdown 标记）。"""
+    return clean_markdown_body(file_path)
+
+
+async def upload_sohu_cover(page: Page, cover_path: Path) -> bool:
+    """搜狐封面完整流程：上传图片 → 切「本地上传」→ 选图 → 弹窗内「确定」→ 校验。
+
+    注意：确认按钮必须在当前激活的 .el-dialog 内定位，
+    否则会误点到弹窗外部隐藏的公式按钮，导致封面卡死。
+    """
+    if not cover_path.exists():
+        print(f'  ⚠️ 封面文件不存在: {cover_path}')
+        return False
+    try:
+        # 1. 找到并点击封面上传触发区
+        try:
+            await page.locator('.cover-title').first.scroll_into_view_if_needed(timeout=4000)
+        except Exception:
+            pass
+        trigger = page.locator('.cover-button .upload-file, .cover-button .upload-tip').first
+        if not await trigger.count():
+            trigger = page.get_by_text('上传图片', exact=True).first
+        if not await trigger.count():
+            print('  ⚠️ 未找到封面「上传图片」入口')
+            return False
+        await trigger.click(force=True)
+        await page.wait_for_timeout(800)
+
+        # 2. 找当前可见、含封面上传文案的弹窗。
+        #    搜狐封面弹窗的容器可能是 .win-mask（不是 .el-dialog），两种都要找。
+        marked = await page.evaluate("""() => {
+          const sels = ['.win-mask', '.el-dialog', '[role="dialog"]'];
+          const seen = new Set();
+          for (const sel of sels) {
+            for (const d of document.querySelectorAll(sel)) {
+              if (seen.has(d)) continue;
+              seen.add(d);
+              const st = getComputedStyle(d);
+              if (st.display === 'none' || st.visibility === 'hidden') continue;
+              const r = d.getBoundingClientRect();
+              if (r.width < 200 || r.height < 150) continue;
+              const t = d.innerText || '';
+              if (t.includes('正文图片') || t.includes('本地上传') || t.includes('最多可选择') || t.includes('已选择')) {
+                d.setAttribute('data-sohu-cover-dialog', '1');
+                return true;
+              }
+            }
+          }
+          return false;
+        }""")
+        if not marked:
+            print('  ⚠️ 未找到搜狐封面对话框')
+            return False
+        dialog = page.locator('[data-sohu-cover-dialog="1"]').first
+
+        # 3. 切到「本地上传」标签（在弹窗内部查找）
+        await dialog.evaluate("""(d) => {
+          const tab = [...d.querySelectorAll('*')].find(el =>
+            [...el.childNodes].some(n => n.nodeType === 3 && (n.textContent || '').trim() === '本地上传')
+          );
+          if (tab) tab.click();
+        }""")
+        await page.wait_for_timeout(500)
+
+        # 4. 选择本地文件
+        file_input = dialog.locator('input[type="file"]').first
+        if not await file_input.count():
+            file_input = page.locator('.el-dialog input[type="file"]').last
+        if not await file_input.count():
+            print('  ⚠️ 封面对话框内无文件输入')
+            return False
+        await file_input.set_input_files(str(cover_path))
+        print('  📤 已写入本地封面，等待选中…')
+
+        # 5. 等待「已选择 N」
+        for _ in range(30):
+            await page.wait_for_timeout(400)
+            try:
+                text = await dialog.inner_text(timeout=2000)
+            except Exception:
+                text = ''
+            m = __import__('re').search(r'已选择\s*(\d+)', text or '')
+            if m and int(m.group(1)) >= 1:
+                print(f'  ✅ 封面已选中: {m.group(0)}')
+                break
+
+        # 6. 在激活弹窗内点「确定」（p.positive-button）
+        clicked = False
+        try:
+            confirm = dialog.locator('p.positive-button, .positive-button, button').filter(has_text='确定').first
+            if await confirm.count():
+                await confirm.click(force=True, timeout=5000)
+                clicked = True
+        except Exception:
+            pass
+        if not clicked:
+            clicked = await dialog.evaluate("""(d) => {
+              const oks = [...d.querySelectorAll('p.positive-button, .positive-button, button, .el-button')]
+                .filter(b => (b.innerText || b.textContent || '').replace(/\\s/g, '') === '确定')
+                .filter(b => { const r = b.getBoundingClientRect(); return r.width > 10 && r.height > 10; });
+              if (!oks.length) return false;
+              oks.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y);
+              oks[0].click();
+              return true;
+            }""")
+        await page.wait_for_timeout(1800)
+
+        # 7. 校验封面已应用
+        ready = await page.evaluate("""() => {
+          const pic = document.querySelector('.pic-cover');
+          if (!pic) return false;
+          const st = getComputedStyle(pic);
+          const bg = st.backgroundImage || '';
+          return st.display !== 'none' && (bg.includes('http') || bg.includes('blob:'));
+        }""")
+        if ready:
+            print('  ✅ 封面已应用到发文页')
+        elif clicked:
+            print('  ⚠️ 已点确定，但未检测到封面预览')
+        return bool(ready or clicked)
+    except Exception as exc:
+        print(f'  ⚠️ 封面流程异常: {exc}')
+        return False
 
 
 async def dismiss_overlays(page: Page):
@@ -177,11 +255,28 @@ async def dismiss_overlays(page: Page):
         await page.evaluate('''() => {
             const masks = document.querySelectorAll('.win-mask, .annual-background-mask');
             for (const m of masks) {
-                const btn = m.querySelector('[class*="close"], button, .icon-close');
-                if (btn) btn.click();
-                else m.remove();
+                // 页面加载时可能自动弹出「设置封面」弹窗（也是 .win-mask），
+                // 它会挡住正文工具栏，这里先关掉；真正上传封面时会重新打开。
+                const html = m.innerHTML || '';
+                const isCoverDialog = html.includes('new-file') || html.includes('upload-area');
+                const btn = m.querySelector(
+                    '[class*="close"], .icon-close, button[aria-label*="关闭"], .win-mask-close'
+                );
+                if (btn) { btn.click(); continue; }
+                if (isCoverDialog) { m.remove(); continue; }
+                m.remove();
             }
         }''')
+    except Exception:
+        pass
+    # 关闭「识别到Markdown格式文字，是否解析…」提示条，避免遮挡工具栏
+    try:
+        await page.evaluate("""() => {
+            document.querySelectorAll('[class*="tooltip"], [class*="tip"], [class*="notice"]').forEach(el => {
+                const t = (el.innerText || el.textContent || '');
+                if (t.includes('识别到Markdown格式文字') || t.includes('确认解析')) el.remove();
+            });
+        }""")
     except Exception:
         pass
     close_candidates = [
@@ -202,8 +297,15 @@ async def dismiss_overlays(page: Page):
 
 
 async def click_sohu_draft_button(page: Page) -> bool:
+    # 搜狐「存草稿」不一定是 <button>，可能是 <p>/<span>/<li> 等样式化元素，
+    # 因此先按精确文本定位（Playwright text= 不限标签），再退回结构选择器。
     candidates = [
+        'text="存草稿"',
+        'p:has-text("存草稿")',
+        'span:has-text("存草稿")',
+        'li:has-text("存草稿")',
         'button:has-text("存草稿")',
+        'div:has-text("存草稿")',
         'button:has-text("保存草稿")',
         'button:has-text("暂存")',
         '[class*="draft"] button',
@@ -213,6 +315,7 @@ async def click_sohu_draft_button(page: Page) -> bool:
         try:
             loc = page.locator(sel).first
             if await loc.count() and await loc.is_visible():
+                await loc.scroll_into_view_if_needed(timeout=3000)
                 await loc.click(force=True, timeout=3000)
                 await page.wait_for_timeout(1500)
                 print(f'  💾 已点击「{sel}」')
@@ -222,8 +325,9 @@ async def click_sohu_draft_button(page: Page) -> bool:
     try:
         clicked = await page.evaluate("""() => {
             const texts = ['存草稿', '保存草稿', '暂存'];
-            const btns = Array.from(document.querySelectorAll('button, [role="button"], a, div, span'));
-            const match = btns.find(el => {
+            // 扫描全部元素，取「最深」的精确文本节点，再点它或其可点击祖先
+            const all = Array.from(document.querySelectorAll('body *'));
+            const hits = all.filter(el => {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (!texts.includes(t)) return false;
                 const rect = el.getBoundingClientRect();
@@ -233,8 +337,13 @@ async def click_sohu_draft_button(page: Page) -> bool:
                 if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                 return true;
             });
-            if (match) { match.click(); return true; }
-            return false;
+            if (!hits.length) return false;
+            // 取子元素最少的那个，避免点到包住整页的容器
+            hits.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+            const el = hits[0];
+            const clickable = el.closest('button, [role="button"], a, li, p, span, div') || el;
+            clickable.click();
+            return true;
         }""")
         if clicked:
             print('  💾 已通过 JS 点击「存草稿」')
@@ -268,10 +377,34 @@ async def save_single_article(page: Page, art: dict) -> bool:
     await page.wait_for_timeout(300)
 
     blocks = parse_sohu_blocks(md_path, art.get('inline_images', []))
+    # 注入正文前再清一次遮罩：页面加载后可能延迟弹出「设置封面」弹窗挡住编辑器
+    await dismiss_overlays(page)
+    await page.wait_for_timeout(300)
     editor = page.locator('.ql-editor').first
-    await editor.click()
+    await editor.click(force=True)
+    # 搜狐会自动恢复上一轮草稿：先全选删文本，再逐张点选图片组件删除。
+    # 注意只做一轮全选，重复全选会把编辑器选区搞乱，导致后续粘贴/插图失败。
     await page.keyboard.press("Meta+A")
     await page.keyboard.press("Backspace")
+    await page.wait_for_timeout(300)
+    for _ in range(6):
+        if await page.locator('.ql-editor img').count() == 0:
+            break
+        try:
+            await page.locator('.ql-editor img').first.click(force=True)
+            await page.wait_for_timeout(120)
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(180)
+        except Exception:
+            break
+    left_imgs = await page.locator('.ql-editor img').count()
+    try:
+        left_text_len = len((await editor.inner_text()).strip())
+    except Exception:
+        left_text_len = -1
+    print(f"  🧹 编辑器已清空，残留图片 {left_imgs} 张、文本 {left_text_len} 字")
+    # 重新把光标放回正文起始位置
+    await editor.click(force=True)
     await page.wait_for_timeout(200)
     for btype, bval in blocks:
         if btype == 'text':
@@ -281,17 +414,15 @@ async def save_single_article(page: Page, art: dict) -> bool:
         else:
             await insert_sohu_inline_image(page, Path(bval))
     imgs_now = await page.locator('.ql-editor img').count()
-    print(f"  📝 正文注入完毕，编辑器内图片数: {imgs_now}")
+    body_now = await editor.inner_text()
+    dup = body_now.count('设计一纸变更下来')
+    print(f"  📝 正文注入完毕，编辑器内图片数: {imgs_now}，正文长度 {len(body_now)}，导语重复 {dup} 次")
+    if imgs_now > 2 or dup > 1:
+        print("  ⚠️ 自检异常：图片或正文疑似重复，请检查该草稿")
     await page.wait_for_timeout(1000)
 
-    try:
-        cover_btn = page.locator('input[type="file"][accept*="image"]').first
-        if await cover_btn.count():
-            await cover_btn.set_input_files(str(cover_path), timeout=6000)
-            await page.wait_for_timeout(3000)
-            print(f"  🖼️ 封面已上传: {cover_path.name}")
-    except Exception as e:
-        print(f"  ⚠️ 封面上传失败(继续): {e}")
+    cover_ok = await upload_sohu_cover(page, cover_path)
+    print(f"  🖼️ 封面上传: {'成功' if cover_ok else '失败/跳过'} ({cover_path.name})")
 
     print("  🤖 设置创作声明: 含有AI生成内容")
     ai_radio = page.locator('label.el-radio:has-text("含有AI生成内容"), span.el-radio__label:has-text("含有AI生成内容")').first
@@ -305,7 +436,7 @@ async def save_single_article(page: Page, art: dict) -> bool:
     if not draft_ok:
         print("  ⚠️ 未找到可点击的「存草稿」按钮，页面保持打开供手动存草稿")
 
-    preview_shot = ARTIFACT_DIR / f"sohu_draft_ep0{ep}_saved.png"
+    preview_shot = ARTIFACT_DIR / f"sohu_draft_ep{ep:02d}_saved.png"
     await page.screenshot(path=str(preview_shot), full_page=True)
     print(f"  📸 发布页截图已保存: {preview_shot.name}")
     return True
@@ -349,6 +480,9 @@ async def main():
         await context.storage_state(path=str(COOKIE_PATH))
 
         print("   ⏳ 等待中，浏览器保持打开，请手动发布后关闭窗口...", flush=True)
+        if os.getenv('DRAFT_NO_WAIT') == '1':
+            print('   ⏹ DRAFT_NO_WAIT=1，保存完成即退出（草稿已留在浏览器/云端）', flush=True)
+            return True
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:

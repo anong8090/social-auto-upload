@@ -11,6 +11,7 @@
    由你在后台手动点击「发布」。
 """
 import asyncio
+import os
 import json
 import sys
 from pathlib import Path
@@ -24,9 +25,10 @@ from uploader.xiaohongshu_uploader.main import XiaoHongShuNote
 from utils.base_social_media import set_init_script
 from utils.log import xiaohongshu_logger
 from account_lookup import get_platform_account
+from draft_content_parser import clean_markdown_body
 
-IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '12_工地图纸多找详图难'
-XHS_DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '12_工地图纸多找详图难_一稿五投'
+IMG_BASE = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '图片素材' / '13_设计变更后图纸怎么跟'
+XHS_DOCS_DIR = BASE_DIR / '河狸云蓝枢_自媒体物料包' / '文案合集' / '13_设计变更后图纸怎么跟_一稿五投'
 COOKIE_PATH, ACCOUNT_USER = get_platform_account(1)
 ARTIFACT_DIR = BASE_DIR / 'logs' / 'screenshots'
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,38 +37,22 @@ import re as _re
 
 
 def _load_xhs_body():
-    raw = (XHS_DOCS_DIR / '母本A_小红书短图文_工地图纸多找详图难.md').read_text(encoding='utf-8')
-    out = []
-    for line in raw.splitlines():
-        s = line.rstrip()
-        st = s.strip()
-        if st.startswith('# '):
-            continue
-        if st == '---':
-            continue
-        if st.startswith('> '):
-            continue
-        if st.startswith('!['):
-            continue
-        if st.startswith('#'):
-            continue
-        if st:
-            out.append(s)
-    return _re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
+    """统一正文清洗（剥离元数据说明行 + 清洗裸露 Markdown 标记）。"""
+    return clean_markdown_body(XHS_DOCS_DIR / '母本A_小红书短图文_设计变更后图纸怎么跟.md')
 
 
 XHS_NOTES = [
     {
-        'episode': 12,
-        'title': '工地图纸找详图翻半天',
-        'md_file': '母本A_小红书短图文_工地图纸多找详图难.md',
+        'episode': 13,
+        'title': '设计变更来了，手上这叠图怎么跟',
+        'md_file': '母本A_小红书短图文_设计变更后图纸怎么跟.md',
         'images': [
-            IMG_BASE / '04_3x4_小红书封面_工地图纸多找详图难.png',
-            IMG_BASE / '05_3x4_小红书内页1_工地图纸多找详图难.png',
-            IMG_BASE / '06_3x4_小红书内页2_工地图纸多找详图难.png',
+            IMG_BASE / '04_3x4_小红书封面_设计变更后图纸怎么跟.png',
+            IMG_BASE / '05_3x4_小红书内页1_设计变更后图纸怎么跟.png',
+            IMG_BASE / '06_3x4_小红书内页2_设计变更后图纸怎么跟.png',
         ],
         'desc': _load_xhs_body(),
-        'tags': ['施工图纸', '看图找详图', '工程人', '工地日常', '图纸管理'],
+        'tags': ['设计变更', '施工图纸', '工程人', '工地日常', '图纸管理'],
     },
 ]
 
@@ -187,6 +173,9 @@ async def main():
         await context.storage_state(path=str(COOKIE_PATH))
 
         print("   ⏳ 等待中，浏览器保持打开，请手动发布后关闭窗口...", flush=True)
+        if os.getenv('DRAFT_NO_WAIT') == '1':
+            print('   ⏹ DRAFT_NO_WAIT=1，保存完成即退出（草稿已留在浏览器/云端）', flush=True)
+            return True
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:

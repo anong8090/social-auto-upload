@@ -87,3 +87,13 @@ videoFile/
 
 # uv
 .uv-cache/
+
+# 浏览器持久化配置（含 Cookie 登录态，体积大）
+omnipost/browser_profiles/
+
+# 一次性探查 / 登录调试脚本
+_probe_*.py
+login_sohu_v*.py
+_verify_xhs_body.py
+_verify_xhs_edit.py
+_verify_xhs_note.py

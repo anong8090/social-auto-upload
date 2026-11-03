@@ -83,18 +83,65 @@ async def _install_preview_guard(page: Page) -> None:
 
 
 async def _dismiss_overlays(page: Page) -> None:
+    """清理百家号营销弹窗与遮罩。
+
+    百家号「AI创作搭子」等营销弹窗会挂上全屏遮罩（.cheetah-modal-mask），
+    导致工具栏按钮被拦截、图片上传超时。此处做两层处理：
+    1. 可见关闭按钮直接 force 点击；
+    2. DOM 级清理：移除含营销文案的弹窗根节点、遮罩与 tooltip 气泡。
+    """
     for selector in (
+        'button[aria-label="关闭"]',
+        '.cheetah-modal-close',
+        'button.cheetah-modal-close',
+        'button:has-text("关闭")',
         'button:has-text("我知道了")',
         'button:has-text("知道了")',
-        'button:has-text("关闭")',
     ):
         try:
             btn = page.locator(selector).first
             if await btn.count() and await btn.is_visible():
-                await btn.click(timeout=1000)
+                await btn.click(force=True, timeout=1000)
                 await page.wait_for_timeout(300)
         except Exception:
             continue
+
+    try:
+        await page.evaluate(
+            """() => {
+                const KILL = ['AI创作搭子', '会聊天了', '立即体验'];
+                const killIfMarketing = (el) => {
+                    if (!el) return false;
+                    const t = (el.innerText || el.textContent || '').trim();
+                    return KILL.some((k) => t.includes(k));
+                };
+                // 移除营销弹窗根节点 + 其遮罩/包裹层
+                document.querySelectorAll(
+                    '.cheetah-modal-root, .cheetah-modal-mask, .cheetah-modal-wrap'
+                ).forEach((el) => {
+                    if (killIfMarketing(el)) {
+                        el.remove();
+                        return;
+                    }
+                    // 弹窗根已移除时，残留的遮罩一并清掉
+                    if (el.classList.contains('cheetah-modal-mask')) {
+                        el.remove();
+                    }
+                });
+                // 移除带「新增智能标题」的 tooltip 气泡
+                document.querySelectorAll(
+                    '.cheetah-tooltip, [class*="tooltip"], [class*="popover"]'
+                ).forEach((el) => {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (t.includes('新增智能标题')) {
+                        el.remove();
+                    }
+                });
+            }"""
+        )
+        await page.wait_for_timeout(150)
+    except Exception as exc:
+        baijiahao_logger.debug(f"营销弹窗 DOM 清理失败: {exc}")
 
 
 async def baijiahao_cookie_gen(account_file):
