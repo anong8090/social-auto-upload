@@ -112,6 +112,18 @@
 
 每次生成完 1 个选题的文案与 6 张配图后，Agent 自动执行以下 4 步闭环：
 
+> **统一发布入口（2026-11-04 起，替代根目录一次性脚本）**
+> 日常发布**不再新建** `_publish_*_epNN.py`，统一走 `omnipost/scripts/publish_episode.py`。它会自动完成：
+> 素材目录发现 → 封禁/账号/cookie 预检 → 从可用池随机抽 5 台 → 逐平台发布 →
+> 写入 `publish_history`（含 `episode` / `topic` / `published_url` / `platform_item_id`）→ 输出汇总 JSON。
+> 「期数 + 平台」已成功发布过的默认跳过，确需重发加 `--force`；小红书在代码层硬拦截。
+>
+> ```bash
+> omnipost/.venv/bin/python omnipost/scripts/publish_episode.py --episode 15 --seed 20261105
+> ```
+>
+> 只看素材/预检不发布：加 `--dry-run`；指定平台：`--platforms 5,7,9,11`。
+
 ### 步骤 1：从活跃平台池中随机抽取 5 个平台并自动发布
 - 使用虚拟环境 Python：macOS/Linux 为 `omnipost/.venv/bin/python`，Windows 为 `omnipost/.venv/Scripts/python.exe`。
 - **排除小红书**：在有效账号列表中随机抽取 5 个平台。

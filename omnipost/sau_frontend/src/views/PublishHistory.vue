@@ -33,7 +33,8 @@
 
             <el-select v-model="filterStatus" placeholder="全部状态" clearable style="width: 130px" @change="loadHistory">
               <el-option label="全部状态" value="" />
-              <el-option label="发布成功" value="success" />
+              <el-option label="发布成功" value="published" />
+              <el-option label="已存草稿" value="draft" />
               <el-option label="发布中" value="publishing" />
               <el-option label="发布失败" value="failed" />
               <el-option label="仅预览" value="preview" />
@@ -122,6 +123,18 @@
               <el-tooltip v-if="row.error_msg" :content="row.error_msg" placement="top">
                 <el-icon class="error-tip-icon"><Warning /></el-icon>
               </el-tooltip>
+            </template>
+          </el-table-column>
+
+          <el-table-column label="发布链接" width="100" align="center">
+            <template #default="{ row }">
+              <el-link
+                v-if="row.published_url"
+                :href="row.published_url"
+                target="_blank"
+                type="primary"
+              >打开</el-link>
+              <span v-else style="color: #c0c4cc">—</span>
             </template>
           </el-table-column>
 
@@ -327,6 +340,11 @@
               {{ getStatusLabel(currentDetail.status) }}
             </el-tag>
           </el-descriptions-item>
+          <el-descriptions-item v-if="currentDetail.published_url" label="发布链接">
+            <el-link :href="currentDetail.published_url" target="_blank" type="primary">
+              {{ currentDetail.published_url }}
+            </el-link>
+          </el-descriptions-item>
           <el-descriptions-item v-if="currentDetail.error_msg" label="错误信息">
             <span class="error-text">{{ currentDetail.error_msg }}</span>
           </el-descriptions-item>
@@ -467,6 +485,7 @@ const getPlatformTagType = (type) => {
 
 const getStatusTag = (status) => {
   switch (status) {
+    case 'published':
     case 'success': return 'success'
     case 'draft': return 'success'
     case 'failed': return 'danger'
@@ -478,6 +497,7 @@ const getStatusTag = (status) => {
 
 const getStatusLabel = (status) => {
   switch (status) {
+    case 'published':
     case 'success': return '发布成功'
     case 'draft': return '已存草稿'
     case 'failed': return '发布失败'

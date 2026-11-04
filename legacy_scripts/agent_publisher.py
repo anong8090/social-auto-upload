@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 # 将 omnipost 加入 Python 模块搜索路径
-CURRENT_DIR = Path(__file__).resolve().parent
+CURRENT_DIR = Path(__file__).resolve().parent.parent
 OMNIPOST_DIR = CURRENT_DIR / "omnipost"
 if str(OMNIPOST_DIR) not in sys.path:
     sys.path.insert(0, str(OMNIPOST_DIR))

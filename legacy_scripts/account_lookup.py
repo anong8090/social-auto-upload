@@ -9,7 +9,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, Tuple
 
-CURRENT_DIR = Path(__file__).resolve().parent
+CURRENT_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = CURRENT_DIR / "omnipost" / "db" / "database.db"
 COOKIES_DIR = CURRENT_DIR / "omnipost" / "cookiesFile"
 

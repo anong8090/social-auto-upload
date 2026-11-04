@@ -3,7 +3,7 @@
 import asyncio, sys
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE)); sys.path.insert(0, str(BASE / 'omnipost'))
 from playwright.async_api import async_playwright
 from utils.base_social_media import set_init_script

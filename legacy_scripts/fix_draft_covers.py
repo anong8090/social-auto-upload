@@ -3,9 +3,9 @@ import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 COOKIE_PATH = BASE_DIR / 'omnipost' / 'cookiesFile' / 'c261ae58-c931-11f1-883f-2ba2d23fe161.json'
-ARTIFACT_DIR = Path(__file__).resolve().parent / 'logs' / 'screenshots'
+ARTIFACT_DIR = Path(__file__).resolve().parent.parent / 'logs' / 'screenshots'
 
 COVERS = {
     '十几万返工代价：为什么图纸必须确认才算现行': BASE_DIR / '河狸云蓝枢_自媒体物料包/图片素材/知乎专栏连载分期配图/第二期_现行锁控与防错闭环/01_本期头图_未确认不算现行版.png',

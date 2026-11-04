@@ -1,9 +1,11 @@
 import sqlite3
 import json
 import os
+import sys
+from pathlib import Path
 
-# 数据库文件路径（如果不存在会自动创建）
-db_file = './database.db'
+# 数据库文件路径（固定落在本脚本所在目录，避免因 cwd 不同建出第二份库）
+db_file = str(Path(__file__).resolve().parent / 'database.db')
 
 # 如果数据库已存在，则删除旧的表（可选）
 # if os.path.exists(db_file):
@@ -143,8 +145,39 @@ _pub_hist_cols = [row[1] for row in cursor.execute("PRAGMA table_info(publish_hi
 if 'product_id' not in _pub_hist_cols:
     cursor.execute("ALTER TABLE publish_history ADD COLUMN product_id INTEGER")
 
+# 发布记录新增字段：公开发布链接、平台条目 ID、期数、选题、截图目录
+for _col, _type in (
+    ('published_url', 'TEXT'),
+    ('platform_item_id', 'TEXT'),
+    ('episode', 'TEXT'),
+    ('topic', 'TEXT'),
+    ('screenshot_dir', 'TEXT'),
+):
+    if _col not in _pub_hist_cols:
+        cursor.execute(f"ALTER TABLE publish_history ADD COLUMN {_col} {_type}")
+
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_publish_history_episode_platform "
+    "ON publish_history(episode, platform_type)"
+)
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_publish_history_status "
+    "ON publish_history(status)"
+)
+
 # 提交更改
 conn.commit()
 print("✅ 表创建成功")
 # 关闭连接
 conn.close()
+
+# 归一历史状态值（'1'/'success' -> published 等）
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from myUtils.publish_record import ensure_publish_history_schema
+
+    changes = ensure_publish_history_schema(Path(db_file))
+    if changes:
+        print(f"🔧 已归一发布状态 {len(changes)} 处")
+except Exception as _exc:  # noqa: BLE001
+    print(f"⚠️ 发布状态归一跳过: {_exc}")

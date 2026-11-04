@@ -11,6 +11,14 @@ from pathlib import Path
 from queue import Queue
 from flask_cors import CORS
 from myUtils.auth import check_cookie
+from myUtils import preflight, publish_record
+from myUtils.preflight import (
+    BANNED_PLATFORMS,
+    PLATFORM_NAMES as PREFLIGHT_PLATFORM_NAMES,
+    PlatformBlockedError,
+    assert_platform_allowed,
+    check_account_file,
+)
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen, baijiahao_cookie_gen, bilibili_cookie_gen, toutiao_cookie_gen, sohu_cookie_gen, zhihu_cookie_gen, tieba_cookie_gen, weibo_cookie_gen, wechat_mp_cookie_gen, wangyi_cookie_gen, dayu_cookie_gen, qiehao_cookie_gen
 from myUtils.postVideo import post_video_tencent, post_article_tencent, post_video_DouYin, post_video_ks, post_video_xhs, post_note_xhs, post_video_baijiahao, post_video_bilibili, post_video_toutiao, post_article_toutiao, post_article_baijiahao, post_article_sohu, post_article_zhihu, post_article_tieba, post_article_weibo, post_article_wechat_mp, post_article_wangyi, post_article_dayu, post_article_qiehao
@@ -92,38 +100,51 @@ PLATFORM_NAME_MAP = {
     15: '企鹅号',
 }
 
-def add_publish_history(platform_type, account_name, content_type, title, content, tags, files, status='publishing', tieba_fid=None, tieba_kw=None):
-    try:
-        platform_name = PLATFORM_NAME_MAP.get(platform_type, f'平台{platform_type}')
-        tags_str = ','.join(tags) if isinstance(tags, list) else str(tags or '')
-        files_str = json.dumps(files, ensure_ascii=False) if isinstance(files, (list, tuple)) else str(files or '')
-        with sqlite3.connect(_db_path()) as conn:
-            cur = conn.cursor()
-            cur.execute('''
-                INSERT INTO publish_history
-                (platform_type, platform_name, account_name, content_type, title, content, tags, files, tieba_fid, tieba_kw, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
-            ''', (platform_type, platform_name, str(account_name), content_type, title, content, tags_str, files_str, tieba_fid or None, tieba_kw or None, status))
-            conn.commit()
-            return cur.lastrowid
-    except Exception as e:
-        print(f"写入发布历史记录失败: {e}", flush=True)
-        return None
+def add_publish_history(platform_type, account_name, content_type, title, content, tags, files, status='publishing', tieba_fid=None, tieba_kw=None, episode=None, topic=None, product_id=None):
+    """写入发布记录，统一委托 myUtils.publish_record（状态枚举与新增字段）。"""
+    return publish_record.create_record(
+        _db_path(),
+        platform_type=int(platform_type),
+        platform_name=PLATFORM_NAME_MAP.get(int(platform_type), f'平台{platform_type}'),
+        account_name=str(account_name),
+        content_type=content_type,
+        title=title,
+        content=content or '',
+        tags=tags or [],
+        files=files or [],
+        status=status,
+        episode=episode,
+        topic=topic,
+        tieba_fid=tieba_fid,
+        tieba_kw=tieba_kw,
+        product_id=product_id,
+    )
 
-def update_publish_history(history_id, status, error_msg=None):
-    if not history_id:
-        return
+def update_publish_history(history_id, status, error_msg=None, published_url=None, platform_item_id=None):
+    """更新发布记录终态；published_at 只在 published 时写入。"""
+    publish_record.finish_record(
+        _db_path(),
+        history_id,
+        status,
+        published_url=published_url,
+        platform_item_id=platform_item_id,
+        error_msg=error_msg,
+    )
+
+
+def _collect_published_link(platform_type, title):
+    """发布成功后从平台后台采集公开链接；失败返回 ("", "")，不打断主流程。"""
     try:
-        with sqlite3.connect(_db_path()) as conn:
-            cur = conn.cursor()
-            cur.execute('''
-                UPDATE publish_history 
-                SET status = ?, error_msg = ?, published_at = datetime('now', 'localtime')
-                WHERE id = ?
-            ''', (status, str(error_msg or '') if error_msg else None, history_id))
-            conn.commit()
-    except Exception as e:
-        print(f"更新发布历史记录失败: {e}", flush=True)
+        from myUtils.link_collector import collect_sync
+
+        account = preflight.get_account(_db_path(), int(platform_type))
+        if not account:
+            return "", ""
+        cookie = preflight.resolve_cookie_path(BASE_DIR, str(account.get("filePath") or ""))
+        return collect_sync(int(platform_type), cookie, title or "")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 发布链接采集跳过: {exc}", flush=True)
+        return "", ""
 
 @app.route('/getPublishHistory', methods=['GET'])
 def get_publish_history():
@@ -142,8 +163,9 @@ def get_publish_history():
             conditions.append("platform_type = ?")
             params.append(int(platform))
         if status:
+            # 兼容旧前端传的 success/1 等历史取值
             conditions.append("status = ?")
-            params.append(status)
+            params.append(publish_record.normalize_status(status))
         if keyword:
             conditions.append("(title LIKE ? OR content LIKE ?)")
             params.extend([f"%{keyword}%", f"%{keyword}%"])
@@ -158,8 +180,9 @@ def get_publish_history():
             total = cur.fetchone()['total']
 
             query_sql = f"""
-                SELECT id, platform_type, platform_name, account_name, content_type, 
-                       title, content, tags, files, status, error_msg, created_at, published_at
+                SELECT id, platform_type, platform_name, account_name, content_type,
+                       title, content, tags, files, status, error_msg, created_at, published_at,
+                       published_url, platform_item_id, episode, topic, screenshot_dir
                 FROM publish_history
                 {where_clause}
                 ORDER BY id DESC
@@ -213,6 +236,12 @@ def retry_publish():
 
             platform_type = record.get('platform_type')
             account_name = record.get('account_name')
+
+            # 封禁平台禁止重试（小红书）
+            try:
+                assert_platform_allowed(int(platform_type))
+            except PlatformBlockedError as exc:
+                return jsonify({"code": 403, "msg": str(exc), "data": None}), 403
 
             cur.execute("SELECT filePath FROM user_info WHERE userName = ? AND type = ?", (account_name, platform_type))
             acc = cur.fetchone()
@@ -295,7 +324,13 @@ def retry_publish():
                     case 15:
                         post_article_qiehao(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
                 print(f"✅ 重试发布任务完成: #{history_id}", flush=True)
-                update_publish_history(history_id, 'success')
+                _url, _item_id = _collect_published_link(platform_type, title)
+                update_publish_history(
+                    history_id,
+                    publish_record.STATUS_PUBLISHED,
+                    published_url=_url,
+                    platform_item_id=_item_id,
+                )
             except Exception as e:
                 print(f"❌ 重试发布任务出错: {e}", flush=True)
                 update_publish_history(history_id, 'failed', error_msg=str(e))
@@ -457,7 +492,7 @@ def delete_draft():
 
 @app.route('/confirmDrafts', methods=['POST'])
 def confirm_drafts():
-    """将选中的草稿从 publish_drafts 移除，并作为已发布完结（status='success'）写入 publish_history"""
+    """将选中的草稿从 publish_drafts 移除，并作为已发布完结（status='published'）写入 publish_history"""
     try:
         data = request.get_json() or {}
         draft_ids = data.get('ids')
@@ -497,6 +532,9 @@ def confirm_drafts():
             inserted_ids = []
             for d in draft_rows:
                 p_type = int(d.get('platform_type') or 1)
+                if p_type in BANNED_PLATFORMS:
+                    print(f"⛔ 跳过封禁平台草稿 #{d.get('id')}: {BANNED_PLATFORMS[p_type]}", flush=True)
+                    continue
                 p_name = d.get('platform_name') or PLATFORM_NAME_MAP.get(p_type, f'平台{p_type}')
                 c_type = d.get('content_type') or 'article'
                 title = d.get('title') or ''
@@ -541,7 +579,7 @@ def confirm_drafts():
                 cur.execute('''
                     INSERT INTO publish_history
                     (platform_type, platform_name, account_name, content_type, title, content, tags, files, status, created_at, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', COALESCE(?, datetime('now', 'localtime')), datetime('now', 'localtime'))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'published', COALESCE(?, datetime('now', 'localtime')), datetime('now', 'localtime'))
                 ''', (p_type, p_name, acc_name, c_type, title, content, tags_str, files_str, d.get('updated_at') or d.get('created_at')))
                 inserted_ids.append(cur.lastrowid)
 
@@ -1116,6 +1154,20 @@ def postVideo():
     except (TypeError, ValueError):
         return jsonify({"code": 400, "msg": f"不支持的平台类型: {type}", "data": None}), 400
 
+    # 封禁平台硬拦截：小红书（type=1）账号已封，任何入口都不得放行
+    try:
+        assert_platform_allowed(type)
+    except PlatformBlockedError as exc:
+        return jsonify({"code": 403, "msg": str(exc), "data": None}), 403
+
+    # 发布预检：账号未绑定或 cookie 文件缺失时直接拒绝，避免跑到一半才发现
+    _acc_ok, _acc_reason, _ = check_account_file(_db_path(), BASE_DIR, type)
+    if not _acc_ok and not dry_run:
+        return jsonify({"code": 400, "msg": f"发布前预检未通过: {_acc_reason}", "data": None}), 400
+
+    episode = data.get('episode') or data.get('ep')
+    topic = data.get('topic')
+
     # 支持图文文章的平台：1=小红书，2=视频号，5=百家号，7=今日头条，8=搜狐号，9=知乎，10=百度贴吧
     ARTICLE_CAPABLE_PLATFORMS = (1, 2, 5, 7, 8, 9, 10)
     # 搜狐号/知乎第一期仅支持图文
@@ -1395,8 +1447,22 @@ def postVideo():
                         file_list=file_list,
                     )
             print(f"✅ 发布任务完成: type={type}, title={title}", flush=True)
-            status_result = 'preview' if dry_run else ('draft' if is_draft else 'success')
-            update_publish_history(history_id, status_result)
+            if dry_run:
+                status_result = publish_record.STATUS_PREVIEW
+            elif is_draft:
+                status_result = publish_record.STATUS_DRAFT
+            else:
+                status_result = publish_record.STATUS_PUBLISHED
+
+            published_url, platform_item_id = "", ""
+            if status_result == publish_record.STATUS_PUBLISHED:
+                published_url, platform_item_id = _collect_published_link(type, title)
+            update_publish_history(
+                history_id,
+                status_result,
+                published_url=published_url,
+                platform_item_id=platform_item_id,
+            )
         except Exception as e:
             print(f"❌ 发布任务出错: {str(e)}", flush=True)
             import traceback
@@ -1427,6 +1493,8 @@ def postVideo():
         status='preview' if dry_run else 'publishing',
         tieba_fid=tieba_fid if type == 10 else None,
         tieba_kw=tieba_kw if type == 10 else None,
+        episode=episode,
+        topic=topic,
     )
 
     thread = threading.Thread(target=run_publish_task, daemon=True)
