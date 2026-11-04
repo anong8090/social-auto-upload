@@ -12,8 +12,8 @@ from queue import Queue
 from flask_cors import CORS
 from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
-from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen, baijiahao_cookie_gen, bilibili_cookie_gen, toutiao_cookie_gen, sohu_cookie_gen, zhihu_cookie_gen, tieba_cookie_gen
-from myUtils.postVideo import post_video_tencent, post_article_tencent, post_video_DouYin, post_video_ks, post_video_xhs, post_note_xhs, post_video_baijiahao, post_video_bilibili, post_video_toutiao, post_article_toutiao, post_article_baijiahao, post_article_sohu, post_article_zhihu, post_article_tieba
+from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen, baijiahao_cookie_gen, bilibili_cookie_gen, toutiao_cookie_gen, sohu_cookie_gen, zhihu_cookie_gen, tieba_cookie_gen, weibo_cookie_gen, wechat_mp_cookie_gen, wangyi_cookie_gen, dayu_cookie_gen, qiehao_cookie_gen
+from myUtils.postVideo import post_video_tencent, post_article_tencent, post_video_DouYin, post_video_ks, post_video_xhs, post_note_xhs, post_video_baijiahao, post_video_bilibili, post_video_toutiao, post_article_toutiao, post_article_baijiahao, post_article_sohu, post_article_zhihu, post_article_tieba, post_article_weibo, post_article_wechat_mp, post_article_wangyi, post_article_dayu, post_article_qiehao
 from uploader.douyin_uploader.content_stats import (
     DouyinStatsSyncError,
     ensure_content_stats_table,
@@ -85,6 +85,11 @@ PLATFORM_NAME_MAP = {
     8: '搜狐',
     9: '知乎',
     10: '百度贴吧',
+    11: '微博',
+    12: '微信公众号',
+    13: '网易号',
+    14: '大鱼号',
+    15: '企鹅号',
 }
 
 def add_publish_history(platform_type, account_name, content_type, title, content, tags, files, status='publishing', tieba_fid=None, tieba_kw=None):
@@ -279,6 +284,16 @@ def retry_publish():
                         post_article_tieba(title, article_body, tags, account_list, fid=tieba_fid_h, kw=tieba_kw_h, enableTimer=False,
                                            videos_per_day=1, daily_times=['10:00'], start_days=0, dry_run=False,
                                            cover_path=thumbnail_path, is_draft=True)
+                    case 11:
+                        post_article_weibo(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
+                    case 12:
+                        post_article_wechat_mp(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, True)
+                    case 13:
+                        post_article_wangyi(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
+                    case 14:
+                        post_article_dayu(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
+                    case 15:
+                        post_article_qiehao(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
                 print(f"✅ 重试发布任务完成: #{history_id}", flush=True)
                 update_publish_history(history_id, 'success')
             except Exception as e:
@@ -1305,6 +1320,80 @@ def postVideo():
                         cover_path=thumbnail_path,
                         is_draft=is_draft,
                     )
+                case 11:
+                    post_article_weibo(
+                        title,
+                        article_body,
+                        tags,
+                        account_list,
+                        enableTimer=enableTimer,
+                        videos_per_day=videos_per_day,
+                        daily_times=daily_times,
+                        start_days=start_days,
+                        dry_run=dry_run,
+                        cover_path=thumbnail_path,
+                        is_draft=is_draft,
+                        file_list=file_list,
+                    )
+                case 12:
+                    post_article_wechat_mp(
+                        title,
+                        article_body,
+                        tags,
+                        account_list,
+                        enableTimer=enableTimer,
+                        videos_per_day=videos_per_day,
+                        daily_times=daily_times,
+                        start_days=start_days,
+                        dry_run=dry_run,
+                        cover_path=thumbnail_path,
+                        is_draft=is_draft,
+                    )
+                case 13:
+                    post_article_wangyi(
+                        title,
+                        article_body,
+                        tags,
+                        account_list,
+                        enableTimer=enableTimer,
+                        videos_per_day=videos_per_day,
+                        daily_times=daily_times,
+                        start_days=start_days,
+                        dry_run=dry_run,
+                        cover_path=thumbnail_path,
+                        is_draft=is_draft,
+                        file_list=file_list,
+                    )
+                case 14:
+                    post_article_dayu(
+                        title,
+                        article_body,
+                        tags,
+                        account_list,
+                        enableTimer=enableTimer,
+                        videos_per_day=videos_per_day,
+                        daily_times=daily_times,
+                        start_days=start_days,
+                        dry_run=dry_run,
+                        cover_path=thumbnail_path,
+                        is_draft=is_draft,
+                        file_list=file_list,
+                    )
+                case 15:
+                    post_article_qiehao(
+                        title,
+                        article_body,
+                        tags,
+                        account_list,
+                        enableTimer=enableTimer,
+                        videos_per_day=videos_per_day,
+                        daily_times=daily_times,
+                        start_days=start_days,
+                        dry_run=dry_run,
+                        cover_path=thumbnail_path,
+                        is_draft=is_draft,
+                        file_list=file_list,
+                    )
             print(f"✅ 发布任务完成: type={type}, title={title}", flush=True)
             status_result = 'preview' if dry_run else ('draft' if is_draft else 'success')
             update_publish_history(history_id, status_result)
@@ -1582,6 +1671,80 @@ def postVideoBatch():
                     dry_run=dry_run,
                     cover_path=thumbnail_path,
                     is_draft=is_draft,
+                )
+            case 11:
+                post_article_weibo(
+                    title,
+                    article_body,
+                    tags,
+                    account_list,
+                    enableTimer=enableTimer,
+                    videos_per_day=videos_per_day,
+                    daily_times=daily_times,
+                    start_days=start_days,
+                    dry_run=dry_run,
+                    cover_path=thumbnail_path,
+                    is_draft=is_draft,
+                    file_list=file_list,
+                )
+            case 12:
+                post_article_wechat_mp(
+                    title,
+                    article_body,
+                    tags,
+                    account_list,
+                    enableTimer=enableTimer,
+                    videos_per_day=videos_per_day,
+                    daily_times=daily_times,
+                    start_days=start_days,
+                    dry_run=dry_run,
+                    cover_path=thumbnail_path,
+                    is_draft=is_draft,
+                )
+            case 13:
+                post_article_wangyi(
+                    title,
+                    article_body,
+                    tags,
+                    account_list,
+                    enableTimer=enableTimer,
+                    videos_per_day=videos_per_day,
+                    daily_times=daily_times,
+                    start_days=start_days,
+                    dry_run=dry_run,
+                    cover_path=thumbnail_path,
+                    is_draft=is_draft,
+                    file_list=file_list,
+                )
+            case 14:
+                post_article_dayu(
+                    title,
+                    article_body,
+                    tags,
+                    account_list,
+                    enableTimer=enableTimer,
+                    videos_per_day=videos_per_day,
+                    daily_times=daily_times,
+                    start_days=start_days,
+                    dry_run=dry_run,
+                    cover_path=thumbnail_path,
+                    is_draft=is_draft,
+                    file_list=file_list,
+                )
+            case 15:
+                post_article_qiehao(
+                    title,
+                    article_body,
+                    tags,
+                    account_list,
+                    enableTimer=enableTimer,
+                    videos_per_day=videos_per_day,
+                    daily_times=daily_times,
+                    start_days=start_days,
+                    dry_run=dry_run,
+                    cover_path=thumbnail_path,
+                    is_draft=is_draft,
+                    file_list=file_list,
                 )
     # 返回响应给客户端
     return jsonify(
@@ -2065,6 +2228,31 @@ def run_async_function(type,id,status_queue):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(tieba_cookie_gen(id, status_queue))
+                loop.close()
+            case '11':
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(weibo_cookie_gen(id, status_queue))
+                loop.close()
+            case '12':
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(wechat_mp_cookie_gen(id, status_queue))
+                loop.close()
+            case '13':
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(wangyi_cookie_gen(id, status_queue))
+                loop.close()
+            case '14':
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(dayu_cookie_gen(id, status_queue))
+                loop.close()
+            case '15':
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(qiehao_cookie_gen(id, status_queue))
                 loop.close()
             case _:
                 print(f"❌ 不支持的登录平台类型: {type}", flush=True)

@@ -300,6 +300,7 @@
             <el-select
               v-model="form.selectedAccounts"
               multiple
+              filterable
               placeholder="选择发布的账号（支持多账号）"
               class="account-selector"
             >
@@ -648,7 +649,12 @@ const platforms = [
   { key: 7, name: '今日头条', icon: '🗞️' },
   { key: 8, name: '搜狐', icon: '🦊' },
   { key: 9, name: '知乎', icon: '💡' },
-  { key: 10, name: '百度贴吧', icon: '🟨' }
+  { key: 10, name: '百度贴吧', icon: '🟨' },
+  { key: 11, name: '微博', icon: '🔴' },
+  { key: 12, name: '微信公众号', icon: '💬' },
+  { key: 13, name: '网易号', icon: '🔴' },
+  { key: 14, name: '大鱼号', icon: '🐟' },
+  { key: 15, name: '企鹅号', icon: '🐧' }
 ]
 
 const getPlatformName = (type) => {
@@ -657,7 +663,7 @@ const getPlatformName = (type) => {
 }
 
 // 支持「图文」文章形态的平台
-const articleCapablePlatforms = [1, 2, 5, 7, 8, 9, 10]
+const articleCapablePlatforms = [1, 2, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 const articleOnlyPlatforms = [8, 9]
 
 // 表单响应式核心状态

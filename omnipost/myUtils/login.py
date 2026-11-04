@@ -966,3 +966,232 @@ async def tieba_cookie_gen(id, status_queue):
                 await browser.close()
         except Exception:
             pass
+
+
+async def _save_account_cookie_and_db(context, platform_type: int, platform_name: str, user_id: str, status_queue):
+    uuid_v1 = uuid.uuid1()
+    print(f"UUID v1 ({platform_name}): {uuid_v1}")
+    cookies_dir = Path(BASE_DIR / "cookiesFile")
+    cookies_dir.mkdir(exist_ok=True)
+    cookie_path = cookies_dir / f"{uuid_v1}.json"
+    await context.storage_state(path=cookie_path)
+
+    result = await check_cookie(platform_type, f"{uuid_v1}.json")
+    if not result:
+        print(f"⚠️ {platform_name} cookie 即时校验未通过，仍保存账号，请稍后刷新验证")
+
+    with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM user_info WHERE userName = ? AND type = ?", (user_id, platform_type))
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE user_info SET filePath = ?, status = 1 WHERE id = ?",
+                (f"{uuid_v1}.json", existing[0])
+            )
+            print(f"✅ 已更新已有{platform_name}用户: id={existing[0]}, userName={user_id}")
+        else:
+            cursor.execute(
+                "INSERT INTO user_info (type, filePath, userName, status) VALUES (?, ?, ?, 1)",
+                (platform_type, f"{uuid_v1}.json", user_id)
+            )
+            print(f"✅ 新增{platform_name}用户: userName={user_id}")
+        conn.commit()
+    status_queue.put("200")
+    return True
+
+
+async def weibo_cookie_gen(id, status_queue):
+    browser = None
+    context = None
+    page = None
+    try:
+        status_queue.put("MANUAL_LOGIN")
+        print(f"🟢 开始微博登录: id={id}")
+        async with async_playwright() as playwright:
+            options = get_browser_options()
+            options['headless'] = False
+            browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context()
+            context = await set_init_script(context)
+            page = await context.new_page()
+            print("🟢 打开微博登录页...")
+            await page.goto("https://weibo.com/login.php", timeout=60000, wait_until="domcontentloaded")
+            print("🟢 请在浏览器完成微博登录，等待 SUB 凭证…")
+            from uploader.weibo_uploader.main import _wait_until_logged_in
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+            if not ok:
+                print("❌ 微博登录超时：未检测到有效登录凭证")
+                status_queue.put("500")
+                return None
+            print("✅ 微博登录成功，已检测到 SUB 凭证")
+            await page.wait_for_timeout(3000)
+            return await _save_account_cookie_and_db(context, 11, "微博", id, status_queue)
+    except Exception as e:
+        print(f"❌ 微博登录异常: {e}")
+        status_queue.put("500")
+        return None
+    finally:
+        for obj in [page, context, browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+
+
+async def wechat_mp_cookie_gen(id, status_queue):
+    browser = None
+    context = None
+    page = None
+    try:
+        status_queue.put("MANUAL_LOGIN")
+        print(f"🟢 开始微信公众号登录: id={id}")
+        async with async_playwright() as playwright:
+            options = get_browser_options()
+            options['headless'] = False
+            browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context()
+            context = await set_init_script(context)
+            page = await context.new_page()
+            print("🟢 打开微信公众号登录页...")
+            await page.goto("https://mp.weixin.qq.com/", timeout=60000, wait_until="domcontentloaded")
+            print("🟢 请使用微信扫码并确认登录公众号…")
+            from uploader.wechat_mp_uploader.main import _wait_until_logged_in
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+            if not ok:
+                print("❌ 微信公众号登录超时")
+                status_queue.put("500")
+                return None
+            print("✅ 微信公众号登录成功")
+            await page.wait_for_timeout(3000)
+            return await _save_account_cookie_and_db(context, 12, "微信公众号", id, status_queue)
+    except Exception as e:
+        print(f"❌ 微信公众号登录异常: {e}")
+        status_queue.put("500")
+        return None
+    finally:
+        for obj in [page, context, browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+
+
+async def wangyi_cookie_gen(id, status_queue):
+    browser = None
+    context = None
+    page = None
+    try:
+        status_queue.put("MANUAL_LOGIN")
+        print(f"🟢 开始网易号登录: id={id}")
+        async with async_playwright() as playwright:
+            options = get_browser_options()
+            options['headless'] = False
+            browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context()
+            context = await set_init_script(context)
+            page = await context.new_page()
+            print("🟢 打开网易号登录页...")
+            await page.goto("https://mp.163.com/login.html", timeout=60000, wait_until="domcontentloaded")
+            print("🟢 请在浏览器完成网易号登录…")
+            from uploader.wangyi_uploader.main import _wait_until_logged_in
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+            if not ok:
+                print("❌ 网易号登录超时")
+                status_queue.put("500")
+                return None
+            print("✅ 网易号登录成功")
+            await page.wait_for_timeout(3000)
+            return await _save_account_cookie_and_db(context, 13, "网易号", id, status_queue)
+    except Exception as e:
+        print(f"❌ 网易号登录异常: {e}")
+        status_queue.put("500")
+        return None
+    finally:
+        for obj in [page, context, browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+
+
+async def dayu_cookie_gen(id, status_queue):
+    browser = None
+    context = None
+    page = None
+    try:
+        status_queue.put("MANUAL_LOGIN")
+        print(f"🟢 开始大鱼号登录: id={id}")
+        async with async_playwright() as playwright:
+            options = get_browser_options()
+            options['headless'] = False
+            browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context()
+            context = await set_init_script(context)
+            page = await context.new_page()
+            print("🟢 打开大鱼号登录页...")
+            await page.goto("https://mp.dayu.com/", timeout=60000, wait_until="domcontentloaded")
+            print("🟢 请在浏览器完成大鱼号登录…")
+            from uploader.dayu_uploader.main import _wait_until_logged_in
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+            if not ok:
+                print("❌ 大鱼号登录超时")
+                status_queue.put("500")
+                return None
+            print("✅ 大鱼号登录成功")
+            await page.wait_for_timeout(3000)
+            return await _save_account_cookie_and_db(context, 14, "大鱼号", id, status_queue)
+    except Exception as e:
+        print(f"❌ 大鱼号登录异常: {e}")
+        status_queue.put("500")
+        return None
+    finally:
+        for obj in [page, context, browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+
+
+async def qiehao_cookie_gen(id, status_queue):
+    browser = None
+    context = None
+    page = None
+    try:
+        status_queue.put("MANUAL_LOGIN")
+        print(f"🟢 开始企鹅号登录: id={id}")
+        async with async_playwright() as playwright:
+            options = get_browser_options()
+            options['headless'] = False
+            browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context()
+            context = await set_init_script(context)
+            page = await context.new_page()
+            print("🟢 打开企鹅号登录页...")
+            await page.goto("https://om.qq.com/userAuth/index", timeout=60000, wait_until="domcontentloaded")
+            print("🟢 请在浏览器完成企鹅号登录（微信/QQ扫码）…")
+            from uploader.qiehao_uploader.main import _wait_until_logged_in
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+            if not ok:
+                print("❌ 企鹅号登录超时")
+                status_queue.put("500")
+                return None
+            print("✅ 企鹅号登录成功")
+            await page.wait_for_timeout(3000)
+            return await _save_account_cookie_and_db(context, 15, "企鹅号", id, status_queue)
+    except Exception as e:
+        print(f"❌ 企鹅号登录异常: {e}")
+        status_queue.put("500")
+        return None
+    finally:
+        for obj in [page, context, browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+

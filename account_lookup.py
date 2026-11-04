@@ -15,10 +15,20 @@ COOKIES_DIR = CURRENT_DIR / "omnipost" / "cookiesFile"
 
 PLATFORM_DEFAULT_COOKIES = {
     1: ["xiaohongshu_default.json", "xiaohongshu.json"],
+    2: ["tencent_default.json", "tencent.json", "channels.json"],
+    3: ["douyin_default.json", "douyin.json"],
+    4: ["kuaishou_default.json", "kuaishou.json"],
     5: ["baijiahao_account.json", "baijiahao_default.json", "baijiahao.json"],
+    6: ["bilibili_default.json", "bilibili.json"],
     7: ["toutiao_default.json", "toutiao.json"],
     8: ["sohu_account.json", "sohu_default.json", "sohu.json"],
     9: ["zhihu_default.json", "zhihu.json"],
+    10: ["tieba_account.json", "tieba_default.json", "tieba.json"],
+    11: ["weibo_account.json", "weibo_default.json", "weibo.json"],
+    12: ["wechat_mp_account.json", "wechat_mp_default.json", "wechat_mp.json", "mp_weixin.json"],
+    13: ["wangyi_account.json", "wangyi_default.json", "wangyi.json", "163.json"],
+    14: ["dayu_account.json", "dayu_default.json", "dayu.json"],
+    15: ["qiehao_account.json", "qiehao_default.json", "qiehao.json", "om_qq.json"],
 }
 
 PLATFORM_NAMES = {
@@ -31,6 +41,12 @@ PLATFORM_NAMES = {
     7: "今日头条",
     8: "搜狐号",
     9: "知乎",
+    10: "百度贴吧",
+    11: "微博",
+    12: "微信公众号",
+    13: "网易号",
+    14: "大鱼号",
+    15: "企鹅号",
 }
 
 
@@ -74,7 +90,11 @@ def get_platform_account(platform_type: int) -> Tuple[Optional[Path], str]:
             return target, "默认账号"
 
     # 3. 扫描目录中匹配平台前缀的 json 文件
-    p_name_en = {1: "xiaohongshu", 5: "baijiahao", 7: "toutiao", 8: "sohu", 9: "zhihu"}.get(platform_type)
+    p_name_en = {
+        1: "xiaohongshu", 2: "tencent", 3: "douyin", 4: "kuaishou", 5: "baijiahao",
+        6: "bilibili", 7: "toutiao", 8: "sohu", 9: "zhihu", 10: "tieba",
+        11: "weibo", 12: "wechat_mp", 13: "wangyi", 14: "dayu", 15: "qiehao"
+    }.get(platform_type)
     if p_name_en:
         for f in COOKIES_DIR.glob(f"*{p_name_en}*.json"):
             return f, "默认账号"
@@ -88,9 +108,9 @@ def get_platform_account(platform_type: int) -> Tuple[Optional[Path], str]:
 
 
 if __name__ == "__main__":
-    print("=== 平台账号 Cookie 探测状态 ===")
-    for pt in [1, 5, 7, 8, 9]:
+    print("=== 平台账号 Cookie 探测状态 (全 15 大平台矩阵) ===")
+    for pt in range(1, 16):
         path, user = get_platform_account(pt)
         pname = PLATFORM_NAMES.get(pt)
         status_icon = "✅" if path else "❌"
-        print(f"{status_icon} [{pname} (type={pt})]: 账号={user}, 文件={path.name if path else '未找到'}")
+        print(f"{status_icon} [{pname} (type={pt:02d})]: 账号={user}, 文件={path.name if path else '未找到'}")

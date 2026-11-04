@@ -93,6 +93,9 @@ omnipost/browser_profiles/
 
 # 一次性探查 / 登录调试脚本
 _probe_*.py
+_*.py
+ep*.json
+GEO-*-发布台.html
 login_sohu_v*.py
 _verify_xhs_body.py
 _verify_xhs_edit.py

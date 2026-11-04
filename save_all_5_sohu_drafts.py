@@ -14,6 +14,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import Optional, List
 
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
@@ -42,7 +43,7 @@ ARTICLES = [
     },
 ]
 
-def parse_sohu_blocks(md_path: Path, inline_images: list | None = None) -> list:
+def parse_sohu_blocks(md_path: Path, inline_images: Optional[List] = None) -> list:
     """统一解析：剥离元数据说明行、清洗裸露 Markdown 标记、内文图穿插。"""
     return parse_body_blocks(md_path, inline_images, skip_cover=True)
 

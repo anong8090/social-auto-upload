@@ -20,6 +20,11 @@ from uploader.toutiao_uploader.main import TouTiaoArticle, TouTiaoVideo
 from uploader.sohu_uploader.main import SoHuArticle
 from uploader.zhihu_uploader.main import ZhiHuArticle
 from uploader.tieba_uploader.main import TiebaPost
+from uploader.weibo_uploader.main import WeiboPost
+from uploader.wechat_mp_uploader.main import WechatMpPost
+from uploader.wangyi_uploader.main import WangyiPost
+from uploader.dayu_uploader.main import DayuPost
+from uploader.qiehao_uploader.main import QiehaoPost
 from uploader.xiaohongshu_uploader.main import XiaoHongShuVideo, XiaoHongShuNote
 from utils.constant import TencentZoneTypes
 from utils.files_times import generate_schedule_time_next_day
@@ -816,6 +821,164 @@ def post_video_bilibili(title, files, tags, account_file, category=None, enableT
                 print(f"❌ Bilibili上传失败 (code={result.returncode}): {error_msg}", flush=True)
                 raise RuntimeError(error_msg or "Bilibili upload failed")
             print("✅ Bilibili上传成功", flush=True)
+
+
+def _resolve_cover_helper(cover_path):
+    if not cover_path or not str(cover_path).strip():
+        return None
+    raw = str(cover_path).strip()
+    name_only = Path(raw.replace("\\", "/")).name
+    candidates = [
+        Path(raw),
+        Path(BASE_DIR / "videoFile" / raw),
+        Path(BASE_DIR / "videoFile" / name_only),
+        Path(BASE_DIR / raw),
+    ]
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return str(cand.resolve())
+        except Exception:
+            continue
+    return None
+
+
+def post_article_weibo(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+    account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    cover = _resolve_cover_helper(cover_path)
+    publish_date = 0
+    if enableTimer:
+        publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
+        publish_date = publish_datetimes[0]
+
+    results = []
+    for cookie in account_paths:
+        print(f"🟢 微博发布开始: 账号={cookie}, dryRun={dry_run}, isDraft={is_draft}", flush=True)
+        app = WeiboPost(
+            title=title,
+            body=body,
+            tags=tags or [],
+            publish_date=publish_date,
+            account_file=str(cookie),
+            dry_run=dry_run,
+            cover_path=cover,
+            is_draft=is_draft,
+            file_list=file_list,
+        )
+        if dry_run:
+            app.headless = False
+        post_url = asyncio.run(app.main(), debug=False)
+        results.append(post_url)
+        print(f"✅ 微博发布流程结束: {post_url}", flush=True)
+    return results[0] if results else ""
+
+
+def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True):
+    account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    cover = _resolve_cover_helper(cover_path)
+    publish_date = 0
+    if enableTimer:
+        publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
+        publish_date = publish_datetimes[0]
+
+    for cookie in account_paths:
+        print(f"🟢 微信公众号图文草稿发布开始: 账号={cookie}, dryRun={dry_run}, isDraft={is_draft}", flush=True)
+        app = WechatMpPost(
+            title=title,
+            body=body,
+            tags=tags or [],
+            publish_date=publish_date,
+            account_file=str(cookie),
+            dry_run=dry_run,
+            cover_path=cover,
+            is_draft=is_draft,
+        )
+        if dry_run:
+            app.headless = False
+        asyncio.run(app.main(), debug=False)
+        print("✅ 微信公众号发布流程结束", flush=True)
+
+
+def post_article_wangyi(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+    account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    cover = _resolve_cover_helper(cover_path)
+    publish_date = 0
+    if enableTimer:
+        publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
+        publish_date = publish_datetimes[0]
+
+    for cookie in account_paths:
+        print(f"🟢 网易号文章发布开始: 账号={cookie}, dryRun={dry_run}, isDraft={is_draft}", flush=True)
+        app = WangyiPost(
+            title=title,
+            body=body,
+            tags=tags or [],
+            publish_date=publish_date,
+            account_file=str(cookie),
+            dry_run=dry_run,
+            cover_path=cover,
+            is_draft=is_draft,
+            file_list=file_list,
+        )
+        if dry_run:
+            app.headless = False
+        asyncio.run(app.main(), debug=False)
+        print("✅ 网易号发布流程结束", flush=True)
+
+
+def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+    account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    cover = _resolve_cover_helper(cover_path)
+    publish_date = 0
+    if enableTimer:
+        publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
+        publish_date = publish_datetimes[0]
+
+    for cookie in account_paths:
+        print(f"🟢 大鱼号文章发布开始: 账号={cookie}, dryRun={dry_run}, isDraft={is_draft}", flush=True)
+        app = DayuPost(
+            title=title,
+            body=body,
+            tags=tags or [],
+            publish_date=publish_date,
+            account_file=str(cookie),
+            dry_run=dry_run,
+            cover_path=cover,
+            is_draft=is_draft,
+            file_list=file_list,
+        )
+        if dry_run:
+            app.headless = False
+        asyncio.run(app.main(), debug=False)
+        print("✅ 大鱼号发布流程结束", flush=True)
+
+
+def post_article_qiehao(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+    account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
+    cover = _resolve_cover_helper(cover_path)
+    publish_date = 0
+    if enableTimer:
+        publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
+        publish_date = publish_datetimes[0]
+
+    for cookie in account_paths:
+        print(f"🟢 企鹅号文章发布开始: 账号={cookie}, dryRun={dry_run}, isDraft={is_draft}", flush=True)
+        app = QiehaoPost(
+            title=title,
+            body=body,
+            tags=tags or [],
+            publish_date=publish_date,
+            account_file=str(cookie),
+            dry_run=dry_run,
+            cover_path=cover,
+            is_draft=is_draft,
+            file_list=file_list,
+        )
+        if dry_run:
+            app.headless = False
+        asyncio.run(app.main(), debug=False)
+        print("✅ 企鹅号发布流程结束", flush=True)
+
 
 
 # post_video("333",["demo.mp4"],"d","d")

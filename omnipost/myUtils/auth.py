@@ -195,6 +195,21 @@ async def check_cookie(type, file_path):
         # 百度贴吧
         case 10:
             return await cookie_auth_tieba(Path(BASE_DIR / "cookiesFile" / file_path))
+        # 微博
+        case 11:
+            return await cookie_auth_weibo(Path(BASE_DIR / "cookiesFile" / file_path))
+        # 微信公众号
+        case 12:
+            return await cookie_auth_wechat_mp(Path(BASE_DIR / "cookiesFile" / file_path))
+        # 网易号
+        case 13:
+            return await cookie_auth_wangyi(Path(BASE_DIR / "cookiesFile" / file_path))
+        # 大鱼号
+        case 14:
+            return await cookie_auth_dayu(Path(BASE_DIR / "cookiesFile" / file_path))
+        # 企鹅号
+        case 15:
+            return await cookie_auth_qiehao(Path(BASE_DIR / "cookiesFile" / file_path))
         case _:
             return False
 
@@ -246,3 +261,29 @@ async def cookie_auth_tieba(account_file):
             return False
         finally:
             await browser.close()
+
+
+async def cookie_auth_weibo(account_file):
+    from uploader.weibo_uploader.main import cookie_auth as weibo_auth
+    return await weibo_auth(account_file)
+
+
+async def cookie_auth_wechat_mp(account_file):
+    from uploader.wechat_mp_uploader.main import cookie_auth as wechat_auth
+    return await wechat_auth(account_file)
+
+
+async def cookie_auth_wangyi(account_file):
+    from uploader.wangyi_uploader.main import cookie_auth as wangyi_auth
+    return await wangyi_auth(account_file)
+
+
+async def cookie_auth_dayu(account_file):
+    from uploader.dayu_uploader.main import cookie_auth as dayu_auth
+    return await dayu_auth(account_file)
+
+
+async def cookie_auth_qiehao(account_file):
+    from uploader.qiehao_uploader.main import cookie_auth as qiehao_auth
+    return await qiehao_auth(account_file)
+

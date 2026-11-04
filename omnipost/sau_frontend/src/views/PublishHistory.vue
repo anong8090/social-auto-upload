@@ -435,7 +435,13 @@ const platformMap = {
   6: 'B站',
   7: '今日头条',
   8: '搜狐',
-  9: '知乎'
+  9: '知乎',
+  10: '百度贴吧',
+  11: '微博',
+  12: '微信公众号',
+  13: '网易号',
+  14: '大鱼号',
+  15: '企鹅号'
 }
 
 const getPlatformTagType = (type) => {
@@ -449,6 +455,12 @@ const getPlatformTagType = (type) => {
     7: 'danger',   // 头条
     8: 'info',     // 搜狐
     9: 'primary',  // 知乎
+    10: 'warning', // 百度贴吧
+    11: 'danger',  // 微博
+    12: 'success', // 微信公众号
+    13: 'danger',  // 网易号
+    14: 'warning', // 大鱼号
+    15: 'primary', // 企鹅号
   }
   return map[type] || 'info'
 }

@@ -40,7 +40,7 @@ if lsof -Pi :5173 -sTCP:LISTEN -t >/dev/null 2>&1 ; then
 else
     echo "▶️ 启动前端 Web 界面..."
     if [ -d "omnipost/sau_frontend/node_modules" ]; then
-        (cd omnipost/sau_frontend && nohup ./node_modules/.bin/vite --host 0.0.0.0 --port 5173 </dev/null > ../frontend.log 2>&1 & disown)
+        (cd omnipost/sau_frontend && nohup env CI=true ./node_modules/.bin/vite --host 0.0.0.0 --port 5173 > ../frontend.log 2>&1 &)
     elif [ -d "omnipost/sau_frontend/dist" ]; then
         echo "ℹ️ 使用内置静态服务运行前端 (端口: 5173)..."
         nohup omnipost/.venv/bin/python -m http.server 5173 --directory omnipost/sau_frontend/dist </dev/null > omnipost/frontend.log 2>&1 &
