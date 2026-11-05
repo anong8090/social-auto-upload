@@ -34,6 +34,7 @@ MANAGE_URLS = {
     8: "https://mp.sohu.com/mpfe/v4/contentManagement/news",
     9: "https://www.zhihu.com/creator/manage/creation/all",
     11: "https://weibo.com/",
+    12: "https://mp.weixin.qq.com/cgi-bin/appmsg?begin=0&count=10&type=77&action=list_card",
     13: "https://mp.163.com/",
     14: "https://mp.dayu.com/",
     15: "https://om.qq.com/articleManager/articleList",
@@ -55,7 +56,11 @@ def _title_hit(candidate: str, title: str) -> bool:
 
 
 async def _first_matching_link(page, selectors: list[str], title: str) -> str:
-    """在页面上按标题匹配链接，匹配不到退回首条。"""
+    """在内容管理页按标题匹配公开链接。
+
+    注意：绝不能在标题匹配失败时退回首条链接；首条通常是上一期文章，
+    会把错误链接回填到台账。只有调用方未给标题时才允许退回列表首条。
+    """
     fallback = ""
     for selector in selectors:
         try:
@@ -66,6 +71,12 @@ async def _first_matching_link(page, selectors: list[str], title: str) -> str:
             try:
                 href = await anchor.get_attribute("href")
                 text = (await anchor.inner_text()) or ""
+                card = (await anchor.evaluate(
+                    """el => {
+                        const box = el.closest('li, tr, [class*="item"], [class*="card"], [class*="articleItem"]');
+                        return (box || el.parentElement || el).innerText || '';
+                    }"""
+                )) or ""
             except Exception:
                 continue
             if not href:
@@ -73,11 +84,16 @@ async def _first_matching_link(page, selectors: list[str], title: str) -> str:
             url = href if href.startswith("http") else "https:" + href
             if "/preview" in url:
                 continue
+            # 后台列表链接常带统计参数，回台账时只保留公开地址
+            if "toutiao.com/item/" in url:
+                url = url.split("?", 1)[0]
+            if url.startswith("http://"):
+                url = "https://" + url[len("http://"):]
             if not fallback:
                 fallback = url
-            if _title_hit(text, title) or _title_hit(url, title):
+            if _title_hit(text, title) or _title_hit(card, title) or _title_hit(url, title):
                 return url
-    return fallback
+    return fallback if not title else ""
 
 
 def _derive_baijiahao_id(url: str) -> str:
@@ -91,10 +107,11 @@ def _item_id_from_url(platform_type: int, url: str) -> str:
         return ""
     patterns = {
         5: r"[?&]id=(\d+)",
-        7: r"/(?:article|w|i)/(\d+)",
+        7: r"/(?:article|item|w|i)/(\d+)",
         8: r"/a/(\d+)",
         9: r"/p/(\d+)",
-        11: r"/(\d{6,})",
+        11: r"weibo\.com/\d+/([A-Za-z0-9]{6,})",
+        12: r"/s/([A-Za-z0-9_-]{6,})",
         13: r"/article/([A-Za-z0-9_-]+)",
         14: r"/content/([A-Za-z0-9_-]+)",
         15: r"/(?:article|detail)/([A-Za-z0-9_-]+)",
@@ -105,6 +122,9 @@ def _item_id_from_url(platform_type: int, url: str) -> str:
 
 async def _collect_with_page(platform_type: int, cookie: Path, title: str, timeout: int) -> str:
     from playwright.async_api import async_playwright
+
+    if not title:
+        return ""
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, channel="chrome")
@@ -120,10 +140,23 @@ async def _collect_with_page(platform_type: int, cookie: Path, title: str, timeo
 
             selectors = {
                 5: ['a[href*="baijiahao.baidu.com/s?id="]', 'a[href*="/builder/preview/s?id="]'],
-                7: ['a[href*="/article/"]', 'a[href*="/w/"]', 'a[href*="/i/"]'],
+                7: [
+                    'a[href*="toutiao.com/item/"]',
+                    'a[href*="toutiao.com/article/"]',
+                    'a[href*="/w/"]',
+                    'a[href*="/i/"]',
+                ],
                 8: ['a[href*="sohu.com/a/"]'],
                 9: ['a[href*="zhuanlan.zhihu.com/p/"]'],
-                11: ['a[href*="weibo.com/"][href*="/"]'],
+                11: [
+                    'a[href*="/status/"]',
+                    'a[href*="/detail/"]',
+                    'a[href*="weibo.com/"][href*="/"][href*="?"]',
+                ],
+                12: [
+                    'a[href*="mp.weixin.qq.com/s/"]',
+                    'a[href*="/s?__biz="]',
+                ],
                 13: ['a[href*="/article/"]'],
                 14: ['a[href*="/content/"]'],
                 15: ['a[href*="article"]', 'a[href*="detail"]'],
@@ -163,7 +196,15 @@ async def collect(
     if not cookie.exists():
         return ""
     try:
-        return await _collect_with_page(platform_type, cookie, title, timeout)
+        url = await _collect_with_page(platform_type, cookie, title, timeout)
+        # 微博首页/游戏页等不是文章链接，必须严格校验，避免把错误链接回填台账
+        if platform_type == 11 and url:
+            if not re.search(r"weibo\.com/\d+/[A-Za-z0-9]{6,}", url) and not re.search(
+                r"/(?:status|detail)/", url
+            ):
+                print(f"⚠️ 微博链接不是文章页，已丢弃: {url}", flush=True)
+                return ""
+        return url
     except Exception as exc:  # noqa: BLE001
         print(f"⚠️ {PLATFORM_NAMES.get(platform_type, platform_type)} 链接采集失败: {exc}", flush=True)
         return ""

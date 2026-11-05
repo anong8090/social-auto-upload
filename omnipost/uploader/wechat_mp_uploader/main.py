@@ -165,6 +165,7 @@ class WechatMpPost(object):
         cover_path=None,
         is_draft=True,  # 公众号默认存为官方草稿箱
         author="",
+        file_list=None,
     ):
         raw_title = (title or "").strip()
         self.title = re.sub(r"^【.*?】\s*", "", raw_title).strip()[:TITLE_MAX_LEN]
@@ -176,6 +177,10 @@ class WechatMpPost(object):
         self.dry_run = bool(dry_run)
         self.is_draft = bool(is_draft)
         self.cover_path = cover_path
+        self.file_list = [
+            str(Path(p).resolve()) for p in (file_list or [])
+            if p and Path(p).is_file()
+        ]
         self.headless = LOCAL_CHROME_HEADLESS if not self.dry_run else False
 
     async def main(self) -> None:
@@ -227,34 +232,92 @@ class WechatMpPost(object):
 
             await page.wait_for_timeout(4000)
 
-            # 填充标题
-            title_input = page.locator('#title, input[placeholder*="标题"], textarea[placeholder*="标题"]').first
-            if await title_input.count():
+            # 填充标题：新版可见标题是 ProseMirror 覆盖层，隐藏 textarea#title 只是镜像
+            title_input = page.locator(
+                '.title-editor__input .ProseMirror[contenteditable="true"], '
+                '.title-editor-overlay .ProseMirror[contenteditable="true"], '
+                '[contenteditable="true"][data-placeholder*="标题"]'
+            ).first
+
+            if await title_input.count() and await title_input.is_visible():
+                await title_input.wait_for(state="visible", timeout=15000)
                 await title_input.click()
-                await title_input.fill(self.title)
+                await page.keyboard.press("ControlOrMeta+A")
+                await page.keyboard.insert_text(self.title)
+                await page.evaluate(
+                    """(t) => {
+                        const el = document.querySelector('#title');
+                        if (!el) return;
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        )?.set;
+                        if (setter) setter.call(el, t);
+                        else el.value = t;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    self.title,
+                )
                 wechat_mp_logger.info(f"已填写文章标题: {self.title}")
+            else:
+                legacy_title = page.locator(
+                    'textarea#title:visible, '
+                    'input[placeholder*="标题"]:visible, '
+                    'textarea[placeholder*="标题"]:visible'
+                ).first
+                if await legacy_title.count():
+                    await legacy_title.fill(self.title)
+                    wechat_mp_logger.info(f"已填写文章标题（旧版编辑器）: {self.title}")
+                else:
+                    raise RuntimeError("未找到微信公众号可见标题编辑器")
 
             # 填充作者
             author_input = page.locator('#author, input[placeholder*="作者"]').first
             if await author_input.count():
                 await author_input.fill(self.author)
 
-            # 填充正文
-            editor = page.locator('#js_editor_area, div[contenteditable="true"], .edui-editor-body').first
-            if await editor.count():
-                await editor.click()
-                await page.wait_for_timeout(500)
-                # 使用 evaluate 写入富文本或纯文本换行
-                escaped_body = self.body.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
-                await page.evaluate(f"""() => {{
-                    const ed = document.querySelector('#js_editor_area') || document.querySelector('div[contenteditable="true"]');
-                    if (ed) {{
-                        const paragraphs = `{escaped_body}`.split('\\n');
-                        ed.innerHTML = paragraphs.map(p => p.trim() ? `<p>${{p}}</p>` : '<p><br></p>').join('');
-                        ed.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    }}
-                }}""")
-                wechat_mp_logger.info(f"正文注入完成，长度={len(self.body)}")
+            # 正文：先找新版主文档 ProseMirror，再兜底旧版 ueditor iframe
+            editor = page.locator(
+                '#edui1_iframeholder .rich_media_content .ProseMirror[contenteditable="true"], '
+                '#ueditor_0 .rich_media_content .ProseMirror[contenteditable="true"], '
+                '#js_editor_area .ProseMirror[contenteditable="true"], '
+                '#js_editor_area .rich_media_content[contenteditable="true"]'
+            ).first
+
+            if not (await editor.count() and await editor.is_visible()):
+                frame_body = page.frame_locator('iframe#ueditor_0').locator(
+                    'body[contenteditable="true"], body .ProseMirror[contenteditable="true"]'
+                ).first
+                if await frame_body.count():
+                    editor = frame_body
+
+            if not (await editor.count() and await editor.is_visible()):
+                raise RuntimeError("未找到微信公众号正文编辑器")
+
+            await editor.click()
+            await page.wait_for_timeout(500)
+            await editor.evaluate(
+                """(el, text) => {
+                    const esc = (s) => s.replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    const lines = text.split(/\\r?\\n/);
+                    el.innerHTML = lines.map(p =>
+                        p.trim() ? '<p>' + esc(p) + '</p>' : '<p><br></p>'
+                    ).join('');
+                    el.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, inputType: 'insertHTML'
+                    }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }""",
+                self.body,
+            )
+            await page.wait_for_timeout(800)
+            got = len(((await editor.inner_text()) or "").strip())
+            if got < max(80, int(len(self.body) * 0.6)):
+                raise RuntimeError(
+                    f"公众号正文注入校验失败：期望约 {len(self.body)} 字，实际 {got} 字"
+                )
+            wechat_mp_logger.info(f"正文注入完成，长度={len(self.body)}，读回 {got} 字")
 
             await page.wait_for_timeout(2000)
 
@@ -267,9 +330,14 @@ class WechatMpPost(object):
                 wechat_mp_logger.info("🛑 【预览模式】跳过保存与发布")
                 return
 
-            # 点击「保存为草稿」
-            save_draft_btn = page.locator('button:has-text("保存为草稿"), #js_submit, a:has-text("保存为草稿")').first
-            if await save_draft_btn.count():
+            if self.is_draft:
+                save_draft_btn = page.locator(
+                    '#js_submit button:has-text("保存为草稿"), '
+                    'button:has-text("保存为草稿"), '
+                    'a:has-text("保存为草稿")'
+                ).first
+                if not (await save_draft_btn.count() and await save_draft_btn.is_visible()):
+                    raise RuntimeError("未定位到可见的「保存为草稿」按钮")
                 await save_draft_btn.click()
                 wechat_mp_logger.info("已点击「保存为草稿」")
                 await page.wait_for_timeout(4000)
@@ -277,7 +345,32 @@ class WechatMpPost(object):
                 await page.screenshot(path=str(done_shot))
                 wechat_mp_logger.success(f"🎉 微信公众号已存入官方草稿箱！截图: {done_shot}")
             else:
-                wechat_mp_logger.warning("未定位到「保存为草稿」按钮")
+                send_btn = page.locator(
+                    '#js_send .mass_send, #js_send button:has-text("发表")'
+                ).first
+                if not (await send_btn.count() and await send_btn.is_visible()):
+                    raise RuntimeError("未定位到可见的「发表」按钮")
+                await send_btn.click()
+                await page.wait_for_timeout(2000)
+
+                confirm = page.locator(
+                    '.mass-send__footer .weui-desktop-btn_primary:has-text("发表"), '
+                    '.weui-desktop-dialog button.weui-desktop-btn_primary:has-text("发表")'
+                ).first
+                if await confirm.count() and await confirm.is_visible():
+                    await confirm.click()
+                await page.wait_for_timeout(2000)
+
+                continue_btn = page.locator('button:has-text("继续发表")').first
+                if await continue_btn.count() and await continue_btn.is_visible():
+                    await continue_btn.click()
+
+                # 管理员扫码确认无法由 DOM 完成，遇到就算未完成，交给上层标记失败
+                if await page.locator('text=扫描二维码, text=管理员确认').count():
+                    raise RuntimeError("微信公众号发表需要管理员扫码确认，无法自动完成")
+
+                await page.wait_for_timeout(3000)
+                wechat_mp_logger.success("已点击「发表」链路")
 
         finally:
             await browser.close()

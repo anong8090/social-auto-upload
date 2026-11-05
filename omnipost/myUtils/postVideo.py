@@ -61,8 +61,8 @@ def post_article_tencent(title, files, note, tags, account_file, enableTimer=Fal
             is_draft=is_draft,
             ai_generated=ai_generated,
         )
-        if dry_run:
-            kwargs["headless"] = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+# 如需调试可见窗口，请显式传入 headless=False
         app = TencentNote(**kwargs)
         asyncio.run(app.main(), debug=False)
 
@@ -99,8 +99,8 @@ def post_video_tencent(title,files,tags,account_file,category=TencentZoneTypes.L
                     else TENCENT_PUBLISH_STRATEGY_IMMEDIATE
                 ),
             )
-            if dry_run:
-                kwargs["headless"] = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             app = TencentVideo(**kwargs)
             asyncio.run(app.main(), debug=False)
 
@@ -142,8 +142,8 @@ def post_video_DouYin(title,files,tags,account_file,category=TencentZoneTypes.LI
                     else DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
                 ),
             )
-            if dry_run:
-                kwargs["headless"] = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             app = DouYinVideo(**kwargs)
             asyncio.run(app.douyin_upload_video(), debug=False)
 
@@ -173,8 +173,8 @@ def post_video_ks(title,files,tags,account_file,category=TencentZoneTypes.LIFEST
                 dry_run=dry_run,
                 ai_generated=ai_generated,
             )
-            if dry_run:
-                kwargs["headless"] = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             app = KSVideo(**kwargs)
             asyncio.run(app.main(), debug=False)
 
@@ -205,8 +205,8 @@ def post_video_xhs(title,files,tags,account_file,category=TencentZoneTypes.LIFES
                 ai_generated=ai_generated,
                 is_draft=is_draft,
             )
-            if dry_run:
-                kwargs["headless"] = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             app = XiaoHongShuVideo(**kwargs)
             asyncio.run(app.main(), debug=False)
 
@@ -240,7 +240,7 @@ def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, vid
             account_file=str(cookie),
             publish_strategy=publish_strategy,
             debug=False,
-            headless=False if dry_run else LOCAL_CHROME_HEADLESS,
+            headless=LOCAL_CHROME_HEADLESS,
             dry_run=dry_run,
             ai_generated=ai_generated,
             is_draft=is_draft,
@@ -270,8 +270,8 @@ def post_video_baijiahao(title, files, tags, account_file, category=TencentZoneT
             print(f"标题：{title}", flush=True)
             print(f"Hashtag：{tags}", flush=True)
             app = BaiJiaHaoVideo(title, str(file), tags, publish_datetimes[index], str(cookie), dry_run=dry_run)
-            if dry_run:
-                app.headless = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             asyncio.run(app.main(), debug=False)
             print(f"✅ 百家号发布流程结束: {file}", flush=True)
 
@@ -291,8 +291,8 @@ def post_video_toutiao(title, files, tags, account_file, category=TencentZoneTyp
             print(f"Hashtag：{tags}")
             print(f"仅预览不发布：{dry_run}")
             app = TouTiaoVideo(title, str(file), tags, publish_datetimes[index], cookie, dry_run=dry_run)
-            if dry_run:
-                app.headless = False
+            # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+            # 如需调试可见窗口，请显式传入 headless=False
             asyncio.run(app.main(), debug=False)
 
 
@@ -308,6 +308,7 @@ def post_article_toutiao(
     dry_run=False,
     cover_path="",
     work_statements=None,
+    inline_image_paths=None,
 ):
     """今日头条图文文章发布（contentType=article）。
 
@@ -365,9 +366,10 @@ def post_article_toutiao(
             dry_run=dry_run,
             cover_path=cover,
             work_statements=work_statements,
+            inline_image_paths=inline_image_paths,
         )
-        if dry_run:
-            app.headless = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+        # 如需调试可见窗口，请显式传入 headless=False
         asyncio.run(app.main(), debug=False)
 
 
@@ -383,6 +385,7 @@ def post_article_baijiahao(
     dry_run=False,
     cover_path="",
     ai_generated=False,
+    inline_image_paths=None,
 ):
     """百家号图文文章发布（contentType=article）。
 
@@ -449,9 +452,11 @@ def post_article_baijiahao(
             dry_run=dry_run,
             cover_path=cover,
             ai_generated=ai_generated,
+            inline_image_paths=inline_image_paths,
         )
         # 百家号图文因百度安全验证机制，使用可见窗口执行以便通过验证
-        app.headless = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+        # 如需调试可见窗口，请显式传入 headless=False
         asyncio.run(app.main(), debug=False)
         print(f"✅ 百家号图文文章发布流程结束", flush=True)
 
@@ -469,6 +474,7 @@ def post_article_sohu(
     cover_path="",
     info_source=None,
     cover_paths=None,
+    inline_image_paths=None,
 ):
     """搜狐号图文文章发布（type=8, contentType=article）。
 
@@ -544,9 +550,10 @@ def post_article_sohu(
             cover_path=resolved_covers[0] if resolved_covers else None,
             cover_paths=resolved_covers,
             info_source=info_source,
+            inline_image_paths=inline_image_paths,
         )
-        if dry_run:
-            app.headless = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+        # 如需调试可见窗口，请显式传入 headless=False
         asyncio.run(app.main(), debug=False)
         print(f"✅ 搜狐号图文文章发布流程结束", flush=True)
 
@@ -564,6 +571,7 @@ def post_article_zhihu(
     cover_path="",
     creation_statement=None,
     is_draft=False,
+    inline_image_paths=None,
 ):
     """知乎文章发布（type=9, contentType=article）。
 
@@ -627,9 +635,10 @@ def post_article_zhihu(
             cover_path=cover,
             creation_statement=creation_statement,
             is_draft=is_draft,
+            inline_image_paths=inline_image_paths,
         )
-        if dry_run:
-            app.headless = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+        # 如需调试可见窗口，请显式传入 headless=False
         asyncio.run(app.main(), debug=False)
         print(f"✅ 知乎文章发布流程结束", flush=True)
 
@@ -725,8 +734,8 @@ def post_article_tieba(
             cover_path=cover,
             is_draft=is_draft,
         )
-        if dry_run:
-            app.headless = False
+        # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
+        # 如需调试可见窗口，请显式传入 headless=False
         asyncio.run(app.main(), debug=False)
         print(f"✅ 百度贴吧图文帖发布流程结束", flush=True)
 
@@ -873,7 +882,7 @@ def post_article_weibo(title, body, tags, account_file, enableTimer=False, video
     return results[0] if results else ""
 
 
-def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True):
+def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
     publish_date = 0
@@ -892,6 +901,7 @@ def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, v
             dry_run=dry_run,
             cover_path=cover,
             is_draft=is_draft,
+            file_list=file_list,
         )
         if dry_run:
             app.headless = False

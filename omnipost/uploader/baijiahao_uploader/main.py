@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import html as html_lib
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -656,6 +658,7 @@ class BaiJiaHaoArticle(object):
         dry_run=False,
         cover_path=None,
         ai_generated=False,
+        inline_image_paths=None,
     ):
         self.title = (title or "")[:64]
         self.body = body or ""
@@ -666,6 +669,10 @@ class BaiJiaHaoArticle(object):
         self.dry_run = bool(dry_run)
         self.cover_path = cover_path
         self.ai_generated = bool(ai_generated)
+        self.inline_image_paths = [
+            str(Path(p).resolve()) for p in (inline_image_paths or [])
+            if p and Path(p).is_file()
+        ]
 
     def _normalize_tags(self) -> list[str]:
         tags = [str(t).strip().lstrip("#") for t in (self.tags or []) if str(t).strip()]
@@ -678,8 +685,54 @@ class BaiJiaHaoArticle(object):
             normalized.append(tag)
         return normalized[:5]
 
+    _MD_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s*")
+    _MD_HR = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$")
+    _MD_QUOTE = re.compile(r"^\s*>\s?")
+    _MD_BOLD = re.compile(r"\*\*(.+?)\*\*")
+    _MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+    _MD_BULLET = re.compile(r"^\s*[-*+]\s+")
+    # 母本文件头的元数据行与结构占位小标题，不应进入正文
+    _MD_META_PREFIXES = (
+        "适用平台", "标题字数", "AI 声明", "AI声明", "作者", "标签",
+        "配图", "封面", "正文字数", "发布时间",
+    )
+    _MD_PLACEHOLDER_HEADINGS = ("正文内容", "正文", "正文如下")
+
+    def _markdown_lines(self) -> list[tuple[str, bool]]:
+        """把 Markdown 母本拆成 (纯文本行, 是否小标题)。
+
+        母本是 Markdown，直接灌进百家号编辑器会把 `##`、`**` 原样发出去。
+        这里统一剥离标记，保留小标题的加粗层级。
+        """
+        out: list[tuple[str, bool]] = []
+        for raw in (self.body or "").splitlines():
+            line = raw.rstrip()
+            if not line.strip() or self._MD_HR.match(line):
+                continue
+            line = self._MD_QUOTE.sub("", line)
+            level = 0
+            m = self._MD_HEADING.match(line)
+            if m:
+                level = len(m.group(1))
+                line = self._MD_HEADING.sub("", line)
+            if level == 1:
+                # 一级标题就是文章标题（或文末 #话题 行），正文里不再重复
+                continue
+            probe = line.strip().lstrip("*").strip()
+            if probe.startswith(self._MD_META_PREFIXES):
+                continue
+            if probe.strip("：: *") in self._MD_PLACEHOLDER_HEADINGS:
+                continue
+            line = self._MD_BOLD.sub(r"\1", line)
+            line = self._MD_LINK.sub(r"\1", line)
+            line = self._MD_BULLET.sub("", line)
+            line = line.replace("**", "").replace("`", "").strip()
+            if line:
+                out.append((line, level >= 2))
+        return out
+
     def _compose_body(self) -> str:
-        return (self.body or "").strip()
+        return "\n".join(text for text, _ in self._markdown_lines()).strip()
 
     async def _is_article_page_ready(self, page: Page) -> bool:
         title_selectors = [
@@ -750,7 +803,7 @@ class BaiJiaHaoArticle(object):
                     await loc.fill("")
                     await loc.fill(title_text)
                 except Exception:
-                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("ControlOrMeta+A")
                     await page.keyboard.press("Backspace")
                     await page.keyboard.type(title_text)
                 baijiahao_logger.info(f"已填写文章标题: {title_text}")
@@ -920,7 +973,11 @@ class BaiJiaHaoArticle(object):
                     pass
             if editor_frame:
                 ed = editor_frame.locator(".news-editor-pc")
-                paragraphs = "".join([f"<p>{line}</p>" for line in text.strip().split("\n") if line.strip()])
+                paragraphs = "".join(
+                    f"<p><strong>{html_lib.escape(t)}</strong></p>" if is_heading
+                    else f"<p>{html_lib.escape(t)}</p>"
+                    for t, is_heading in self._markdown_lines()
+                )
                 await ed.evaluate("""(el, html) => {
                     el.focus();
                     el.innerHTML = html;
@@ -928,8 +985,15 @@ class BaiJiaHaoArticle(object):
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                 }""", paragraphs)
                 await page.wait_for_timeout(800)
+
+                got = len(((await ed.inner_text()) or "").strip())
+                expected = len(text.strip())
+                if got < max(80, int(expected * 0.6)):
+                    raise RuntimeError(
+                        f"百家号正文注入校验失败：期望约 {expected} 字，实际读回 {got} 字"
+                    )
                 filled = True
-                baijiahao_logger.info("文章正文已通过 iframe DOM 富文本注入成功")
+                baijiahao_logger.info(f"文章正文已通过 iframe DOM 富文本注入成功（约 {got} 字）")
         except Exception as exc:
             baijiahao_logger.warning(f"iframe DOM 富文本注入失败: {exc}")
 
@@ -971,7 +1035,103 @@ class BaiJiaHaoArticle(object):
                 )
             baijiahao_logger.info("文章正文已通过 fill/DOM 写入")
 
+        try:
+            got = len(((await editor.inner_text()) or "").strip())
+        except Exception:
+            got = 0
+        expected = len(text.strip())
+        if got < max(80, int(expected * 0.6)):
+            raise RuntimeError(
+                f"百家号正文写入校验失败：期望约 {expected} 字，编辑器仅读回 {got} 字"
+            )
+        baijiahao_logger.success(f"正文写入校验通过（约 {got} 字）")
+
         await self.insert_topics_in_body(page, editor)
+
+    async def _confirm_image_modal(self, page: Page) -> bool:
+        """点击图片弹窗底部「确认」。
+
+        页面上常同时存在多个隐藏弹窗的「确认」按钮，必须限定在
+        `.cheetah-modal-footer` 内，否则会点到不可见的那个，图片永远进不了正文。
+        """
+        for sel in (
+            ".cheetah-modal-footer button:has-text('确认')",
+            ".cheetah-modal-footer .cheetah-btn-primary",
+            ".cheetah-modal-footer button:has-text('确定')",
+        ):
+            loc = page.locator(sel).last
+            try:
+                if await loc.count() and await loc.is_visible():
+                    await loc.click(force=True, timeout=5000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _insert_inline_images(self, page: Page) -> None:
+        """通过编辑器图片按钮批量插入 16:9 内文图；少于预期则中止发布。"""
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        if not paths:
+            return
+
+        editor = await self._wait_for_body_editor(page)
+        if not editor:
+            raise RuntimeError("未找到正文编辑区")
+        try:
+            before = await editor.locator("img").count()
+        except Exception:
+            before = 0
+
+        await editor.click(force=True)
+        await page.keyboard.press("ControlOrMeta+End")
+        await page.wait_for_timeout(400)
+
+        btn = page.locator(
+            ".edui-for-insertimage .edui-button-body, .edui-for-insertimage"
+        ).first
+        if not await btn.count():
+            btn = page.locator('[class*="insertimage"]').first
+        await btn.click(force=True, timeout=8000)
+        await page.wait_for_timeout(2000)
+
+        file_input = page.locator('input[type="file"][accept*="image"]').last
+        if not await file_input.count():
+            file_input = page.locator('input[type="file"]').last
+        await file_input.set_input_files([str(p) for p in paths])
+
+        expected = f"{len(paths)}张上传成功"
+        uploaded = False
+        for _ in range(30):
+            await page.wait_for_timeout(600)
+            try:
+                text = await page.locator(".cheetah-modal-body").last.inner_text()
+            except Exception:
+                continue
+            if expected in text or "上传成功" in text:
+                if expected in text:
+                    uploaded = True
+                    break
+        if not uploaded:
+            baijiahao_logger.warning(f"未等到「{expected}」提示，仍尝试点击确认")
+
+        if not await self._confirm_image_modal(page):
+            raise RuntimeError("图片弹窗「确认」按钮点击失败，内文图未进入正文")
+
+        after = before
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            try:
+                after = await editor.locator("img").count()
+            except Exception:
+                after = before
+            if after - before >= len(paths):
+                break
+
+        if after - before < len(paths):
+            raise RuntimeError(
+                f"内文图仅成功插入 {after - before}/{len(paths)} 张，已中止发布，避免正文缺图"
+            )
+        baijiahao_logger.success(f"内文图 {len(paths)} 张已进入正文（图片数 {before}→{after}）")
 
     async def _move_caret_to_editor_end(self, page: Page, editor) -> None:
         try:
@@ -980,7 +1140,7 @@ class BaiJiaHaoArticle(object):
         except Exception:
             pass
         await page.wait_for_timeout(100)
-        for key in ("Control+End", "End", "Control+ArrowDown"):
+        for key in ("ControlOrMeta+End", "End", "ControlOrMeta+ArrowDown"):
             try:
                 await page.keyboard.press(key)
             except Exception:
@@ -1902,6 +2062,7 @@ class BaiJiaHaoArticle(object):
         await self.fill_title(page)
         await page.wait_for_timeout(500)
         await self.fill_body(page)
+        await self._insert_inline_images(page)
         await self.handle_cover(page)
         await self.apply_ai_declaration(page)
         await _dismiss_overlays(page)

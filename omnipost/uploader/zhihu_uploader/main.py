@@ -160,6 +160,7 @@ class ZhiHuArticle(object):
         cover_path=None,
         creation_statement=None,
         is_draft=False,
+        inline_image_paths=None,
     ):
         import re
         raw_title = (title or "").strip()
@@ -178,6 +179,10 @@ class ZhiHuArticle(object):
         self.headless = LOCAL_CHROME_HEADLESS if not self.dry_run else False
         self.cover_path = self._normalize_cover(cover_path)
         self.creation_statement = self._normalize_creation_statement(creation_statement)
+        self.inline_image_paths = [
+            str(Path(p).resolve()) for p in (inline_image_paths or [])
+            if p and Path(p).is_file()
+        ]
 
     @staticmethod
     def _normalize_cover(cover_path) -> str | None:
@@ -245,6 +250,7 @@ class ZhiHuArticle(object):
                 raise RuntimeError("知乎 cookie 已失效，请重新登录")
             await self.fill_title(page)
             await self.fill_body(page)
+            await self._insert_inline_images(page)
             if self.cover_path:
                 await self.upload_cover(page)
             await self.apply_creation_statement(page)
@@ -435,6 +441,88 @@ class ZhiHuArticle(object):
 
         final_len = len(await editor.inner_text())
         zhihu_logger.info(f"已填写正文，文本长度={len(self.body)}，知乎编辑器实际录入字数={final_len}")
+        if final_len < max(80, int(len(self.body.strip()) * 0.6)):
+            raise RuntimeError(
+                f"知乎正文写入校验失败：期望约 {len(self.body.strip())} 字，实际录入 {final_len} 字"
+            )
+
+    async def _insert_inline_images(self, page: Page) -> None:
+        """在正文末尾插入 16:9 内文图。
+
+        知乎图片弹窗的 file input 支持多选，一次选全部后点「插入图片」最稳；
+        逐张插入会因弹窗未关闭导致第二张失败。以编辑器 <img> 增量校验。
+        """
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        if not paths:
+            return
+
+        editor = page.locator(
+            ".public-DraftEditor-content, .ProseMirror, [contenteditable='true']"
+        ).first
+        if not await editor.count():
+            raise RuntimeError("未找到正文编辑器")
+        try:
+            before = await editor.locator("img").count()
+        except Exception:
+            before = 0
+
+        await editor.click(force=True)
+        await page.keyboard.press("ControlOrMeta+End")
+        await page.wait_for_timeout(300)
+
+        btn = page.locator(
+            'button[aria-label*="图片"], '
+            '.Editable-toolbar button:has-text("图片"), '
+            'button:has-text("图片")'
+        ).first
+        if not await btn.count():
+            raise RuntimeError("未找到知乎图片按钮")
+        await btn.click(force=True, timeout=5000)
+        await page.wait_for_timeout(1500)
+
+        file_input = page.locator('.Modal-content input[type="file"]').last
+        if not await file_input.count():
+            file_input = page.locator('input[type="file"][accept*="image"]').last
+        if not await file_input.count():
+            raise RuntimeError("知乎图片弹窗无文件输入")
+        await file_input.set_input_files([str(p) for p in paths])
+
+        expected = f"已上传{len(paths)}张"
+        uploaded = False
+        last_text = ""
+        for _ in range(45):
+            await page.wait_for_timeout(1000)
+            last_text = await page.evaluate(
+                """() => (document.querySelector('.Modal-content')?.innerText || '').replace(/\\s/g, '')"""
+            )
+            if expected in last_text:
+                uploaded = True
+                break
+        if not uploaded:
+            raise RuntimeError(f"知乎图片弹窗未出现「{expected}」提示，弹窗文本: {last_text[-160:]}")
+
+        insert_btn = page.locator(
+            '.Modal-content button:has-text("插入图片"), '
+            '.Modal-content :text-is("插入图片")'
+        ).last
+        if not await insert_btn.count():
+            raise RuntimeError("未找到「插入图片」按钮")
+        await insert_btn.click(force=True)
+
+        after = before
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            try:
+                after = await editor.locator("img").count()
+            except Exception:
+                after = before
+            if after - before >= len(paths):
+                break
+        if after - before < len(paths):
+            raise RuntimeError(
+                f"内文图仅成功插入 {after - before}/{len(paths)} 张，已中止发布，避免正文缺图"
+            )
+        zhihu_logger.info(f"内文图 {len(paths)} 张已进入正文，图片数={after}")
 
     async def upload_cover(self, page: Page) -> None:
         if not self.cover_path or not os.path.exists(self.cover_path):

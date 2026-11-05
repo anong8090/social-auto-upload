@@ -426,6 +426,7 @@ class TouTiaoArticle(object):
         dry_run=False,
         cover_path=None,
         work_statements=None,
+        inline_image_paths=None,
     ):
         self.title = (title or "")[:30]
         self.body = body or ""
@@ -436,6 +437,7 @@ class TouTiaoArticle(object):
         self.headless = LOCAL_CHROME_HEADLESS if not dry_run else False
         self.dry_run = bool(dry_run)
         self.cover_path = cover_path
+        self.inline_image_paths = [Path(p) for p in (inline_image_paths or []) if p]
         self.work_statements = self._normalize_work_statements(work_statements)
 
     @staticmethod
@@ -564,13 +566,13 @@ class TouTiaoArticle(object):
                 pass
             await editor.click(force=True)
             await page.wait_for_timeout(200)
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("ControlOrMeta+A")
             await page.keyboard.press("Backspace")
             await page.evaluate(
                 """async (t) => { await navigator.clipboard.writeText(t); }""",
                 text,
             )
-            await page.keyboard.press("Control+V")
+            await page.keyboard.press("ControlOrMeta+V")
             await page.wait_for_timeout(800)
             filled = True
             toutiao_logger.info("正文已通过剪贴板粘贴")
@@ -580,7 +582,7 @@ class TouTiaoArticle(object):
         if not filled:
             try:
                 await editor.click(force=True)
-                await page.keyboard.press("Control+A")
+                await page.keyboard.press("ControlOrMeta+A")
                 await page.keyboard.press("Backspace")
                 chunk_size = 200
                 for i in range(0, len(text), chunk_size):
@@ -609,7 +611,7 @@ class TouTiaoArticle(object):
             pass
         await page.wait_for_timeout(100)
         # 多次 End / Ctrl+End，兼容不同编辑器
-        for key in ("Control+End", "End", "Control+ArrowDown"):
+        for key in ("ControlOrMeta+End", "End", "ControlOrMeta+ArrowDown"):
             try:
                 await page.keyboard.press(key)
             except Exception:
@@ -1287,21 +1289,104 @@ class TouTiaoArticle(object):
             await self._paste_or_type_text(page, editor, body_text)
         else:
             await editor.click(force=True)
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("ControlOrMeta+A")
             await page.keyboard.press("Backspace")
 
-        try:
-            content = await editor.inner_text()
-            if body_text.strip() and content and len(content.strip()) >= min(5, len(body_text)):
-                toutiao_logger.success(f"正文写入校验通过（约 {len(content.strip())} 字）")
-            elif body_text.strip():
-                toutiao_logger.warning(
-                    f"正文读回长度偏短（{len((content or '').strip())}），请 dry_run 人工确认"
+        if body_text.strip():
+            content = ""
+            try:
+                content = await editor.inner_text()
+            except Exception:
+                content = ""
+            got = len((content or "").strip())
+            expected = len(body_text.strip())
+            # 只读回几个字不能算成功；至少要到正文长度的 60% 且不少于 80 字
+            if got < max(80, int(expected * 0.6)):
+                raise RuntimeError(
+                    f"今日头条正文写入校验失败：期望约 {expected} 字，编辑器仅读回 {got} 字"
                 )
-        except Exception:
-            pass
+            toutiao_logger.success(f"正文写入校验通过（约 {got} 字）")
 
         await self.insert_topics_in_body(page, editor)
+
+    async def _insert_inline_images(self, page: Page) -> None:
+        """在正文末尾上传 2 张 16:9 内文图；少于预期则中止发布。"""
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        if not paths:
+            return
+
+        inserted = 0
+        for idx, img in enumerate(paths, 1):
+            try:
+                _frame, editor = await self._find_editor(page)
+                if not editor:
+                    raise RuntimeError("未找到正文编辑器")
+                try:
+                    before = await editor.locator("img").count()
+                except Exception:
+                    before = 0
+                await editor.click(force=True)
+                await page.keyboard.press("ControlOrMeta+End")
+                await page.wait_for_timeout(300)
+
+                btn = page.locator(
+                    ".syl-toolbar-tool.image button, .syl-toolbar-tool.image"
+                ).first
+                if not await btn.count():
+                    btn = page.locator('[class*="toolbar"] [class*="image"]').first
+                await btn.click(force=True, timeout=5000)
+                await page.wait_for_timeout(800)
+
+                uploaded = False
+                try:
+                    async with page.expect_file_chooser(timeout=8000) as fc:
+                        local = page.get_by_text("本地上传", exact=True).first
+                        await local.click(force=True)
+                    chooser = await fc.value
+                    await chooser.set_files(str(img))
+                    uploaded = True
+                except Exception:
+                    uploaded = False
+
+                if not uploaded:
+                    file_input = page.locator('input[type="file"][accept*="image"]').last
+                    if await file_input.count():
+                        await file_input.set_input_files(str(img))
+                        uploaded = True
+                if not uploaded:
+                    raise RuntimeError("未找到图片上传入口")
+
+                await page.wait_for_timeout(2500)
+                for label in ("确定", "完成", "确认", "使用"):
+                    ok = page.get_by_role("button", name=label).first
+                    try:
+                        if await ok.count() and await ok.is_visible():
+                            await ok.click(force=True, timeout=3000)
+                            break
+                    except Exception:
+                        continue
+
+                # 以编辑器内 <img> 实际增量为准，避免"点了没插进去"被当成成功
+                after = before
+                for _ in range(16):
+                    await page.wait_for_timeout(500)
+                    try:
+                        after = await editor.locator("img").count()
+                    except Exception:
+                        after = before
+                    if after > before:
+                        break
+                if after <= before:
+                    raise RuntimeError(f"编辑器图片数未增加（{before}→{after}）")
+                inserted += 1
+                toutiao_logger.info(f"内文图 {idx} 已进入正文，图片数={after}")
+            except Exception as exc:
+                toutiao_logger.warning(f"内文图 {idx} 插入失败: {exc}")
+
+        if inserted < len(paths):
+            raise RuntimeError(
+                f"内文图仅成功插入 {inserted}/{len(paths)} 张，已中止发布，避免正文缺图"
+            )
 
     async def _confirm_cover_dialog(self, page: Page) -> None:
         """封面裁剪/确认弹窗：尽量点掉「确定/完成/确认」。"""
@@ -2074,8 +2159,39 @@ class TouTiaoArticle(object):
             )
         if not clicked:
             raise RuntimeError("未找到可点击的「发布」按钮")
-        await page.wait_for_timeout(3000)
-        toutiao_logger.success("已点击文章发布")
+        await page.wait_for_timeout(2500)
+
+        # 头条可能再弹「确认发布 / 确定」二次确认
+        for label in ("确认发布", "确认", "确定", "继续发布"):
+            try:
+                dlg = page.get_by_role("button", name=label).last
+                if await dlg.count() and await dlg.is_visible():
+                    await dlg.click(force=True, timeout=3000)
+                    toutiao_logger.info(f"已点击二次确认「{label}」")
+                    await page.wait_for_timeout(2000)
+                    break
+            except Exception:
+                continue
+
+        # 以「离开编辑器 / 出现成功提示」作为真实成功信号
+        confirmed = False
+        for _ in range(25):
+            await page.wait_for_timeout(1000)
+            try:
+                if "graphic/publish" not in page.url and "graphic/articles/editor" not in page.url:
+                    confirmed = True
+                    break
+            except Exception:
+                pass
+            try:
+                if await page.locator("text=/发布成功|已提交审核|提交成功|审核中/").count():
+                    confirmed = True
+                    break
+            except Exception:
+                pass
+        if not confirmed:
+            raise RuntimeError(f"点击发布后未确认成功，当前页面: {page.url}")
+        toutiao_logger.success(f"已点击文章发布并确认成功，当前页面: {page.url}")
 
     async def upload(self, playwright: Playwright) -> None:
         if not (self.body or "").strip() and not self.tags:
@@ -2129,6 +2245,7 @@ class TouTiaoArticle(object):
         await self.fill_title(page)
         await page.wait_for_timeout(500)
         await self.fill_body(page)
+        await self._insert_inline_images(page)
         await self.handle_cover(page)
         await self.apply_work_statements(page)
         await _dismiss_overlays(page)

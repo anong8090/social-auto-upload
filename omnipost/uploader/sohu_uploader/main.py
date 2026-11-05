@@ -11,6 +11,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import List
 
 from playwright.async_api import Page, Playwright, async_playwright
 
@@ -197,6 +198,7 @@ class SoHuArticle(object):
         cover_path=None,
         cover_paths=None,
         info_source=None,
+        inline_image_paths=None,
     ):
         self.title = (title or "").strip()[:72]
         if len(self.title) < 5:
@@ -210,6 +212,10 @@ class SoHuArticle(object):
         self.cover_paths = self._normalize_cover_paths(cover_path, cover_paths)
         self.cover_path = self.cover_paths[0] if self.cover_paths else None
         self.info_source = self._normalize_info_source(info_source)
+        self.inline_image_paths = [
+            str(Path(p).resolve()) for p in (inline_image_paths or [])
+            if p and Path(p).is_file()
+        ]
 
     @staticmethod
     def _normalize_cover_paths(cover_path, cover_paths) -> list[str]:
@@ -340,13 +346,13 @@ class SoHuArticle(object):
                 pass
             await editor.click(force=True)
             await page.wait_for_timeout(200)
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press("ControlOrMeta+A")
             await page.keyboard.press("Backspace")
             await page.evaluate(
                 """async (t) => { await navigator.clipboard.writeText(t); }""",
                 text,
             )
-            await page.keyboard.press("Control+V")
+            await page.keyboard.press("ControlOrMeta+V")
             await page.wait_for_timeout(800)
             filled = True
             sohu_logger.info("正文已通过剪贴板粘贴")
@@ -356,7 +362,7 @@ class SoHuArticle(object):
         if not filled:
             try:
                 await editor.click(force=True)
-                await page.keyboard.press("Control+A")
+                await page.keyboard.press("ControlOrMeta+A")
                 await page.keyboard.press("Backspace")
                 chunk_size = 200
                 for i in range(0, len(text), chunk_size):
@@ -393,6 +399,176 @@ class SoHuArticle(object):
 
         await self._paste_or_type_text(page, editor, body_text)
         sohu_logger.info(f"已填写正文，长度={len(body_text)}")
+
+    async def _apply_ai_statement(self, page: Page) -> None:
+        """勾选创作声明「含有AI生成内容」。"""
+        try:
+            ai_radio = page.locator(
+                'label.el-radio:has-text("含有AI生成内容"), '
+                'span.el-radio__label:has-text("含有AI生成内容")'
+            ).first
+            if await ai_radio.count() and await ai_radio.is_visible():
+                await ai_radio.scroll_into_view_if_needed(timeout=5000)
+                await ai_radio.click(force=True, timeout=5000)
+                sohu_logger.success("已勾选创作声明: 含有AI生成内容")
+            else:
+                sohu_logger.warning("未找到创作声明「含有AI生成内容」，请 dry_run 人工确认")
+        except Exception as exc:
+            sohu_logger.warning(f"勾选创作声明失败: {exc}")
+
+    async def _editor_image_count(self, page: Page) -> int:
+        try:
+            return await page.locator(".ql-editor img").count()
+        except Exception:
+            return 0
+
+    async def _open_image_dialog(self, page: Page) -> None:
+        """点击工具栏图片按钮，直到上传弹窗的 file input 出现。"""
+        editor = page.locator(".ql-editor").first
+        await editor.click(force=True)
+        await page.wait_for_timeout(500)
+
+        btn = None
+        for sel in (
+            ".ql-toolbar .ql-image",
+            "button.ql-image",
+            "[class*='ql-image']",
+            'button:has-text("图片")',
+        ):
+            candidate = page.locator(sel).first
+            if await candidate.count() and await candidate.is_visible():
+                btn = candidate
+                break
+        if not btn:
+            raise RuntimeError("未找到正文配图按钮")
+        await btn.click(force=True)
+
+        for _ in range(20):
+            await page.wait_for_timeout(500)
+            if await page.locator('.win-mask input[type="file"]').count():
+                return
+        raise RuntimeError("配图弹窗无文件输入")
+
+    async def _confirm_upload_dialog(self, page: Page) -> bool:
+        """点上传弹窗内的「确定」；页面别处还有同名按钮，必须限定在弹窗内。"""
+        return await page.evaluate(
+            """() => {
+                const pick = (root) => [...root.querySelectorAll(
+                    'p, button, [role="button"], .positive-button'
+                )].find(x =>
+                    (x.innerText || x.textContent || '').replace(/\\s/g, '') === '确定'
+                    && x.offsetHeight > 0
+                );
+                const mask = document.querySelector('.win-mask');
+                const e = (mask && pick(mask)) || pick(document);
+                if (e) { e.click(); return true; }
+                return false;
+            }"""
+        )
+
+    async def _dismiss_upload_mask(self, page: Page) -> None:
+        """等弹窗自动关闭；残留在则关掉，避免遮挡下一次点击。"""
+        for _ in range(12):
+            if await page.locator(".win-mask").count() == 0:
+                return
+            await page.wait_for_timeout(500)
+        try:
+            await page.locator(
+                ".win-mask .win-close, .win-mask [class*='close']"
+            ).first.click(force=True, timeout=2000)
+        except Exception:
+            pass
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await page.wait_for_timeout(1000)
+
+    async def _upload_images_at_once(self, page: Page, paths: List[Path]) -> None:
+        """弹窗支持多选：一次选中全部配图，避免第二张被残留遮罩拦截。"""
+        await self._open_image_dialog(page)
+        file_input = page.locator('.win-mask input[type="file"]').last
+        await file_input.set_input_files([str(p) for p in paths])
+
+        expected = f"已成功上传{len(paths)}张"
+        uploaded = False
+        for _ in range(40):
+            await page.wait_for_timeout(500)
+            text = await page.evaluate(
+                """() => (document.querySelector('.win-mask')?.innerText || '').replace(/\\s/g, '')"""
+            )
+            if expected in text:
+                uploaded = True
+                break
+        if not uploaded:
+            raise RuntimeError(f"弹窗未出现「{expected}」提示")
+
+        if not await self._confirm_upload_dialog(page):
+            raise RuntimeError("上传弹窗内未找到「确定」")
+        await self._dismiss_upload_mask(page)
+
+    async def _upload_images_one_by_one(self, page: Page, paths: List[Path]) -> None:
+        """回退路径：逐张上传，每张确认后等弹窗关闭再继续。"""
+        for idx, img in enumerate(paths, 1):
+            before = await self._editor_image_count(page)
+            try:
+                await self._open_image_dialog(page)
+                file_input = page.locator('.win-mask input[type="file"]').last
+                await file_input.set_input_files(str(img))
+
+                for _ in range(30):
+                    await page.wait_for_timeout(500)
+                    text = await page.evaluate(
+                        """() => (document.querySelector('.win-mask')?.innerText || '')"""
+                    )
+                    if "已成功上传" in text or "上传成功" in text:
+                        break
+
+                if not await self._confirm_upload_dialog(page):
+                    raise RuntimeError("上传弹窗内未找到「确定」")
+
+                after = before
+                for _ in range(16):
+                    await page.wait_for_timeout(500)
+                    after = await self._editor_image_count(page)
+                    if after > before:
+                        break
+                if after <= before:
+                    raise RuntimeError(f"编辑器图片数未增加（{before}→{after}）")
+                sohu_logger.info(f"内文图 {idx} 已进入正文，编辑器图片数={after}")
+            except Exception as exc:
+                sohu_logger.warning(f"内文图 {idx} 插入失败: {exc}")
+                await self._dismiss_upload_mask(page)
+            finally:
+                await self._dismiss_upload_mask(page)
+
+    async def _insert_inline_images(self, page: Page) -> None:
+        """把 16:9 内文配图插入正文末尾。
+
+        搜狐 Quill 的上传弹窗 input 支持多选，一次选全部最稳；批量失败时
+        回退逐张。最终以编辑器内 <img> 增量校验，少于预期即中止发布。
+        """
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        if not paths:
+            return
+
+        # 等正文粘贴/输入完全稳定，否则图片按钮可能点不到或弹窗未真正打开
+        await page.wait_for_timeout(2000)
+        before = await self._editor_image_count(page)
+
+        try:
+            await self._upload_images_at_once(page, paths)
+        except Exception as exc:
+            sohu_logger.warning(f"内文图批量插入失败，改为逐张重试: {exc}")
+            await self._dismiss_upload_mask(page)
+            await self._upload_images_one_by_one(page, paths)
+
+        after = await self._editor_image_count(page)
+        if after - before < len(paths):
+            raise RuntimeError(
+                f"内文图仅成功插入 {after - before}/{len(paths)} 张，已中止发布，避免正文缺图"
+            )
+        sohu_logger.info(f"内文图 {len(paths)} 张已进入正文，编辑器图片数={after}")
 
     async def handle_cover(self, page: Page) -> None:
         """搜狐封面：点击「上传图片」→ 切「本地上传」→ 选图 → 确定。
@@ -795,10 +971,17 @@ class SoHuArticle(object):
 
         await _dismiss_overlays(page)
         publish_candidates = [
+            page.locator(
+                'li.publish-report-btn.active:has-text("发布"), '
+                'li.publish-report-btn.positive-button:has-text("发布")'
+            ).first,
             page.locator('button:has-text("发布")').last,
             page.get_by_role("button", name="发布").last,
             page.locator('button:has-text("立即发布")').last,
-            page.locator('span:has-text("发布")').last,
+            page.locator(
+                'p.positive-button:has-text("发布"), '
+                'div[class*="publish"]:has-text("发布")'
+            ).last,
         ]
         clicked = False
         for btn in publish_candidates:
@@ -814,10 +997,20 @@ class SoHuArticle(object):
         if not clicked:
             clicked = await page.evaluate(
                 """() => {
-                    const nodes = Array.from(document.querySelectorAll('button, a, span, div'));
+                    const nodes = Array.from(
+                        document.querySelectorAll('li, p, button, a, span, div, [role="button"]')
+                    );
                     const match = nodes.find(el => {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        return t === '发布' || t === '立即发布';
+                        const own = Array.from(el.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => (n.textContent || '').trim())
+                            .join('');
+                        const t = own || (el.innerText || el.textContent || '').trim();
+                        if (t !== '发布' && t !== '立即发布') return false;
+                        const r = el.getBoundingClientRect();
+                        const s = getComputedStyle(el);
+                        return r.width > 10 && r.height > 10
+                            && s.display !== 'none' && s.visibility !== 'hidden';
                     });
                     if (!match) return false;
                     match.click();
@@ -826,8 +1019,41 @@ class SoHuArticle(object):
             )
         if not clicked:
             raise RuntimeError("未找到可点击的「发布」按钮")
+
+        # 发布后可能有二次确认弹窗
+        await page.wait_for_timeout(1500)
+        for _ in range(6):
+            acted = await page.evaluate(
+                """() => {
+                    const texts = ['确定', '确认', '继续发布', '提交'];
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, p.positive-button, .positive-button, [role="button"]'
+                    ));
+                    const hit = nodes.find(el =>
+                        texts.includes((el.innerText || el.textContent || '').trim())
+                        && el.offsetParent !== null
+                    );
+                    if (!hit) return '';
+                    hit.click();
+                    return (hit.innerText || hit.textContent || '').trim();
+                }"""
+            )
+            if acted:
+                sohu_logger.info(f"已点击搜狐发布确认: {acted}")
+                await page.wait_for_timeout(2000)
+            if "addarticle" not in (page.url or ""):
+                break
+            await page.wait_for_timeout(1000)
+
         await page.wait_for_timeout(3000)
-        sohu_logger.success("已点击文章发布")
+        if "addarticle" in (page.url or ""):
+            hints = await page.evaluate(
+                """() => [...document.querySelectorAll('[class*=toast], [class*=message], [class*=tip], [class*=error]')]
+                    .filter(e => e.offsetHeight > 0)
+                    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 5)"""
+            )
+            raise RuntimeError(f"点击发布后仍停留在发文页，疑似未发出：{hints}")
+        sohu_logger.success(f"已点击文章发布并离开发文页: {page.url}")
 
     async def _title_input_ready(self, page: Page) -> bool:
         try:
@@ -1070,9 +1296,11 @@ class SoHuArticle(object):
         await self.fill_title(page)
         await page.wait_for_timeout(500)
         await self.fill_body(page)
+        await self._insert_inline_images(page)
         await self.fill_tags(page)
         await self.handle_cover(page)
         await self.apply_info_source(page)
+        await self._apply_ai_statement(page)
         await _dismiss_overlays(page)
 
         if self.dry_run:

@@ -248,12 +248,14 @@ class TiebaPost(object):
                     lambda: self.upload_cover(page),
                     label="上传帖子封面",
                 )
-            # 安全底线：绝不自动点击「发布」。填完内容后等待用户手动操作。
-            await self.save_draft(page)
-            tieba_logger.info(
-                f"✅ 百度贴吧帖子内容已自动填写完毕（标题={self.title}, fid={self.fid}, kw={self.kw})。"
-                " 请在浏览器中手动点击「发布」或关闭页面，脚本绝不自动发布。"
-            )
+            if self.dry_run or self.is_draft:
+                await self.save_draft(page)
+                tieba_logger.info(
+                    f"✅ 百度贴吧帖子内容已自动填写完毕（标题={self.title}, fid={self.fid}, kw={self.kw}）。"
+                    " 本次为预览/草稿模式，未点击「发布」。"
+                )
+            else:
+                await self.publish_post(page)
             try:
                 preview = Path(self.account_file).with_name("tieba_post_draft_saved.png")
                 await page.screenshot(full_page=True, path=str(preview))
@@ -431,6 +433,40 @@ class TiebaPost(object):
             tieba_logger.info(f"已上传封面: {self.cover_path}")
         except Exception as e:
             tieba_logger.warning(f"上传封面失败: {e}")
+
+    async def publish_post(self, page: Page) -> None:
+        """点击「发布」并确认发帖成功（用户已授权自动发布）。"""
+        btn = None
+        for sel in (
+            '#publish .issue-btn.button-wrapper--primary',
+            '#publish .footer-safe-issue .issue-btn',
+            'div.issue-btn.button-wrapper--primary',
+            '.publisher-container .issue-btn',
+            'button:has-text("发布")',
+            'div[class*="submit"]:has-text("发布")',
+        ):
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() and await loc.is_visible():
+                    btn = loc
+                    break
+            except Exception:
+                continue
+        if not btn:
+            raise RuntimeError("未找到贴吧「发布」按钮")
+
+        await btn.click(force=True)
+        tieba_logger.info("已点击贴吧「发布」，等待平台确认…")
+
+        for _ in range(40):
+            await page.wait_for_timeout(1000)
+            if "/p/" in page.url:
+                tieba_logger.success(f"✅ 贴吧发帖成功: {page.url}")
+                return
+            if await page.locator("text=/发表成功|发布成功|发送成功/").count():
+                tieba_logger.success("✅ 贴吧提示发帖成功")
+                return
+        raise RuntimeError(f"贴吧点击发布后未确认成功，当前页面: {page.url}")
 
     async def save_draft(self, page: Page) -> None:
         """贴吧内容填写完毕后等待用户手动操作。

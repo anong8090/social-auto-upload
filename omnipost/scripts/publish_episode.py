@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -25,15 +26,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 OMNIPOST_DIR = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(OMNIPOST_DIR))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from conf import BASE_DIR  # noqa: E402
 from myUtils import preflight, publish_record  # noqa: E402
 from myUtils.link_collector import collect_sync, _item_id_from_url  # noqa: E402
+import preflight_notify  # noqa: E402
+import failure_classify  # noqa: E402
 
 DEFAULT_MATERIAL_ROOT = OMNIPOST_DIR.parent / "河狸云蓝枢_自媒体物料包"
 DB_PATH = Path(BASE_DIR) / "db" / "database.db"
 RUN_LOG_DIR = OMNIPOST_DIR.parent / "logs"
+COMPLIANCE_NOTIFY_DIR = RUN_LOG_DIR / "compliance_notify"
 
 # 长文平台用母本 B，动态平台用母本 A
 LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
@@ -68,6 +74,144 @@ def _read_markdown(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.+)$")
+_RULE_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
+_IMAGE_RE = re.compile(r"^\s*!\[[^\]]*\]\([^)]*\)\s*$")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _strip_inline_markdown(text: str) -> str:
+    """把行内 Markdown 标记转成适合富文本 editor 的纯文本。"""
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"~~(.+?)~~", r"\1", text)
+    text = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)\*([^*\n]+?)\*(?!\w)", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text.replace("**", "").replace("__", "").strip()
+
+
+def _table_cells(line: str) -> List[str]:
+    """解析 Markdown 表格行；非表格行返回空列表。"""
+    stripped = line.strip()
+    if "|" not in stripped:
+        return []
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _table_cells(line)
+    return len(cells) >= 2 and all(
+        re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells
+    )
+
+
+def _extract_clean_body(text: str) -> str:
+    """把母本 Markdown 转成可直接粘贴到平台富文本 editor 的纯正文。
+
+    平台 editor 不会渲染 Markdown；若保留 `#`、`**`、`>`、图片引用或表格竖线，
+    这些源码会原样发布出去。这里统一删除母本标题/元数据，并把二级标题、
+    加粗、表格转成自然语言。
+    """
+    lines = text.replace("\r\n", "\n").splitlines()
+    out: List[str] = []
+    i = 0
+    seen_first_heading = False
+
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if not stripped:
+            if out and out[-1]:
+                out.append("")
+            i += 1
+            continue
+        if _FENCE_RE.match(stripped):
+            fence = stripped[:3]
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith(fence):
+                i += 1
+            i += 1
+            continue
+        if stripped.startswith(">") or _IMAGE_RE.match(stripped) or _RULE_RE.match(stripped):
+            i += 1
+            continue
+        if _is_table_separator(stripped):
+            i += 1
+            continue
+
+        heading = _HEADING_RE.match(raw)
+        if heading:
+            # 第一行 H1 是文章标题，由发布器单独填入，不再重复进正文。
+            if not seen_first_heading:
+                seen_first_heading = True
+                i += 1
+                continue
+            heading_text = _strip_inline_markdown(heading.group(2))
+            if heading_text in {"正文内容", "正文", "内容"}:
+                i += 1
+                continue
+            if out and out[-1]:
+                out.append("")
+            out.append(heading_text)
+            out.append("")
+            i += 1
+            continue
+
+        cells = _table_cells(raw)
+        if len(cells) >= 2 and i + 1 < len(lines) and _is_table_separator(lines[i + 1]):
+            headers = [_strip_inline_markdown(cell) for cell in cells]
+            i += 2
+            while i < len(lines):
+                row = _table_cells(lines[i])
+                if len(row) < 2 or not any(row):
+                    break
+                out.append("；".join(
+                    f"{headers[idx] if idx < len(headers) else f'第{idx + 1}项'}：{_strip_inline_markdown(cell)}"
+                    for idx, cell in enumerate(row)
+                ))
+                i += 1
+            continue
+
+        out.append(_strip_inline_markdown(raw.rstrip()))
+        i += 1
+
+    cleaned: List[str] = []
+    for line in out:
+        if line or (cleaned and cleaned[-1]):
+            cleaned.append(line)
+    while cleaned and not cleaned[0].strip():
+        cleaned.pop(0)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    return "\n".join(cleaned)
+
+
+def find_markdown_leaks(body: str) -> List[str]:
+    """检查清洗后正文是否仍含会原样发布的 Markdown 源码。"""
+    problems: List[str] = []
+    checks = (
+        (r"^\s*#{1,6}\s+", "标题标记 # / ## / ###"),
+        (r"^\s*>", "引用/元数据行 >"),
+        (r"!\[[^\]]*\]\(", "图片引用 ![](...)"),
+        (r"\[[^\]]+\]\([^)]+\)", "链接语法 [](...)"),
+        (r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "水平分隔线 ---"),
+        (r"^\s*\|.*\|\s*$", "表格竖线 |"),
+    )
+    for pattern, label in checks:
+        if re.search(pattern, body, flags=re.MULTILINE):
+            problems.append(label)
+    if "**" in body or "```" in body or re.search(r"(?<!\w)__(?!\w)", body):
+        problems.append("加粗/代码块标记")
+    return problems
+
+
 def _first_heading(text: str) -> str:
     for line in text.splitlines():
         line = line.strip()
@@ -87,9 +231,26 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
     if not short_md:
         short_md = long_md
 
-    long_body = _read_markdown(long_md) if long_md else ""
-    short_body = _read_markdown(short_md) if short_md else long_body
-    topic = _first_heading(long_body) or episode_dir.name
+    long_raw = _read_markdown(long_md) if long_md else ""
+    short_raw = _read_markdown(short_md) if short_md else long_raw
+    long_body = _extract_clean_body(long_raw)
+    short_body = _extract_clean_body(short_raw)
+
+    # 平台专属长文：`母本B_<平台type>_<平台名>.md`，用于保证 5 篇内容互不重复
+    long_body_by_platform: Dict[int, str] = {}
+    title_by_platform: Dict[int, str] = {}
+    for path in md_files:
+        match = re.match(r"母本B_(\d+)_", path.name)
+        if not match:
+            continue
+        ptype = int(match.group(1))
+        raw = _read_markdown(path)
+        long_body_by_platform[ptype] = _extract_clean_body(raw)
+        heading = _first_heading(raw)
+        if heading:
+            title_by_platform[ptype] = heading
+
+    topic = title_by_platform.get(5) or _first_heading(long_raw) or episode_dir.name
 
     image_dir = find_image_dir(material_root, episode, topic)
     cover = inline = None
@@ -109,7 +270,10 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
         "episode_dir": str(episode_dir),
         "topic": topic,
         "long_body": long_body,
+        "long_body_by_platform": long_body_by_platform,
+        "title_by_platform": title_by_platform,
         "short_body": short_body,
+        "short_title": _first_heading(short_raw) or topic,
         "cover": str(cover) if cover else "",
         "inline": [str(p) for p in (inline or [])],
         "gallery": [str(p) for p in gallery],
@@ -117,35 +281,10 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
     }
 
 
-# ---------------------------------------------------------------- 合规闸门
+# ---------------------------------------------------------------- 合规闸门（复用独立模块）
 
 
-BANNED_WORDS = (
-    "15天免费试点", "免费试跑", "免费领", "私信领资料", "加微信", "扫码体验", "点击链接",
-    "www.ricent.com", "国家级", "全网最强", "100%零失误",
-)
-
-
-def compliance_check(title: str, body: str, platform_type: int, *, has_cover: bool) -> List[str]:
-    """返回不通过原因列表；空列表表示通过。"""
-    problems: List[str] = []
-    low, high = preflight.TITLE_LIMITS.get(platform_type, (1, 2000))
-    title_len = len(title or "")
-    if not title:
-        problems.append("标题为空")
-    elif title_len < low or title_len > high:
-        problems.append(f"标题 {title_len} 字，超出该平台 {low}~{high} 字红线")
-
-    text = f"{title}\n{body}"
-    hits = [w for w in BANNED_WORDS if w in text]
-    if hits:
-        problems.append(f"命中违规词: {', '.join(hits)}")
-
-    if platform_type in preflight.COVER_REQUIRED_PLATFORMS and not has_cover:
-        problems.append("该平台要求 16:9 封面，但未找到 01_16x9 头图")
-
-    return problems
-
+from scripts.compliance_check import compliance_check
 
 # ---------------------------------------------------------------- 发布分发
 
@@ -180,41 +319,52 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     )
 
     if platform_type == 5:
-        post_article_baijiahao(title, body, tags, account_list, ai_generated=True, **common)
+        return post_article_baijiahao(
+            title, body, tags, account_list, ai_generated=True,
+            inline_image_paths=inline, **common,
+        )
     elif platform_type == 7:
-        post_article_toutiao(title, body, tags, account_list, work_statements=["引用AI"], **common)
+        return post_article_toutiao(
+            title, body, tags, account_list, work_statements=["引用AI"],
+            inline_image_paths=inline, **common,
+        )
     elif platform_type == 8:
-        post_article_sohu(
+        return post_article_sohu(
             title, body, tags, account_list,
-            cover_paths=[p for p in ([cover] + inline) if p],
+            cover_paths=[cover] if cover else [],
+            inline_image_paths=inline,
             **common,
         )
     elif platform_type == 9:
-        post_article_zhihu(
+        return post_article_zhihu(
             title, body, tags, account_list,
-            creation_statement=True, is_draft=is_draft, **common,
+            creation_statement="包含 AI 辅助创作",
+            inline_image_paths=inline, is_draft=is_draft, **common,
         )
     elif platform_type == 10:
-        post_article_tieba(
+        return post_article_tieba(
             title, body, tags, account_list,
             kw=tieba_kw or None, is_draft=is_draft,
             **{k: v for k, v in common.items() if k != "cover_path"},
             cover_path=cover,
         )
     elif platform_type == 11:
-        post_article_weibo(
+        return post_article_weibo(
             title, body, tags, account_list,
             is_draft=is_draft, file_list=gallery,
             **common,
         )
     elif platform_type == 12:
-        post_article_wechat_mp(title, body, tags, account_list, is_draft=True, **common)
+        return post_article_wechat_mp(
+            title, body, tags, account_list,
+            is_draft=is_draft, file_list=inline, **common,
+        )
     elif platform_type == 13:
-        post_article_wangyi(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
+        return post_article_wangyi(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     elif platform_type == 14:
-        post_article_dayu(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
+        return post_article_dayu(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     elif platform_type == 15:
-        post_article_qiehao(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
+        return post_article_qiehao(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     else:
         raise ValueError(f"暂不支持的平台类型: {platform_type}")
 
@@ -302,12 +452,50 @@ def main(argv: Optional[List[str]] = None) -> int:
                 })
                 continue
 
-        body = assets["long_body"] if ptype in LONG_FORM_PLATFORMS else assets["short_body"]
-        problems = compliance_check(title, body, ptype, has_cover=bool(assets["cover"]))
+        body = (
+            assets["long_body_by_platform"].get(ptype, assets["long_body"])
+            if ptype in LONG_FORM_PLATFORMS
+            else assets["short_body"]
+        )
+        platform_title = (
+            assets["short_title"]
+            if ptype in SHORT_FORM_PLATFORMS
+            else assets["title_by_platform"].get(ptype, title)
+        )
+        compliance_result = compliance_check(
+            platform_title, body, ptype,
+            has_cover=bool(assets["cover"]),
+            inline_count=len(assets["inline"]),
+        )
+        problems = compliance_result["problems"]
+        warnings = compliance_result["warnings"]
         if problems:
-            results.append({"platform": pname, "type": ptype, "status": "blocked", "reason": "; ".join(problems)})
-            print(f"  ⛔ {pname} 合规拦截: {'; '.join(problems)}")
+            reason = "; ".join(problems)
+            results.append({"platform": pname, "type": ptype, "status": "blocked", "reason": reason})
+            print(f"  ⛔ {pname} 合规拦截: {reason}")
+            # 飞书告警（去重：同一期+平台+问题摘要只提醒一次）
+            try:
+                webhook, secret = preflight_notify.resolve_lark_settings(None, preflight_notify.CONFIG_PATH)
+                if webhook:
+                    webhook = preflight_notify.validate_webhook(webhook)
+                    key = f"compliance:{args.episode}:{ptype}:{hashlib.md5(reason.encode()).hexdigest()[:8]}"
+                    import hashlib
+                    status, msg = preflight_notify.notify_once(
+                        COMPLIANCE_NOTIFY_DIR, key, webhook, secret,
+                        f"⛔ 第 {args.episode} 期 {pname} 合规拦截\n{reason}\n标题: {platform_title[:50]}",
+                    )
+                    if status == "sent":
+                        print(f"  📣 已推送飞书告警")
+                    elif status == "unknown":
+                        print(f"  ⚠️ 飞书告警结果未知: {msg}")
+            except Exception as exc:
+                print(f"  ⚠️ 飞书告警发送异常: {preflight_notify.redact_error(exc, None, None)}")
             continue
+
+        # 合规告警（不拦截，仅提示）
+        if warnings:
+            for w in warnings:
+                print(f"  ⚠️ {pname} 合规告警: {w}")
 
         cookie = Path(str(check["cookie_path"]))
         account_file = [cookie.name]
@@ -318,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             platform_name=pname,
             account_name=str(check.get("account") or "默认账号"),
             content_type="article",
-            title=title,
+            title=platform_title,
             content=body,
             files=assets["gallery"],
             status=publish_record.STATUS_PREVIEW if args.dry_run
@@ -327,15 +515,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             topic=assets["topic"],
         )
 
+        direct_url = ""
         try:
-            _dispatch(
-                ptype, assets, title, body, account_file,
-                dry_run=args.dry_run, is_draft=args.draft, tieba_kw=args.tieba_kw,
-            )
+            direct_url = str(
+                _dispatch(
+                    ptype, assets, platform_title, body, account_file,
+                    dry_run=args.dry_run, is_draft=args.draft, tieba_kw=args.tieba_kw,
+                ) or ""
+            ).strip()
         except Exception as exc:  # noqa: BLE001
-            publish_record.finish_record(DB_PATH, history_id, publish_record.STATUS_FAILED, error_msg=str(exc))
-            results.append({"platform": pname, "type": ptype, "status": "failed", "reason": str(exc)})
-            print(f"  ❌ {pname} 发布失败: {exc}")
+            error_msg = str(exc)
+            # 失败分类与记录
+            code, is_new = failure_classify.record_failure(
+                DB_PATH, args.episode, ptype, pname, error_msg,
+                history_id=history_id,
+                failure_step="dispatch",
+            )
+            # PAGE_CHANGED 累计 2 次生成待修记录
+            fix_path = failure_classify.maybe_create_pending_fix(
+                args.episode, ptype, pname, "dispatch", error_msg
+            )
+            if fix_path:
+                print(f"  📝 已生成待修记录: {fix_path.name}")
+            publish_record.finish_record(
+                DB_PATH, history_id, publish_record.STATUS_FAILED,
+                error_msg=error_msg,
+            )
+            results.append({"platform": pname, "type": ptype, "status": "failed", "reason": error_msg, "failure_code": code})
+            print(f"  ❌ {pname} 发布失败 [{code}]: {exc}")
             continue
 
         if args.dry_run or args.draft:
@@ -345,13 +552,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  ✅ {pname} 已{('预览' if args.dry_run else '存草稿')}")
             continue
 
-        url, item_id = collect_sync(ptype, cookie, title)
+        url, item_id = collect_sync(ptype, cookie, platform_title)
+        if not url and direct_url:
+            # 发布器已拿到真实链接（如微博），优先采用，采集仅作兜底
+            url, item_id = direct_url, _item_id_from_url(ptype, direct_url)
+            print(f"  🔗 使用发布器返回链接: {url}")
+        if not url:
+            error_msg = "发布动作已完成，但未能采集到标题匹配的公开链接；请核查平台后台"
+            code, is_new = failure_classify.record_failure(
+                DB_PATH, args.episode, ptype, pname, error_msg,
+                history_id=history_id,
+                failure_step="collect_link",
+            )
+            publish_record.finish_record(
+                DB_PATH, history_id, publish_record.STATUS_FAILED,
+                error_msg=error_msg,
+            )
+            results.append({
+                "platform": pname, "type": ptype, "status": "failed",
+                "reason": error_msg, "failure_code": code,
+            })
+            print(f"  ❌ {pname} 发布结果无法核验 [{code}]: 未采集到公开链接")
+            continue
+
         publish_record.finish_record(
             DB_PATH, history_id, publish_record.STATUS_PUBLISHED,
             published_url=url, platform_item_id=item_id,
         )
         results.append({"platform": pname, "type": ptype, "status": "published", "url": url, "item_id": item_id})
-        print(f"  ✅ {pname} 已发布: {url or '链接待补采'}")
+        print(f"  ✅ {pname} 已发布: {url}")
 
     summary = {
         "episode": args.episode,
