@@ -7,7 +7,8 @@
 - 发布前预检（封禁平台、账号、cookie 文件），自动从可用池随机抽 5 台；
 - 每平台独立执行，单个失败不影响其余；
 - 成功/失败都写入 publish_history（含期数、选题、公开链接）；
-- 按「期数 + 平台」幂等，已成功发布过的默认跳过。
+- 按「期数 + 平台」幂等，已成功发布过的默认跳过；
+- 头条（`type=7`）禁止任何浏览器自动化，只产出「待发内容包」供人工发布。
 
 用法示例：
     python scripts/publish_episode.py --episode 15 --seed 20261105
@@ -20,6 +21,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +46,11 @@ COMPLIANCE_NOTIFY_DIR = RUN_LOG_DIR / "compliance_notify"
 # 长文平台用母本 B，动态平台用母本 A
 LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
 SHORT_FORM_PLATFORMS = (10, 11)
+
+# 禁止自动化操作浏览器的平台：只产出「待发内容包」，由人工到后台发布。
+# 头条（type=7）编辑器的「草稿保存中…」是常挂的前端状态，抓包证实无草稿保存请求，
+# 自动化无法保证草稿真的落库，因此改为彻底不碰浏览器，避免误发与误判。
+MANUAL_PACKAGE_PLATFORMS = (7,)
 
 
 # ---------------------------------------------------------------- 素材发现
@@ -298,7 +305,6 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
         post_article_qiehao,
         post_article_sohu,
         post_article_tieba,
-        post_article_toutiao,
         post_article_wangyi,
         post_article_wechat_mp,
         post_article_weibo,
@@ -324,10 +330,10 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
             inline_image_paths=inline, **common,
         )
     elif platform_type == 7:
-        return post_article_toutiao(
-            title, body, tags, account_list, work_statements=["引用AI"],
-            inline_image_paths=inline, **common,
-        )
+        # 2026-11-05 用户规则：头条禁止任何自动化写入，避免被判定营销号封禁。
+        # 主流程已在 _dispatch 之前改走 export_manual_package，这里只做兜底拦截，
+        # 防止将来有人绕过主流程直接把头条丢进来。
+        raise RuntimeError("头条已禁止自动化发布，请走待发内容包流程（MANUAL_PACKAGE_PLATFORMS）")
     elif platform_type == 8:
         return post_article_sohu(
             title, body, tags, account_list,
@@ -367,6 +373,91 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
         return post_article_qiehao(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     else:
         raise ValueError(f"暂不支持的平台类型: {platform_type}")
+
+
+# ---------------------------------------------------------------- 待发内容包
+
+
+def _safe_name(text: str, limit: int = 60) -> str:
+    """把标题转成跨平台安全的目录名（含全角标点，避免在 Windows 上失败）。"""
+    cleaned = re.sub(r'[\\/:*?"<>|？：＊＂＜＞｜／\r\n\t]', "_", (text or "").strip())
+    return cleaned[:limit].strip(" .") or "未命名"
+
+
+def export_manual_package(
+    material_root: Path,
+    episode: str,
+    topic: str,
+    platform_name: str,
+    title: str,
+    body: str,
+    cover: str,
+    inline: List[str],
+) -> Path:
+    """为禁止自动发布的平台产出一份可直接照抄的待发内容包，绝不启动浏览器。
+
+    目录结构：`<物料包>/待发布/<期数>_<选题>/<平台>/`
+      - `标题.txt`：平台标题（已按平台红线校验过）
+      - `正文.md`：可直接粘贴的纯正文（母本 Markdown 语法已清洗）
+      - `01_封面.*` / `02_内文图1.*` …：按插入顺序编号的配图副本
+      - `发布说明.md`：上传顺序、AI 声明勾选、发布后回填要求
+    """
+    out_dir = material_root / "待发布" / f"{episode}_{_safe_name(topic)}" / _safe_name(platform_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    (out_dir / "标题.txt").write_text(title + "\n", encoding="utf-8")
+    (out_dir / "正文.md").write_text(body.strip() + "\n", encoding="utf-8")
+
+    image_lines: List[str] = []
+    if cover and Path(cover).is_file():
+        target = out_dir / f"01_封面{Path(cover).suffix}"
+        shutil.copy2(cover, target)
+        image_lines.append(f"1. `{target.name}` → 文章封面 / 头图（16:9）")
+    for idx, path in enumerate(inline, 1):
+        src = Path(path)
+        if not src.is_file():
+            continue
+        target = out_dir / f"0{idx + 1}_内文图{idx}{src.suffix}"
+        shutil.copy2(src, target)
+        image_lines.append(
+            f"{idx + 1}. `{target.name}` → 正文第 {idx} 张插图（插在第 {idx} 个二级小标题后的段落末）"
+        )
+
+    body_chars = len(re.sub(r"\s", "", body or ""))
+    note = "\n".join([
+        f"# {platform_name} 待发内容包（第 {episode} 期）",
+        "",
+        f"- 选题：{topic}",
+        f"- 标题（{len(title)} 字）：{title}",
+        f"- 正文字数：{body_chars} 字",
+        "",
+        "## 为什么是内容包而不是自动发布",
+        "",
+        "该平台已列入「禁止自动化发布」名单。自动化写入后台存在误发、误判营销号的风险，",
+        "因此本工具只把内容整理成可直接照抄的文件，发布动作由人工完成。",
+        "",
+        "## 发布步骤",
+        "",
+        "1. 打开平台创作后台的图文发布页；",
+        "2. 标题直接粘贴 `标题.txt`；",
+        "3. 正文粘贴 `正文.md`（已是纯文本，无 Markdown 标记）；",
+        "4. 按下面的顺序上传配图；",
+        "5. 勾选平台要求的 AI 声明；",
+        "6. 人工确认无误后点击发布。",
+        "",
+        "## 配图上传顺序",
+        "",
+        *(image_lines or ["（本期无可用配图）"]),
+        "",
+        "## 发布后回填",
+        "",
+        "- 把公开链接回填到飞书每日动作台账对应列；",
+        "- 在本机 OmniPost 发布记录里把该条 `draft` 改成已发布并补链接。",
+        "",
+    ])
+    (out_dir / "发布说明.md").write_text(note, encoding="utf-8")
+
+    return out_dir
 
 
 # ---------------------------------------------------------------- 主流程
@@ -452,7 +543,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ptype = check["platform_type"]
         pname = check["platform_name"]
 
-        if not check["ok"]:
+        # 待发内容包平台不需要 cookie（不碰浏览器），预检失败也不影响出包
+        if not check["ok"] and ptype not in MANUAL_PACKAGE_PLATFORMS:
             results.append({"platform": pname, "type": ptype, "status": "skipped", "reason": check["reason"]})
             continue
 
@@ -515,8 +607,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             for w in warnings:
                 print(f"  ⚠️ {pname} 合规告警: {w}")
 
-        cookie = Path(str(check["cookie_path"]))
-        account_file = [cookie.name]
+        # 待发内容包平台只出包不发布，历史记录统一记 draft
+        draft_only = bool(args.draft) or ptype in MANUAL_PACKAGE_PLATFORMS
 
         history_id = publish_record.create_record(
             DB_PATH,
@@ -528,17 +620,51 @@ def main(argv: Optional[List[str]] = None) -> int:
             content=body,
             files=assets["gallery"],
             status=publish_record.STATUS_PREVIEW if args.dry_run
-            else (publish_record.STATUS_DRAFT if args.draft else publish_record.STATUS_PUBLISHING),
+            else (publish_record.STATUS_DRAFT if draft_only else publish_record.STATUS_PUBLISHING),
             episode=args.episode,
             topic=assets["topic"],
         )
+
+        # 禁止自动发布的平台：只产出待发内容包，全程不启动浏览器
+        if ptype in MANUAL_PACKAGE_PLATFORMS:
+            if args.dry_run:
+                publish_record.finish_record(DB_PATH, history_id, publish_record.STATUS_PREVIEW)
+                results.append({"platform": pname, "type": ptype, "status": "preview"})
+                print(f"  ✅ {pname} 预览模式：只校验合规，不出包")
+                continue
+            try:
+                package_dir = export_manual_package(
+                    Path(args.base), args.episode, assets["topic"], pname,
+                    platform_title, body, assets["cover"], assets["inline"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_msg = f"待发内容包生成失败: {exc}"
+                publish_record.finish_record(
+                    DB_PATH, history_id, publish_record.STATUS_FAILED, error_msg=error_msg,
+                )
+                results.append({"platform": pname, "type": ptype, "status": "failed", "reason": error_msg})
+                print(f"  ❌ {pname} 待发内容包生成失败: {exc}")
+                continue
+            note = f"禁止自动发布，已生成待发内容包，请人工到{pname}后台发布: {package_dir}"
+            publish_record.finish_record(
+                DB_PATH, history_id, publish_record.STATUS_DRAFT, error_msg=note,
+            )
+            results.append({
+                "platform": pname, "type": ptype, "status": "manual_package",
+                "package": str(package_dir),
+            })
+            print(f"  📁 {pname} 已生成待发内容包（不自动发布）: {package_dir}")
+            continue
+
+        cookie = Path(str(check["cookie_path"]))
+        account_file = [cookie.name]
 
         direct_url = ""
         try:
             direct_url = str(
                 _dispatch(
                     ptype, assets, platform_title, body, account_file,
-                    dry_run=args.dry_run, is_draft=args.draft, tieba_kw=args.tieba_kw,
+                    dry_run=args.dry_run, is_draft=draft_only, tieba_kw=args.tieba_kw,
                 ) or ""
             ).strip()
         except Exception as exc:  # noqa: BLE001
@@ -563,11 +689,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  ❌ {pname} 发布失败 [{code}]: {exc}")
             continue
 
-        if args.dry_run or args.draft:
+        if args.dry_run or draft_only:
             final_status = publish_record.STATUS_PREVIEW if args.dry_run else publish_record.STATUS_DRAFT
             publish_record.finish_record(DB_PATH, history_id, final_status)
             results.append({"platform": pname, "type": ptype, "status": final_status})
-            print(f"  ✅ {pname} 已{('预览' if args.dry_run else '存草稿')}")
+            hint = "预览" if args.dry_run else "存草稿"
+            print(f"  ✅ {pname} 已{hint}")
             continue
 
         url, item_id = collect_sync(ptype, cookie, platform_title)
@@ -612,8 +739,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     published = sum(1 for r in results if r["status"] == "published")
-    print(f"\n📊 完成 {published} 个平台，明细已写入 {out}")
-    return 0 if published or args.dry_run else 1
+    packaged = sum(1 for r in results if r["status"] == "manual_package")
+    print(f"\n📊 自动发布 {published} 个平台，待发内容包 {packaged} 个，明细已写入 {out}")
+    return 0 if (published or packaged or args.dry_run) else 1
 
 
 def asyncio_run_preflight(platforms: List[int], verify_cookie: bool) -> List[Dict[str, Any]]:
