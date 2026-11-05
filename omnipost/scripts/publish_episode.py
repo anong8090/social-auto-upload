@@ -589,7 +589,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if webhook:
                     webhook = preflight_notify.validate_webhook(webhook)
                     key = f"compliance:{args.episode}:{ptype}:{hashlib.md5(reason.encode()).hexdigest()[:8]}"
-                    import hashlib
                     status, msg = preflight_notify.notify_once(
                         COMPLIANCE_NOTIFY_DIR, key, webhook, secret,
                         f"⛔ 第 {args.episode} 期 {pname} 合规拦截\n{reason}\n标题: {platform_title[:50]}",
@@ -670,7 +669,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as exc:  # noqa: BLE001
             error_msg = str(exc)
             # 失败分类与记录
-            code, is_new = failure_classify.record_failure(
+            code, _ = failure_classify.record_failure(
                 DB_PATH, args.episode, ptype, pname, error_msg,
                 history_id=history_id,
                 failure_step="dispatch",
@@ -704,7 +703,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  🔗 使用发布器返回链接: {url}")
         if not url:
             error_msg = "发布动作已完成，但未能采集到标题匹配的公开链接；请核查平台后台"
-            code, is_new = failure_classify.record_failure(
+            code, _ = failure_classify.record_failure(
                 DB_PATH, args.episode, ptype, pname, error_msg,
                 history_id=history_id,
                 failure_step="collect_link",
