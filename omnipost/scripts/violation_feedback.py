@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""违规反馈闭环：聚合 platform_feedback → 更新合规词库 / 生成避坑指南。
+"""违规反馈聚合：platform_feedback → 观察词库提案 / 避坑指南。
 
-职责（第 5 件核心）：
-1. 从 platform_feedback 读取近 N 天 warned/deleted/throttled 记录
-2. 按平台+状态分桶，提取高频警告关键词、触发片段、受影响期数
-3. 生成/更新：
-   - logs/violations/dynamic_banned_words.json  — 动态违规词库（供 compliance_check.py 优先加载）
-   - logs/violations/avoid_guide.md              — 选题/写作阶段人工可读的避坑指南
-   - logs/violations/platform_rules_<type>.json  — 各平台专用规则建议（标题/封面/标签/声明）
-4. 合规闸门集成：compliance_check.py 增加动态词库加载逻辑（优先级：动态 > 静态）
-5. 选题共创集成：避坑指南可被选题 Agent 读取做规避提示
+证据链约束（2026-11-05 收口，对齐跨项目 Autoloop 路线）：
+1. 只采信 evidence_quality='verified' 的记录；unverified 只做「待人工复核」计数；
+2. 同一 history_id 同一天只算一次，同一判词按「不同期数」计数，避免重复巡检刷频次；
+3. 平台通知判词整句绝不自动转成正文违禁词。只有落在
+   preflight.PROMOTABLE_RISK_TERMS 白名单里的词法候选才进入 observed_terms 提案；
+4. 输出 dynamic_banned_words.json 是「观察提案」，不是已生效规则；
+   compliance_check.py 只加载白名单内候选，且规则文件损坏时 fail-closed；
+5. 无有效证据时自愈回静态基线，并清理由旧脏数据生成的平台规则文件。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -28,6 +28,7 @@ OMNIPOST_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(OMNIPOST_DIR))
 
 from conf import BASE_DIR  # noqa: E402
+from myUtils import preflight  # noqa: E402
 
 DB_PATH = Path(BASE_DIR) / "db" / "database.db"
 VIOLATIONS_DIR = OMNIPOST_DIR.parent / "logs" / "violations"
@@ -38,18 +39,10 @@ AVOID_GUIDE_PATH = VIOLATIONS_DIR / "avoid_guide.md"
 PLATFORM_RULES_DIR = VIOLATIONS_DIR / "platform_rules"
 PLATFORM_RULES_DIR.mkdir(parents=True, exist_ok=True)
 
-# 静态兜底（来自 AGENTS.md & compliance_check.py）
-STATIC_BANNED_WORDS = [
-    "15天免费试点", "免费试跑", "免费领", "私信领资料", "加微信",
-    "扫码体验", "点击链接", "www.ricent.com", "国家级", "第一",
-    "唯一", "100%零失误", "全网最强",
-]
-# 需要上下文判断的模糊词（高频出现在 warned 时才加入）
-FUZZY_CANDIDATES = [
-    "免费", "试用", "领取", "私信", "微信", "二维码", "联系方式",
-    "绝对", "零失误", "最强", "第一", "唯一", "全网", "全国",
-    "营销", "推广", "广告", "引流", "获客", "转化",
-]
+SCHEMA_VERSION = "evidence-v2"
+ACTIONABLE_STATUSES = ("warned", "deleted", "throttled", "under_review")
+STATIC_BANNED_WORDS = preflight.STATIC_BANNED_WORDS  # 唯一来源，不复制
+PROMOTABLE = set(preflight.PROMOTABLE_RISK_TERMS)
 
 PLATFORM_NAME_MAP = {
     5: "百家号", 7: "今日头条", 8: "搜狐号", 9: "知乎",
@@ -57,302 +50,311 @@ PLATFORM_NAME_MAP = {
 }
 
 
+# ============================================================ 读取与去重
+
+def _feedback_supports_evidence(db_path: Path) -> bool:
+    """旧库/未建表时返回 False，调用方据此给出「证据能力缺失」而不是猜。"""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='platform_feedback'"
+            ).fetchone()
+            if not table:
+                return False
+            return "evidence_quality" in {
+                row[1] for row in conn.execute("PRAGMA table_info(platform_feedback)")
+            }
+    except sqlite3.Error:
+        return False
+
+
 def load_feedback(db_path: Path, days: int = 30) -> List[Dict[str, Any]]:
-    """读取近 N 天 platform_feedback 异常记录。"""
+    """读取近 N 天巡检记录，按 (history_id, 日期) 保留最新一条。
+
+    verified 与 unverified 都返回，由上层分别处理；
+    旧库缺 evidence_quality 时返回空并打印明确提示，避免把历史脏数据当证据。
+    """
+    if not _feedback_supports_evidence(db_path):
+        print("⚠️ platform_feedback 缺少 evidence_quality 列，本次不采信任何历史记录", file=sys.stderr)
+        return []
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute(
+        rows = conn.execute(
             """
             SELECT id, history_id, episode, platform_type, platform_name,
-                   published_url, check_status, warning_text, content_visible,
-                   http_status, check_at, raw_snapshot
+                   published_url, check_status, evidence_quality, evidence_source,
+                   evidence_text, evidence_reason, check_at, raw_snapshot
             FROM platform_feedback
-            WHERE check_status IN ('warned', 'deleted', 'throttled', 'under_review')
-              AND date(check_at) >= ?
-            ORDER BY check_at DESC
+            WHERE date(check_at) >= ?
+            ORDER BY check_at DESC, id DESC
             """,
             (cutoff,),
         ).fetchall()
-    return [dict(r) for r in rows]
 
+    seen: Set[tuple[int, str]] = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        key = (row["history_id"], str(row["check_at"])[:10])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(row))
+    return out
+
+
+# ============================================================ 信号提取
 
 def extract_violation_signals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """从反馈记录中提取违规信号。"""
-    # 按平台+状态分桶
-    buckets: Dict[str, List[Dict]] = {}
+    """只从 verified 异常提取信号；整句判词不参与词频。"""
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    unverified = 0
     for r in records:
+        if r.get("evidence_quality") != "verified":
+            unverified += 1
+            continue
+        if r.get("check_status") not in ACTIONABLE_STATUSES:
+            continue
         key = f"{r['platform_name']}|{r['check_status']}"
         buckets.setdefault(key, []).append(r)
 
-    signals = {}
+    signals: Dict[str, Any] = {
+        "unverified_count": unverified,
+        "buckets": {},
+    }
     for key, items in buckets.items():
         platform, status = key.split("|", 1)
-        # 收集警告文本
-        warning_texts = [r["warning_text"] for r in items if r["warning_text"]]
-        # 关键词频次
-        kw_counter = Counter()
-        for wt in warning_texts:
-            for kw in wt.split("; "):
-                kw_counter[kw.strip()] += 1
+        verdict_counter: Counter[str] = Counter()
+        term_counter: Counter[str] = Counter()
+        episodes: Set[str] = set()
+        samples: List[str] = []
+        urls: List[str] = []
 
-        # 从 raw_snapshot 提取疑似触发片段（启发式）
-        trigger_snippets = []
         for r in items:
-            snap = r.get("raw_snapshot", "")
-            if snap:
-                # 取前 500 字符作为片段
-                trigger_snippets.append(snap[:500])
+            episodes.add(str(r.get("episode") or "?"))
+            verdict = (r.get("evidence_text") or "").strip()
+            if verdict:
+                verdict_counter[verdict] += 1
+                samples.append(verdict[:300])
+                # 只有白名单内的词法候选才计入词频
+                for term in PROMOTABLE:
+                    if term in verdict:
+                        term_counter[term] += 1
+            if r.get("published_url") and len(urls) < 3:
+                urls.append(r["published_url"])
 
-        signals[key] = {
+        signals["buckets"][key] = {
             "platform": platform,
             "platform_type": items[0]["platform_type"],
             "status": status,
-            "count": len(items),
-            "affected_episodes": sorted(set(r["episode"] for r in items)),
-            "top_keywords": kw_counter.most_common(20),
-            "warning_texts": warning_texts[:10],
-            "trigger_snippets": trigger_snippets[:5],
-            "sample_urls": [r["published_url"] for r in items[:3]],
+            "count": len(items),                  # 去重后的不同链接·天
+            "affected_episodes": sorted(episodes),
+            "distinct_episodes": len(episodes),  # 规则升级看的是不同期数，不是巡检次数
+            "top_verdicts": verdict_counter.most_common(10),  # 供人工复盘，不进词表
+            "promotable_terms": term_counter.most_common(),    # 白名单内观察词
+            "trigger_snippets": samples[:5],
+            "sample_urls": urls,
         }
     return signals
 
 
+# ============================================================ 产物生成
+
 def build_dynamic_banned_words(signals: Dict[str, Any]) -> Dict[str, Any]:
-    """构建动态违规词库（分层：高危/疑似/平台专用）。"""
-    high_risk: Set[str] = set()
-    suspicious: Set[str] = set()
-    platform_specific: Dict[str, List[str]] = {}
+    """生成「观察提案」而非自动生效规则。
 
-    for key, data in signals.items():
-        platform = data["platform"]
-        status = data["status"]
+    high_risk 永远等于静态基线；平台判词绝不进入。
+    observed_terms 仅记录白名单候选在不同期数中出现次数，供人工确认后再改规则。
+    """
+    term_episodes: Dict[str, Set[str]] = {}
+    for _key, data in signals.get("buckets", {}).items():
+        for term, freq in data.get("promotable_terms", []):
+            term_episodes.setdefault(term, set()).update(data["affected_episodes"])
+            # freq 保留在 detail 中，计数口径以不同期数为准
+            _ = freq
 
-        for kw, freq in data["top_keywords"]:
-            kw_lower = kw.lower()
-            # 直接出现在警告文本中的关键词 -> 高危
-            if status in ("warned", "deleted") and freq >= 2:
-                high_risk.add(kw)
-            # 频次较低或 throttled/under_review -> 疑似
-            elif freq >= 1:
-                suspicious.add(kw)
-
-        # 平台专用黑名单
-        if data["count"] >= 2:
-            plat_kws = [kw for kw, _ in data["top_keywords"][:10]]
-            platform_specific[platform] = plat_kws
-
-    # 合并静态兜底
-    all_high = set(STATIC_BANNED_WORDS) | high_risk
+    observed = [
+        {
+            "term": term,
+            "distinct_episodes": len(eps),
+            "episodes": sorted(eps),
+            "action": "proposal_only",  # 永不自动升级为拦截词
+        }
+        for term, eps in sorted(term_episodes.items(), key=lambda x: (-len(x[1]), x[0]))
+    ]
 
     return {
+        "schema_version": SCHEMA_VERSION,
         "version": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "source_days": 30,
-        "high_risk": sorted(all_high),
-        "suspicious": sorted(suspicious - all_high),
-        "platform_specific": platform_specific,
+        "status": "observation_proposal",
+        "note": "本文件是观察提案，不是已生效规则。规则变更须人工确认并验证效果。",
+        "high_risk": sorted(STATIC_BANNED_WORDS),
+        "suspicious": [],
+        "platform_specific": {},
+        "observed_terms": observed,
         "stats": {
-            "high_risk_count": len(all_high),
-            "suspicious_count": len(suspicious - all_high),
-            "platforms_covered": len(platform_specific),
+            "high_risk_count": len(STATIC_BANNED_WORDS),
+            "suspicious_count": 0,
+            "platforms_covered": 0,
+            "verified_signal_buckets": len(signals.get("buckets", {})),
+            "unverified_records_ignored": signals.get("unverified_count", 0),
+            "observed_term_count": len(observed),
         },
     }
 
 
 def generate_avoid_guide(signals: Dict[str, Any], dynamic_words: Dict[str, Any]) -> str:
-    """生成 Markdown 避坑指南（供选题/写作阶段人工/ Agent 读取）。"""
-    lines = []
-    lines.append(f"# 🚫 违规避坑指南（自动生成 {datetime.now():%Y-%m-%d %H:%M}）")
-    lines.append("")
-    lines.append(f"> 数据来源：近 30 天 `platform_feedback` 表中 `warned/deleted/throttled/under_review` 记录")
-    lines.append(f"> 高危词库条目：{dynamic_words['stats']['high_risk_count']} 个 | 疑似词：{dynamic_words['stats']['suspicious_count']} 个")
-    lines.append("")
+    """生成人工可读指南；明确区分已验证信号与待复核记录。"""
+    lines = [
+        f"# 违规避坑指南（观察提案，自动生成 {datetime.now():%Y-%m-%d %H:%M}）",
+        "",
+        "> 数据来源：近 30 天 `platform_feedback` 中 `evidence_quality='verified'` 的异常记录。",
+        "> 同一链接同一天只计一次；平台判词整句不会自动变成正文违禁词。",
+        f"> 静态零容忍词：{dynamic_words['stats']['high_risk_count']} 个；"
+        f"待人工复核记录：{dynamic_words['stats']['unverified_records_ignored']} 条。",
+        "",
+        "## 1. 静态零容忍词（唯一来源：myUtils/preflight.py）",
+        "",
+    ]
+    lines.extend(f"- `{w}`" for w in dynamic_words["high_risk"])
 
-    # 1. 通用高危词汇
-    lines.append("## 1️⃣ 通用高危词汇（全平台严禁）")
-    lines.append("")
-    lines.append("以下词汇在近期巡检中**直接触发平台违规/删除/限流**，写作时**严禁出现**：")
-    lines.append("")
-    for w in dynamic_words["high_risk"]:
-        lines.append(f"- `{w}`")
-    lines.append("")
+    lines.extend(["", "## 2. 观察词候选（仅提案，不自动拦截）", ""])
+    observed = dynamic_words.get("observed_terms", [])
+    if observed:
+        lines.append("| 候选词 | 不同期数 | 涉及期数 | 状态 |")
+        lines.append("|---|---:|---|---|")
+        for item in observed:
+            lines.append(
+                f"| `{item['term']}` | {item['distinct_episodes']} | "
+                f"{', '.join(item['episodes'])} | 待人工确认，未生效 |"
+            )
+    else:
+        lines.append("暂无可采信的观察词。")
 
-    # 2. 疑似风险词（需上下文判断）
-    if dynamic_words["suspicious"]:
-        lines.append("## 2️⃣ 疑似风险词（视上下文谨慎使用）")
-        lines.append("")
-        lines.append("以下词汇高频出现在警告/限流场景，**非必要不要用**，若必须用请确保语境合规：")
-        lines.append("")
-        for w in dynamic_words["suspicious"]:
-            lines.append(f"- `{w}`")
-        lines.append("")
-
-    # 3. 平台专用避坑规则
-    lines.append("## 3️⃣ 平台专用避坑规则")
-    lines.append("")
-
-    for key, data in signals.items():
-        platform = data["platform"]
-        status = data["status"]
-        count = data["count"]
-        if count < 2:
-            continue
-
-        lines.append(f"### {platform}（{PLATFORM_NAME_MAP.get(data['platform_type'], '')}）")
-        lines.append(f"- **异常状态**：{status} × {count} 次")
-        lines.append(f"- **受影响期数**：{', '.join(data['affected_episodes'])}")
-        lines.append("")
-
-        if data["top_keywords"]:
-            lines.append("**高频警告关键词**：")
-            for kw, freq in data["top_keywords"][:8]:
-                lines.append(f"- `{kw}`（{freq} 次）")
-            lines.append("")
-
-        if data["trigger_snippets"]:
-            lines.append("**典型触发片段（供人工复盘）**：")
-            for i, snip in enumerate(data["trigger_snippets"][:2], 1):
-                lines.append(f"> {snip[:300]}...")
-                lines.append("")
-
-        # 平台级建议
-        if status == "warned":
-            lines.append("💡 **写作建议**：标题/正文/标签中避开上述关键词；检查 AI 声明是否按要求勾选；封面图无水印/二维码。")
-        elif status == "throttled":
-            lines.append("💡 **写作建议**：疑似触发质量模型/限流。优化标题吸引力（非标题党）、提升正文原创度、避免纯营销话术、确保图文匹配度。")
-        elif status == "deleted":
-            lines.append("💡 **写作建议**：内容被平台删除。人工复盘对应期数全文，核对平台社区规范与违规申诉渠道。")
-        elif status == "under_review":
-            lines.append("💡 **写作建议**：审核超时。检查是否含敏感词/图片，或账号权重不足导致长审。")
-
-        lines.append("---")
+    lines.extend(["", "## 3. 按平台汇总（已验证证据）", ""])
+    buckets = signals.get("buckets", {})
+    if not buckets:
+        lines.append("暂无 `verified` 异常记录。")
+    for _key, data in sorted(buckets.items()):
+        lines.append(f"### {data['platform']} · {data['status']}")
+        lines.append(
+            f"- 去重后记录：{data['count']} 条；不同期数：{data['distinct_episodes']} 个"
+        )
+        lines.append(f"- 受影响期数：{', '.join(data['affected_episodes'])}")
+        if data["top_verdicts"]:
+            lines.append("- 平台判词（供人工复盘，**不作为禁词**）：")
+            for verdict, freq in data["top_verdicts"][:5]:
+                lines.append(f"  - `{verdict}`（{freq} 次）")
+        if data["sample_urls"]:
+            lines.append(f"- 样例链接：{data['sample_urls'][0]}")
         lines.append("")
 
-    # 4. 选题阶段规避清单
-    lines.append("## 4️⃣ 选题阶段规避清单（共创时自查）")
-    lines.append("")
-    lines.append("| 维度 | 自查问题 | 规避动作 |")
-    lines.append("|------|----------|----------|")
-    lines.append("| 标题 | 是否含高危词/绝对化/诱导点击？ | 替换为客观陈述+痛点场景 |")
-    lines.append("| 正文 | 是否含免费试用/私信导流/联系方式？ | 删去引导词，改为「文末获取方案」类软植入 |")
-    lines.append("| 图片 | 封面/内文图是否含二维码/水印/手机号？ | 纯净图片，Logo 仅用官方透明版 |")
-    lines.append("| 标签 | 话题标签是否含营销/广告/引流词？ | 用产品功能/行业痛点/场景词 |")
-    lines.append("| 声明 | AI 声明是否按平台要求勾选？ | 发布前逐平台核对声明项 |")
-    lines.append("")
+    unverified = signals.get("unverified_count", 0)
+    if unverified:
+        lines.extend([
+            "## 4. 待人工复核（不进入规则聚合）",
+            "",
+            f"共 {unverified} 条 `unverified` 记录，常见成因：登录墙、反爬、正文容器未命中、巡检异常。",
+            "请先到对应平台创作者后台核实，再决定是否补录人工确认证据。",
+            "",
+        ])
 
-    lines.append("> 🤖 **Agent 使用提示**：选题共创/写作前请 `Read` 本文件，对生成的标题/大纲/正文做关键词扫描，命中即标红提示用户修改。")
-
-    return "\n".join(lines)
+    lines.extend([
+        "## 5. 选题与写作自查",
+        "",
+        "| 维度 | 自查问题 | 规避动作 |",
+        "|---|---|---|",
+        "| 标题 | 是否含静态零容忍词/绝对化/诱导点击？ | 改为客观陈述 + 痛点场景 |",
+        "| 正文 | 是否含免费试用/私信导流/联系方式？ | 删除引导词，不写外链 |",
+        "| 图片 | 是否含二维码/水印/手机号？ | 纯净图片，Logo 仅用官方透明版 |",
+        "| 标签 | 是否含营销/引流词？ | 用产品功能/行业痛点/场景词 |",
+        "| 声明 | AI 声明是否按平台要求勾选？ | 发布前逐平台核对 |",
+        "",
+        "> 本指南只读，不修改合规闸门。任何规则变更须人工确认，并在验证效果后写入受保护版本。",
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def generate_platform_rules(signals: Dict[str, Any]) -> Dict[str, Any]:
-    """生成各平台专用规则建议（JSON，供自动化发布脚本参考）。"""
-    rules = {}
-    for key, data in signals.items():
+    """生成只读建议文件；不参与发布拦截。"""
+    rules: Dict[str, Any] = {}
+    for _key, data in signals.get("buckets", {}).items():
         platform = data["platform"]
-        ptype = data["platform_type"]
-        status = data["status"]
-        if data["count"] < 2:
-            continue
-
         rules[platform] = {
-            "platform_type": ptype,
-            "risk_level": "high" if status in ("warned", "deleted") else "medium",
-            "trigger_keywords": [kw for kw, _ in data["top_keywords"][:15]],
-            "avoid_in_title": [kw for kw, _ in data["top_keywords"][:10] if len(kw) <= 20],
-            "avoid_in_body": [kw for kw, _ in data["top_keywords"][:15]],
-            "avoid_in_tags": [kw for kw, _ in data["top_keywords"][:10] if "营销" in kw or "广告" in kw or "引流" in kw],
+            "platform_type": data["platform_type"],
+            "schema_version": SCHEMA_VERSION,
+            "status": "proposal_only",
+            "risk_level": "high" if data["status"] in ("warned", "deleted") else "medium",
+            "verified_status": data["status"],
+            "distinct_episodes": data["distinct_episodes"],
+            "verdicts_for_review": [v for v, _f in data["top_verdicts"][:10]],
+            "observed_terms": [t for t, _f in data["promotable_terms"]],
+            "sample_urls": data["sample_urls"],
             "checklist": [
-                f"标题长度符合 {platform} 红线",
-                "正文无高危词/疑似词",
-                "封面图纯净（无二维码/水印/联系方式）",
-                f"AI 声明按 {platform} 要求勾选",
-                "内文图位置/数量符合规范",
+                "核对平台通知原文与创作者后台状态",
+                "复盘对应期数的标题/正文/封面/标签",
+                "确认 AI 声明与内文图位置",
+                "若需改规则，先人工确认并补回归样本",
             ],
-            "sample_violations": data["trigger_snippets"][:3],
         }
     return rules
 
 
-def update_compliance_check_integration(dynamic_words: Dict[str, Any]) -> str:
-    """生成 compliance_check.py 的动态加载补丁代码（供人工合并或自动应用）。"""
-    patch = f'''# ===== 动态违规词库加载（自动生成 {datetime.now():%Y-%m-%d}）=====
-# 将此段合并到 compliance_check.py 顶部 import 之后、BANNED_WORDS 定义之前
+def write_outputs(dynamic_words: Dict[str, Any], guide_md: str,
+                  platform_rules: Dict[str, Any]) -> Dict[str, Any]:
+    """原子写入产物；主动清理旧格式平台规则，避免残留规则被误读。"""
+    DYNAMIC_BANNED_PATH.write_text(
+        json.dumps(dynamic_words, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    AVOID_GUIDE_PATH.write_text(guide_md, encoding="utf-8")
 
-import json
-from pathlib import Path
-
-_DYNAMIC_BANNED_PATH = Path(__file__).parent.parent / "logs" / "violations" / "dynamic_banned_words.json"
-
-def _load_dynamic_banned() -> tuple[list[str], list[str], dict[str, list[str]]]:
-    """加载动态词库，返回 (high_risk, suspicious, platform_specific)。"""
-    if _DYNAMIC_BANNED_PATH.exists():
-        try:
-            data = json.loads(_DYNAMIC_BANNED_PATH.read_text(encoding="utf-8"))
-            return (
-                data.get("high_risk", []),
-                data.get("suspicious", []),
-                data.get("platform_specific", {{}}),
-            )
-        except Exception:
-            pass
-    return [], [], {{}}
-
-DYNAMIC_HIGH_RISK, DYNAMIC_SUSPICIOUS, DYNAMIC_PLATFORM_SPECIFIC = _load_dynamic_banned()
-
-# 合并策略：动态高危 > 静态高危 > 动态疑似
-# 使用时：BANNED_WORDS = list(set(STATIC_BANNED_WORDS) | set(DYNAMIC_HIGH_RISK))
-# 平台专用：PLATFORM_BANNED[platform] = DYNAMIC_PLATFORM_SPECIFIC.get(platform, [])
-'''
-    return patch
+    expected = {f"{name}.json" for name in platform_rules}
+    for old in PLATFORM_RULES_DIR.glob("*.json"):
+        if old.name not in expected:
+            old.unlink()
+    for name, rule in platform_rules.items():
+        (PLATFORM_RULES_DIR / f"{name}.json").write_text(
+            json.dumps(rule, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    return {
+        "updated": True,
+        "dynamic_words": str(DYNAMIC_BANNED_PATH),
+        "avoid_guide": str(AVOID_GUIDE_PATH),
+        "platform_rules_count": len(platform_rules),
+        "high_risk_count": dynamic_words["stats"]["high_risk_count"],
+        "suspicious_count": dynamic_words["stats"]["suspicious_count"],
+        "platforms_covered": len(platform_rules),
+        "observed_term_count": dynamic_words["stats"]["observed_term_count"],
+        "unverified_records_ignored": dynamic_words["stats"]["unverified_records_ignored"],
+        "verified_signal_buckets": dynamic_words["stats"]["verified_signal_buckets"],
+    }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="违规反馈闭环：聚合分析 → 更新词库/生成避坑指南")
+    parser = argparse.ArgumentParser(description="违规反馈聚合（只产出观察提案，不自动改规则）")
     parser.add_argument("--days", type=int, default=30, help="回看天数")
-    parser.add_argument("--apply-patch", action="store_true", help="输出 compliance_check.py 动态加载补丁")
     args = parser.parse_args(argv)
 
     print(f"📥 读取 platform_feedback（最近 {args.days} 天）...")
     records = load_feedback(DB_PATH, args.days)
-    print(f"   异常记录数：{len(records)}")
-
-    if not records:
-        print("✅ 无异常记录，词库/指南保持现状")
-        return 0
+    print(f"   去重后记录数：{len(records)}")
 
     signals = extract_violation_signals(records)
-    print(f"   聚类信号数：{len(signals)}")
+    print(f"   verified 信号桶：{len(signals['buckets'])}；unverified 忽略：{signals['unverified_count']}")
 
-    # 1) 动态词库
     dynamic_words = build_dynamic_banned_words(signals)
-    DYNAMIC_BANNED_PATH.write_text(json.dumps(dynamic_words, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"📝 动态词库已写入：{DYNAMIC_BANNED_PATH}")
-    print(f"   高危：{dynamic_words['stats']['high_risk_count']} 个 | 疑似：{dynamic_words['stats']['suspicious_count']} 个 | 平台专用：{dynamic_words['stats']['platforms_covered']} 个")
-
-    # 2) 避坑指南
     guide_md = generate_avoid_guide(signals, dynamic_words)
-    AVOID_GUIDE_PATH.write_text(guide_md, encoding="utf-8")
-    print(f"📝 避坑指南已写入：{AVOID_GUIDE_PATH}")
-
-    # 3) 平台专用规则
     platform_rules = generate_platform_rules(signals)
-    for platform, rule in platform_rules.items():
-        rule_path = PLATFORM_RULES_DIR / f"{platform}.json"
-        rule_path.write_text(json.dumps(rule, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"📝 平台专用规则已写入：{PLATFORM_RULES_DIR}（{len(platform_rules)} 个平台）")
+    result = write_outputs(dynamic_words, guide_md, platform_rules)
 
-    # 4) 合规闸门补丁
-    if args.apply_patch:
-        patch = update_compliance_check_integration(dynamic_words)
-        patch_path = VIOLATIONS_DIR / "compliance_check_patch.py"
-        patch_path.write_text(patch, encoding="utf-8")
-        print(f"📝 合规闸门补丁已写入：{patch_path}")
-        print("   请人工合并到 omnipost/scripts/compliance_check.py")
-
+    print(f"📝 观察词库：{result['dynamic_words']}（status=observation_proposal）")
+    print(f"📝 避坑指南：{result['avoid_guide']}")
+    print(f"📝 平台建议：{result['platform_rules_count']} 个（均不参与拦截）")
+    if result["unverified_records_ignored"]:
+        print(f"⚠️ {result['unverified_records_ignored']} 条待人工复核记录未进入规则聚合")
     return 0
 
 

@@ -4,11 +4,16 @@
 
 设计原则：
 - 只做「能否发布」的静态判定，不打开浏览器、不改数据；
-- 复用 preflight.py 的共享常量（TITLE_LIMITS、COVER_REQUIRED_PLATFORMS 等）；
-- 返回不通过原因列表；空列表表示通过。
-- 供 publish_episode.py、未来 CLI 与定时任务复用。
-- 动态违规词库：优先加载 logs/violations/dynamic_banned_words.json（由 violation_feedback.py 生成），
-  合并策略：动态高危 > 静态高危 > 动态疑似；平台专用黑名单在 compliance_check 入口按 platform_type 应用。
+- 复用 preflight.py 的共享常量（TITLE_LIMITS、COVER_REQUIRED_PLATFORMS、STATIC_BANNED_WORDS）；
+- 返回结构化结果（passed / problems / warnings / matched_*）；
+- 供 publish_episode.py、CLI 与定时任务复用。
+
+证据链约束（2026-11-05 收口）：
+- 静态零容忍词表只有 myUtils/preflight.py 一份来源；
+- logs/violations/dynamic_banned_words.json 只提供「观察候选」，且必须落在
+  preflight.PROMOTABLE_RISK_TERMS 白名单内才可能被采信，整句平台判词永不成为正文违禁词；
+- 词库文件存在但损坏/格式非法 -> 抛 ComplianceRuleError，调用方必须拦截发布，禁止静默降级；
+- 词库文件不存在 -> 视为尚无提案，退回静态基线。
 """
 from __future__ import annotations
 
@@ -24,36 +29,92 @@ sys.path.insert(0, str(OMNIPOST_DIR))
 
 from myUtils import preflight  # noqa: E402
 
-# ============================================================ 动态违规词库加载（优先级：动态 > 静态）
+# ============================================================ 动态违规词库加载（fail-closed、只读观察词）
 
 _DYNAMIC_BANNED_PATH = OMNIPOST_DIR.parent / "logs" / "violations" / "dynamic_banned_words.json"
 
+
+class ComplianceRuleError(RuntimeError):
+    """合规规则不可信时抛出；调用方必须拦截发布，不得降级放行。"""
+
+
+# 规则装载错误：模块导入时不抛（便于 CLI 输出可读提示），但在每次合规判断时 fail-closed。
+_RULE_LOAD_ERROR: Optional[str] = None
+
+
 def _load_dynamic_banned() -> tuple[Set[str], Set[str], Dict[str, List[str]]]:
-    """加载动态词库，返回 (high_risk, suspicious, platform_specific)。"""
-    if _DYNAMIC_BANNED_PATH.exists():
-        try:
-            data = json.loads(_DYNAMIC_BANNED_PATH.read_text(encoding="utf-8"))
-            return (
-                set(data.get("high_risk", [])),
-                set(data.get("suspicious", [])),
-                data.get("platform_specific", {}),
-            )
-        except Exception:
-            pass
-    return set(), set(), {}
+    """加载动态词库，返回 (high_risk, suspicious, platform_specific)。
+
+    文件不存在视为「尚无提案」（允许用静态基线发布）；
+    文件存在但损坏/格式不合法：记录错误，由 compliance_check() 抛 ComplianceRuleError，
+    绝不静默退回到静态词表继续放行。
+    """
+    global _RULE_LOAD_ERROR
+    _RULE_LOAD_ERROR = None
+    if not _DYNAMIC_BANNED_PATH.exists():
+        return set(), set(), {}
+    try:
+        data = json.loads(_DYNAMIC_BANNED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _RULE_LOAD_ERROR = f"动态词库不可读或 JSON 非法: {_DYNAMIC_BANNED_PATH}: {exc}"
+        return set(), set(), {}
+    if not isinstance(data, dict):
+        _RULE_LOAD_ERROR = f"动态词库根节点必须是对象: {_DYNAMIC_BANNED_PATH}"
+        return set(), set(), {}
+
+    # 旧证据链产出的词库（无 schema_version）含平台判词整句，一律不采信；
+    # 由 violation_feedback.py 重新生成 evidence-v2 观察提案后才启用。
+    if data.get("schema_version") != "evidence-v2":
+        return set(), set(), {}
+
+    def _words(key: str) -> Optional[List[str]]:
+        value = data.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            _RULE_LOAD_ERROR = f"动态词库 {key} 必须是字符串数组: {_DYNAMIC_BANNED_PATH}"
+            return None
+        return value
+
+    high_risk_raw = _words("high_risk")
+    suspicious_raw = _words("suspicious")
+    if high_risk_raw is None or suspicious_raw is None:
+        return set(), set(), {}
+
+    platform_specific = data.get("platform_specific", {})
+    if not isinstance(platform_specific, dict) or any(
+        not isinstance(k, str) or not isinstance(v, list) or any(not isinstance(x, str) for x in v)
+        for k, v in platform_specific.items()
+    ):
+        _RULE_LOAD_ERROR = f"动态词库 platform_specific 格式非法: {_DYNAMIC_BANNED_PATH}"
+        return set(), set(), {}
+
+    # 只采信白名单内的词法候选；整句平台判词不得被当作正文违禁词。
+    allowed = set(preflight.PROMOTABLE_RISK_TERMS)
+    high_risk = {w for w in high_risk_raw if w in allowed}
+    suspicious = {w for w in suspicious_raw if w in allowed}
+    # 静态基线词本就不在 PROMOTABLE 白名单里，不算「脏词」；
+    # 只提示既非静态词表、又不在白名单的可疑条目。
+    baseline = set(preflight.STATIC_BANNED_WORDS)
+    ignored = set(high_risk_raw) | set(suspicious_raw)
+    ignored -= baseline
+    ignored -= allowed
+    if ignored:
+        print(
+            f"ℹ️ 动态词库有 {len(ignored)} 个非白名单条目未进入拦截规则（平台判词/旧脏词）",
+            file=sys.stderr,
+        )
+    plat = {k: [w for w in v if w in allowed] for k, v in platform_specific.items()}
+    return high_risk, suspicious, plat
+
 
 DYNAMIC_HIGH_RISK, DYNAMIC_SUSPICIOUS, DYNAMIC_PLATFORM_SPECIFIC = _load_dynamic_banned()
 
 # ============================================================ 规则常量（Level 0 基线）
 
-# 静态零容忍违规词（AGENTS.md 第四节「零容忍清单」）
-STATIC_BANNED_WORDS = (
-    "15天免费试点", "免费试跑", "免费领", "私信领资料", "加微信", "扫码体验", "点击链接",
-    "www.ricent.com", "国家级", "第一", "唯一", "100%零失误", "全网最强", "二维码",
-)
+# 唯一词表来源：myUtils/preflight.py（与 AGENTS.md 保持一致）
+STATIC_BANNED_WORDS = preflight.STATIC_BANNED_WORDS
 
-# 合并：动态高危 ∪ 静态高危（动态优先，去重）
-BANNED_WORDS = tuple(DYNAMIC_HIGH_RISK | set(STATIC_BANNED_WORDS))
+# 合并：静态零容忍 ∪ 动态白名单内已观察词
+BANNED_WORDS = tuple(sorted(set(STATIC_BANNED_WORDS) | DYNAMIC_HIGH_RISK))
 
 # 正文字数要求（AGENTS.md 第二节）
 BODY_WORD_RANGES = {
@@ -151,6 +212,16 @@ def compliance_check(
     warnings: List[str] = []
     matched_banned: List[str] = []
     matched_suspicious: List[str] = []
+
+    # 0) 规则本身不可信时 fail-closed：不进入逐项检查，整批拦截发布
+    if _RULE_LOAD_ERROR:
+        return {
+            "passed": False,
+            "problems": [_RULE_LOAD_ERROR],
+            "warnings": ["合规规则装载失败，本轮全部平台禁止发布；修复词库后重跑"],
+            "matched_banned": [],
+            "matched_suspicious": [],
+        }
 
     # 1) 标题长度红线
     low, high = preflight.TITLE_LIMITS.get(platform_type, (1, 2000))

@@ -284,7 +284,7 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
 # ---------------------------------------------------------------- 合规闸门（复用独立模块）
 
 
-from scripts.compliance_check import compliance_check
+from scripts.compliance_check import compliance_check, ComplianceRuleError
 
 # ---------------------------------------------------------------- 发布分发
 
@@ -389,7 +389,7 @@ def resolve_platforms(args, assets: Dict[str, Any]) -> List[int]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="一稿五投统一发布入口")
-    parser.add_argument("--episode", required=True, help="期数，如 15")
+    parser.add_argument("--episode", help="期数，如 15（--rule-check 时可省略）")
     parser.add_argument("--dir", help="直接指定该期文案目录（默认按 --episode 自动发现）")
     parser.add_argument("--base", default=str(DEFAULT_MATERIAL_ROOT), help="物料包根目录")
     parser.add_argument("--platforms", default="auto", help="auto 或逗号分隔的平台类型，如 5,7,9,11")
@@ -401,7 +401,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--verify-cookie", action="store_true", help="发布前真正开浏览器校验 cookie（慢）")
     parser.add_argument("--force", action="store_true", help="忽略幂等检查，强制重新发布")
     parser.add_argument("--tieba-kw", default="", help="贴吧目标吧名（type=10 必填）")
+    parser.add_argument("--rule-check", action="store_true", help="仅校验合规规则是否可信，不加载素材/不发布")
     args = parser.parse_args(argv)
+
+    if args.rule_check:
+        import compliance_check as rule_module
+        if rule_module._RULE_LOAD_ERROR:
+            print(f"❌ 合规规则不可信: {rule_module._RULE_LOAD_ERROR}", file=sys.stderr)
+            return 2
+        print("✅ 合规规则装载正常（静态词表 + 动态白名单候选）")
+        return 0
+
+    if not args.episode:
+        print("❌ 缺少 --episode（仅 --rule-check 可省略）")
+        return 2
 
     if not DB_PATH.exists():
         print(f"❌ 数据库不存在: {DB_PATH}")
@@ -462,11 +475,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             if ptype in SHORT_FORM_PLATFORMS
             else assets["title_by_platform"].get(ptype, title)
         )
-        compliance_result = compliance_check(
-            platform_title, body, ptype,
-            has_cover=bool(assets["cover"]),
-            inline_count=len(assets["inline"]),
-        )
+        try:
+            compliance_result = compliance_check(
+                platform_title, body, ptype,
+                has_cover=bool(assets["cover"]),
+                inline_count=len(assets["inline"]),
+            )
+        except ComplianceRuleError as exc:
+            # 规则本身不可信：整批终止，不逐平台尝试发布
+            print(f"❌ 合规规则不可信，终止本轮发布: {exc}", file=sys.stderr)
+            return 2
         problems = compliance_result["problems"]
         warnings = compliance_result["warnings"]
         if problems:

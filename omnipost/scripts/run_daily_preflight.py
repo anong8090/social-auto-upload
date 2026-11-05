@@ -93,13 +93,19 @@ def _append_run_log(record: Dict[str, Any]) -> None:
 
 
 def _rule_version() -> str:
+    """所有会影响结果/告警/规则产物的文件都进版本，避免改了规则却仍判定「结果匹配」。"""
     parts = [
         Path(__file__).resolve(),
         OMNIPOST_DIR / "myUtils" / "preflight.py",
         Path(preflight_notify.__file__).resolve(),
+        Path(__file__).resolve().parent / "link_health_check.py",
+        Path(__file__).resolve().parent / "violation_feedback.py",
+        Path(__file__).resolve().parent / "compliance_check.py",
+        Path(__file__).resolve().parent / "failure_classify.py",
     ]
     digest = hashlib.sha256()
     for path in parts:
+        digest.update(str(path).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
@@ -203,47 +209,29 @@ def _run_check() -> List[Dict[str, Any]]:
 
 
 def _run_link_health_check() -> List[Dict[str, Any]]:
-    """执行链路存活巡检。"""
+    """执行链路存活巡检；告警由统一汇总逻辑发送，这里显式关闭逐条告警。"""
     import asyncio
-    from scripts import link_health_check
+    import link_health_check  # scripts 目录已在 sys.path 中
 
-    # 复用 link_health_check 的 run_health_check，但不发送飞书告警（由统一逻辑处理）
     return asyncio.run(
-        link_health_check.run_health_check(DB_PATH, lookback_days=30, concurrency=2)
+        link_health_check.run_health_check(
+            DB_PATH, lookback_days=30, concurrency=2, send_alerts=False,
+        )
     )
 
 
 def _run_violation_feedback() -> Dict[str, Any]:
-    """执行违规聚合分析，返回生成的文件路径。"""
-    from scripts import violation_feedback
+    """执行违规聚合，只写观察提案；无记录时也要自愈回静态基线并清理旧规则。"""
+    import violation_feedback  # scripts 目录已在 sys.path 中
 
     records = violation_feedback.load_feedback(DB_PATH, days=30)
-    if not records:
-        return {"updated": False, "reason": "无异常记录"}
-
     signals = violation_feedback.extract_violation_signals(records)
     dynamic_words = violation_feedback.build_dynamic_banned_words(signals)
     guide_md = violation_feedback.generate_avoid_guide(signals, dynamic_words)
     platform_rules = violation_feedback.generate_platform_rules(signals)
-
-    # 写入文件
-    violation_feedback.DYNAMIC_BANNED_PATH.write_text(
-        json.dumps(dynamic_words, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    violation_feedback.AVOID_GUIDE_PATH.write_text(guide_md, encoding="utf-8")
-    for platform, rule in platform_rules.items():
-        rule_path = violation_feedback.PLATFORM_RULES_DIR / f"{platform}.json"
-        rule_path.write_text(json.dumps(rule, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "updated": True,
-        "dynamic_words": str(violation_feedback.DYNAMIC_BANNED_PATH),
-        "avoid_guide": str(violation_feedback.AVOID_GUIDE_PATH),
-        "platform_rules_count": len(platform_rules),
-        "high_risk_count": dynamic_words["stats"]["high_risk_count"],
-        "suspicious_count": dynamic_words["stats"]["suspicious_count"],
-        "platforms_covered": dynamic_words["stats"]["platforms_covered"],
-    }
+    result = violation_feedback.write_outputs(dynamic_words, guide_md, platform_rules)
+    result["unverified_records_ignored"] = signals.get("unverified_count", 0)
+    return result
 
 
 def _mark_resolved_issues(now: datetime) -> None:
@@ -260,45 +248,64 @@ def _mark_resolved_issues(now: datetime) -> None:
 
 
 def _build_link_health_alert(health_results: List[Dict[str, Any]]) -> Optional[str]:
-    """构建链路巡检异常告警消息。"""
-    abnormal = [r for r in health_results if r.get("check_status") != "alive"]
-    if not abnormal:
+    """构建链路巡检告警；verified 异常与 unverified 待复核分开呈现。"""
+    verified = [
+        r for r in health_results
+        if r.get("evidence_quality") == "verified" and r.get("check_status") != "alive"
+    ]
+    unverified = [r for r in health_results if r.get("evidence_quality") != "verified"]
+    if not verified and not unverified:
         return None
 
-    lines = ["🔗 链路存活巡检发现异常：", ""]
-    for r in abnormal:
-        lines.append(
-            f"- {r['platform_name']}（期数 {r.get('episode', '?')}，{r['check_status']}）：{r.get('published_url', '')}"
-        )
-        if r.get("warning_text"):
-            lines.append(f"  警告：{r['warning_text']}")
+    lines = ["🔗 链路存活巡检结果：", ""]
+    if verified:
+        lines.append("已验证异常（可进入违规复盘）：")
+        for r in verified[:12]:
+            lines.append(
+                f"- {r['platform_name']}（期数 {r.get('episode', '?')}，{r['check_status']}）：{r.get('published_url', '')}"
+            )
+            if r.get("evidence_text"):
+                lines.append(f"  判词：{r['evidence_text']}")
+    if unverified:
+        lines.append("")
+        lines.append(f"待人工复核：{len(unverified)} 条（登录墙/反爬/容器未命中，不进入规则聚合）")
+        reasons = [
+            str(r.get("evidence_reason") or "证据不足")
+            for r in unverified
+        ]
+        for reason, count in sorted(
+            {reason: reasons.count(reason) for reason in reasons}.items(),
+            key=lambda item: -item[1],
+        )[:4]:
+            lines.append(f"  - {reason} × {count}")
     lines.extend(
         [
             "",
-            "建议：登录对应平台创作者后台核实违规详情并申诉；",
             f"证据：{LINK_HEALTH_DIR}/health_check_*.json",
-            "影响：仅提醒，不自动修改发布内容。",
+            "影响：仅提醒与记录，不自动修改发布内容、不自动改合规规则。",
         ]
     )
     return "\n".join(lines)
 
 
 def _build_violation_feedback_alert(feedback_result: Dict[str, Any]) -> Optional[str]:
-    """构建违规聚合更新告警消息。"""
+    """构建违规聚合告警；明确标注为观察提案，不再宣称自动生效。"""
     if not feedback_result.get("updated"):
         return None
 
     lines = [
-        "📊 违规模式聚合已更新（自动反哺合规闸门）：",
+        "📊 违规反馈聚合完成（观察提案，未自动改规则）：",
         "",
-        f"- 高危词库：{feedback_result['high_risk_count']} 个",
-        f"- 疑似风险词：{feedback_result['suspicious_count']} 个",
-        f"- 平台专用规则：{feedback_result['platforms_covered']} 个平台",
+        f"- 静态零容忍词：{feedback_result['high_risk_count']} 个（唯一来源 preflight.py）",
+        f"- verified 信号桶：{feedback_result.get('verified_signal_buckets', 0)} 个",
+        f"- 观察词候选：{feedback_result.get('observed_term_count', 0)} 个，均待人工确认",
+        f"- unverified 记录忽略：{feedback_result.get('unverified_records_ignored', 0)} 条",
+        f"- 平台建议文件：{feedback_result['platform_rules_count']} 个（proposal_only）",
         "",
-        f"动态词库：{feedback_result['dynamic_words']}",
-        f"避坑指南：{feedback_result['avoid_guide']}",
+        f"提案：{feedback_result['dynamic_words']}",
+        f"指南：{feedback_result['avoid_guide']}",
         "",
-        "下次发布前合规检查将自动加载新词库拦截高危内容。",
+        "规则变更仍需人工确认并验证效果；发布闸门只加载静态词表与白名单内候选。",
     ]
     return "\n".join(lines)
 
@@ -432,15 +439,26 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
         if error_reason or failed:
             alert_messages.append(_build_message(results, record=record_base, error=error_reason, streak=streak))
 
-        # 链路巡检异常
+        # 链路巡检：有 verified 异常或待复核记录时汇总一次
         health_alert = _build_link_health_alert(health_results)
         if health_alert:
             alert_messages.append(health_alert)
 
-        # 违规聚合更新
+        # 违规聚合：每天重写观察提案，内容未变时不重复推送
         feedback_alert = _build_violation_feedback_alert(feedback_result)
         if feedback_alert:
-            alert_messages.append(feedback_alert)
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "verified": feedback_result.get("verified_signal_buckets", 0),
+                        "observed": feedback_result.get("observed_term_count", 0),
+                        "unverified": feedback_result.get("unverified_records_ignored", 0),
+                        "rules": feedback_result.get("platform_rules_count", 0),
+                    },
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()[:8]
+            alert_messages.append(f"{feedback_alert}\n\n聚合签名：{fingerprint}")
 
         # 昨日失败汇总（第 4 件）
         yesterday = now - timedelta(days=1)
@@ -502,8 +520,15 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             "failed": len(failed),
             "unbound": sum(1 for r in failed if "未绑定" in r.get("reason", "")),
             "link_health_checked": len(health_results),
-            "link_health_abnormal": sum(1 for r in health_results if r.get("check_status") != "alive"),
+            "link_health_verified_abnormal": sum(
+                1 for r in health_results
+                if r.get("evidence_quality") == "verified" and r.get("check_status") != "alive"
+            ),
+            "link_health_unverified": sum(
+                1 for r in health_results if r.get("evidence_quality") != "verified"
+            ),
             "violation_feedback_updated": feedback_result.get("updated", False),
+            "violation_observed_terms": feedback_result.get("observed_term_count", 0),
         }
         finished_at = _now().isoformat(timespec="seconds")
         result_payload = {
@@ -521,8 +546,14 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             "notification_reason": notify_reason or None,
             "error_reason": error_reason or None,
             "access": "local-only",
-            "allowed_writes": ["logs/preflight/", "logs/link_health/", "logs/violations/"],
-            "forbidden_actions": ["publish", "account-rebind", "business-db-write"],
+            "allowed_writes": [
+                "logs/preflight/", "logs/link_health/", "logs/violations/",
+                "omnipost/db/database.db（仅 publish_history 健康字段、platform_feedback、幂等 schema 补齐）",
+            ],
+            "forbidden_actions": [
+                "publish", "account-rebind",
+                "publish_drafts 写入", "user_info 写入", "台账写入", "合规规则自动生效",
+            ],
         }
         current = _read_json(result_path)
         if not error_reason and results:
@@ -572,8 +603,16 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             print(f"⚠️ 告警投递结果未知，需人工核查: {notify_reason}", file=sys.stderr)
             return 3
         if not args.quiet:
-            print(f"✅ 当日巡检完成：账号正常 {summary['ok']}、异常 {summary['failed']}；链路巡检 {summary['link_health_checked']} 条（异常 {summary['link_health_abnormal']}）；违规聚合{'已更新' if summary['violation_feedback_updated'] else '无变化'}（任务 {task_id}）")
-        return 1 if (failed or summary['link_health_abnormal'] > 0) else 0
+            print(
+                f"✅ 当日巡检完成：账号正常 {summary['ok']}、异常 {summary['failed']}；"
+                f"链路巡检 {summary['link_health_checked']} 条"
+                f"（verified 异常 {summary['link_health_verified_abnormal']}、"
+                f"待复核 {summary['link_health_unverified']}）；"
+                f"观察词候选 {summary['violation_observed_terms']} 个"
+                f"（任务 {task_id}）"
+            )
+        # 待人工复核不单独制造「异常退出码」，它已在统一飞书卡片里呈现
+        return 1 if (failed or summary["link_health_verified_abnormal"] > 0) else 0
 
 
 def _status_check(args: argparse.Namespace, task_id: str, window: str, today: datetime) -> int:
