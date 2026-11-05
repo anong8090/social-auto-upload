@@ -3,8 +3,9 @@
 """每日账号健康预检 + 链路巡检 + 违规聚合调度入口（第 2+3+5 级巡检）。
 
 职责边界：
-- 只读取账号与 Cookie 文件状态、写 logs/preflight/ logs/link_health/ logs/violations/
-- 绝不发布内容、改数据库业务表或重新绑定账号
+- 只读取账号与 Cookie 文件状态、写 logs/preflight/ logs/link_health/ logs/violations/ logs/review/
+- 写 platform_feedback 的巡检健康字段与人工复核结论
+- 绝不发布内容、改账号业务表、重新绑定账号或自动生效合规规则
 
 退出码：
   0 = 成功/当日已完成
@@ -41,6 +42,7 @@ DB_PATH = Path(BASE_DIR) / "db" / "database.db"
 LOGS_DIR = PROJECT_DIR / "logs" / "preflight"
 LINK_HEALTH_DIR = PROJECT_DIR / "logs" / "link_health"
 VIOLATIONS_DIR = PROJECT_DIR / "logs" / "violations"
+REVIEW_DIR = PROJECT_DIR / "logs" / "review"
 RUN_LOG_PATH = LOGS_DIR / "runs.jsonl"
 STATE_DIR = LOGS_DIR / ".state"
 CONFIG_PATH = preflight_notify.CONFIG_PATH
@@ -102,6 +104,8 @@ def _rule_version() -> str:
         Path(__file__).resolve().parent / "violation_feedback.py",
         Path(__file__).resolve().parent / "compliance_check.py",
         Path(__file__).resolve().parent / "failure_classify.py",
+        Path(__file__).resolve().parent / "review_sync.py",
+        Path(__file__).resolve().parent / "feedback_schema.py",
     ]
     digest = hashlib.sha256()
     for path in parts:
@@ -220,6 +224,15 @@ def _run_link_health_check() -> List[Dict[str, Any]]:
     )
 
 
+def _sync_human_reviews() -> Dict[str, Any]:
+    """同步飞书复核台：先回写人工结论，再把新待复核证据上行。"""
+    import review_sync  # scripts 目录已在 sys.path 中
+
+    result = review_sync.sync_reviews(DB_PATH, days=30, dry_run=False)
+    result["ok"] = bool(result.get("ok"))
+    return result
+
+
 def _run_violation_feedback() -> Dict[str, Any]:
     """执行违规聚合，只写观察提案；无记录时也要自愈回静态基线并清理旧规则。"""
     import violation_feedback  # scripts 目录已在 sys.path 中
@@ -231,6 +244,7 @@ def _run_violation_feedback() -> Dict[str, Any]:
     platform_rules = violation_feedback.generate_platform_rules(signals)
     result = violation_feedback.write_outputs(dynamic_words, guide_md, platform_rules)
     result["unverified_records_ignored"] = signals.get("unverified_count", 0)
+    result["human_reviewed_count"] = signals.get("human_reviewed_count", 0)
     return result
 
 
@@ -288,6 +302,45 @@ def _build_link_health_alert(health_results: List[Dict[str, Any]]) -> Optional[s
     return "\n".join(lines)
 
 
+def _build_review_alert(
+    review_result: Dict[str, Any],
+    review_error: str = "",
+) -> Optional[str]:
+    """构建人工复核台汇总；同步失败必须显式呈现，不得静默吞掉。"""
+    if review_error:
+        return "\n".join([
+            "🚨 飞书人工复核同步失败：",
+            "",
+            f"- 原因：{review_error}",
+            f"- 本地证据：logs/review/、logs/preflight/runs.jsonl",
+            "- 影响：本轮新增待复核项可能未写入复核台；人工结论也未保证回写。",
+            "- 处理：检查 lark-cli user 身份与复核台配置后人工重跑 review_sync.py。",
+        ])
+    if not review_result:
+        return None
+    base_url = str(review_result.get("base_url") or "")
+    pending = int(review_result.get("pending_in_base") or 0)
+    created = int(review_result.get("created") or 0)
+    reviewed = int(review_result.get("reviewed") or 0)
+    upgraded = int(review_result.get("verified_upgraded") or 0)
+    conflicts = int(review_result.get("conflicts") or 0)
+    if not (pending or created or reviewed or conflicts or review_result.get("unprocessed_reviews")):
+        return None
+    lines = [
+        "🧾 飞书人工复核台同步完成：",
+        "",
+        f"- 复核台：{base_url}" if base_url else "- 复核台：未配置 URL",
+        f"- 待复核：{pending} 条；本轮新增：{created} 条",
+        f"- 已回写人工结论：{reviewed} 条；其中确认异常并升级证据：{upgraded} 条",
+        f"- 需人工检查的冲突：{conflicts} 条；复核台未处理结论：{review_result.get('unprocessed_reviews', 0)} 条",
+        "",
+        "操作：打开复核台，在「复核结论」选择确认正常 / 确认异常 / 忽略；",
+        "确认异常还需选择「人工判定状态」并写明创作者后台核实依据。",
+        "规则变更仍只产出观察提案，不自动改发布拦截词。",
+    ]
+    return "\n".join(lines)
+
+
 def _build_violation_feedback_alert(feedback_result: Dict[str, Any]) -> Optional[str]:
     """构建违规聚合告警；明确标注为观察提案，不再宣称自动生效。"""
     if not feedback_result.get("updated"):
@@ -299,7 +352,8 @@ def _build_violation_feedback_alert(feedback_result: Dict[str, Any]) -> Optional
         f"- 静态零容忍词：{feedback_result['high_risk_count']} 个（唯一来源 preflight.py）",
         f"- verified 信号桶：{feedback_result.get('verified_signal_buckets', 0)} 个",
         f"- 观察词候选：{feedback_result.get('observed_term_count', 0)} 个，均待人工确认",
-        f"- unverified 记录忽略：{feedback_result.get('unverified_records_ignored', 0)} 条",
+        f"- unverified 待复核：{feedback_result.get('unverified_records_ignored', 0)} 条；"
+        f"人工已复核：{feedback_result.get('human_reviewed_count', 0)} 条",
         f"- 平台建议文件：{feedback_result['platform_rules_count']} 个（proposal_only）",
         "",
         f"提案：{feedback_result['dynamic_words']}",
@@ -316,6 +370,7 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     LINK_HEALTH_DIR.mkdir(parents=True, exist_ok=True)
     VIOLATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    REVIEW_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = STATE_DIR / "daily-preflight.lock"
     try:
         stat = lock_path.stat()
@@ -418,7 +473,21 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️ 链路巡检异常: {preflight_notify.redact_error(exc, webhook, secret)}", file=sys.stderr)
 
-        # 步骤 3：违规聚合分析（仅在预检无致命错误时执行）
+        # 步骤 3：人工复核结论回写 + 新待复核证据上行
+        # 前置预检失败时本步骤按设计跳过，不伪装成「复核同步失败」。
+        review_result: Dict[str, Any] = {}
+        review_error = ""
+        review_skipped = bool(error_reason)
+        if not error_reason:
+            try:
+                review_result = _sync_human_reviews()
+                if not review_result.get("ok"):
+                    review_error = "复核台读回校验未通过"
+            except Exception as exc:  # noqa: BLE001
+                review_error = preflight_notify.redact_error(exc, webhook, secret)
+                print(f"⚠️ 飞书人工复核同步异常: {review_error}", file=sys.stderr)
+
+        # 步骤 4：违规聚合分析（只采信机器 verified 或人工确认异常后的证据）
         if not error_reason:
             try:
                 feedback_result = _run_violation_feedback()
@@ -434,15 +503,42 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
 
         # ========== 汇总所有告警消息，统一发送（去重按 key） ==========
         alert_messages: List[str] = []
+        review_fingerprint = ""
 
         # 账号预检异常
         if error_reason or failed:
             alert_messages.append(_build_message(results, record=record_base, error=error_reason, streak=streak))
 
+        # 前置预检失败时复核同步按设计跳过；汇总里显式说明，避免误以为复核台已同步。
+        if review_skipped:
+            alert_messages.append(
+                "⏸️ 飞书人工复核同步已跳过：账号预检前置步骤失败；"
+                "本轮不写复核台、不回写人工结论，待预检恢复后由下次任务重试。"
+            )
+
         # 链路巡检：有 verified 异常或待复核记录时汇总一次
         health_alert = _build_link_health_alert(health_results)
         if health_alert:
             alert_messages.append(health_alert)
+
+        # 人工复核台：待复核数量、复核链接、回写结果与同步失败
+        review_alert = _build_review_alert(review_result, review_error)
+        if review_alert:
+            review_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "pending": review_result.get("pending_in_base", 0),
+                        "created": review_result.get("created", 0),
+                        "reviewed": review_result.get("reviewed", 0),
+                        "upgraded": review_result.get("verified_upgraded", 0),
+                        "conflicts": review_result.get("conflicts", 0),
+                        "unprocessed": review_result.get("unprocessed_reviews", 0),
+                        "error": review_error,
+                    },
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()[:8]
+            alert_messages.append(f"{review_alert}\n\n复核同步签名：{review_fingerprint}")
 
         # 违规聚合：每天重写观察提案，内容未变时不重复推送
         feedback_alert = _build_violation_feedback_alert(feedback_result)
@@ -483,7 +579,7 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             combined_message = "\n\n---\n\n".join(alert_messages)
             notify_state, notify_reason = preflight_notify.notify_once(
                 STATE_DIR,
-                f"daily-summary|{now:%Y-%m-%d}|{issue_signature}",
+                f"daily-summary|{now:%Y-%m-%d}|{issue_signature}|review:{review_fingerprint}",
                 webhook,
                 secret,
                 combined_message,
@@ -529,6 +625,14 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             ),
             "violation_feedback_updated": feedback_result.get("updated", False),
             "violation_observed_terms": feedback_result.get("observed_term_count", 0),
+            "review_pending": review_result.get("pending_in_base", 0),
+            "review_created": review_result.get("created", 0),
+            "review_writebacks": review_result.get("reviewed", 0),
+            "review_conflicts": review_result.get("conflicts", 0),
+            "review_sync_skipped": review_skipped,
+            "review_sync_failed": bool(
+                review_error or (not review_skipped and not review_result.get("ok"))
+            ),
         }
         finished_at = _now().isoformat(timespec="seconds")
         result_payload = {
@@ -547,8 +651,9 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             "error_reason": error_reason or None,
             "access": "local-only",
             "allowed_writes": [
-                "logs/preflight/", "logs/link_health/", "logs/violations/",
+                "logs/preflight/", "logs/link_health/", "logs/violations/", "logs/review/",
                 "omnipost/db/database.db（仅 publish_history 健康字段、platform_feedback、幂等 schema 补齐）",
+                "飞书多维表格「蓝枢发布链路人工复核台」（待复核记录与回写状态）",
             ],
             "forbidden_actions": [
                 "publish", "account-rebind",
@@ -608,11 +713,17 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
                 f"链路巡检 {summary['link_health_checked']} 条"
                 f"（verified 异常 {summary['link_health_verified_abnormal']}、"
                 f"待复核 {summary['link_health_unverified']}）；"
+                f"复核台待复核 {summary['review_pending']}、回写 {summary['review_writebacks']}；"
                 f"观察词候选 {summary['violation_observed_terms']} 个"
                 f"（任务 {task_id}）"
             )
-        # 待人工复核不单独制造「异常退出码」，它已在统一飞书卡片里呈现
-        return 1 if (failed or summary["link_health_verified_abnormal"] > 0) else 0
+        # 待人工复核不单独制造「异常退出码」；复核同步故障与已验证异常需要显露
+        return 1 if (
+            failed
+            or summary["link_health_verified_abnormal"] > 0
+            or summary["review_sync_failed"]
+            or summary["review_conflicts"] > 0
+        ) else 0
 
 
 def _status_check(args: argparse.Namespace, task_id: str, window: str, today: datetime) -> int:

@@ -25,10 +25,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 OMNIPOST_DIR = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(OMNIPOST_DIR))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from conf import BASE_DIR  # noqa: E402
 from myUtils import preflight  # noqa: E402
+import feedback_schema  # noqa: E402
 
 DB_PATH = Path(BASE_DIR) / "db" / "database.db"
 VIOLATIONS_DIR = OMNIPOST_DIR.parent / "logs" / "violations"
@@ -72,7 +75,8 @@ def load_feedback(db_path: Path, days: int = 30) -> List[Dict[str, Any]]:
     """读取近 N 天巡检记录，按 (history_id, 日期) 保留最新一条。
 
     verified 与 unverified 都返回，由上层分别处理；
-    旧库缺 evidence_quality 时返回空并打印明确提示，避免把历史脏数据当证据。
+    旧库缺 evidence_quality 时返回空并打印明确提示，避免把历史脏数据当证据；
+    review_status 为可选列，旧库动态投影为 NULL，保持只读兼容。
     """
     if not _feedback_supports_evidence(db_path):
         print("⚠️ platform_feedback 缺少 evidence_quality 列，本次不采信任何历史记录", file=sys.stderr)
@@ -80,11 +84,14 @@ def load_feedback(db_path: Path, days: int = 30) -> List[Dict[str, Any]]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(platform_feedback)")}
+        review_select = "review_status" if "review_status" in columns else "NULL AS review_status"
         rows = conn.execute(
-            """
+            f"""
             SELECT id, history_id, episode, platform_type, platform_name,
                    published_url, check_status, evidence_quality, evidence_source,
-                   evidence_text, evidence_reason, check_at, raw_snapshot
+                   evidence_text, evidence_reason, check_at, raw_snapshot,
+                   {review_select}
             FROM platform_feedback
             WHERE date(check_at) >= ?
             ORDER BY check_at DESC, id DESC
@@ -105,11 +112,22 @@ def load_feedback(db_path: Path, days: int = 30) -> List[Dict[str, Any]]:
 
 # ============================================================ 信号提取
 
+HUMAN_REVIEWED_STATUSES = feedback_schema.HUMAN_REVIEWED_STATUSES
+NO_AGGREGATION_REVIEW_STATUSES = frozenset({"confirmed_normal", "ignored"})
+
+
 def extract_violation_signals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """只从 verified 异常提取信号；整句判词不参与词频。"""
+    """只从 verified 异常提取信号；人工确认正常/忽略不再算待复核。"""
     buckets: Dict[str, List[Dict[str, Any]]] = {}
     unverified = 0
+    human_reviewed = 0
     for r in records:
+        review_status = str(r.get("review_status") or "")
+        if review_status in NO_AGGREGATION_REVIEW_STATUSES:
+            human_reviewed += 1
+            continue
+        if review_status in HUMAN_REVIEWED_STATUSES:
+            human_reviewed += 1
         if r.get("evidence_quality") != "verified":
             unverified += 1
             continue
@@ -120,6 +138,7 @@ def extract_violation_signals(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     signals: Dict[str, Any] = {
         "unverified_count": unverified,
+        "human_reviewed_count": human_reviewed,
         "buckets": {},
     }
     for key, items in buckets.items():
@@ -199,6 +218,7 @@ def build_dynamic_banned_words(signals: Dict[str, Any]) -> Dict[str, Any]:
             "platforms_covered": 0,
             "verified_signal_buckets": len(signals.get("buckets", {})),
             "unverified_records_ignored": signals.get("unverified_count", 0),
+            "human_reviewed_count": signals.get("human_reviewed_count", 0),
             "observed_term_count": len(observed),
         },
     }
@@ -212,7 +232,8 @@ def generate_avoid_guide(signals: Dict[str, Any], dynamic_words: Dict[str, Any])
         "> 数据来源：近 30 天 `platform_feedback` 中 `evidence_quality='verified'` 的异常记录。",
         "> 同一链接同一天只计一次；平台判词整句不会自动变成正文违禁词。",
         f"> 静态零容忍词：{dynamic_words['stats']['high_risk_count']} 个；"
-        f"待人工复核记录：{dynamic_words['stats']['unverified_records_ignored']} 条。",
+        f"待人工复核记录：{dynamic_words['stats']['unverified_records_ignored']} 条；"
+        f"飞书人工已复核：{dynamic_words['stats'].get('human_reviewed_count', 0)} 条。",
         "",
         "## 1. 静态零容忍词（唯一来源：myUtils/preflight.py）",
         "",
@@ -256,7 +277,8 @@ def generate_avoid_guide(signals: Dict[str, Any], dynamic_words: Dict[str, Any])
             "## 4. 待人工复核（不进入规则聚合）",
             "",
             f"共 {unverified} 条 `unverified` 记录，常见成因：登录墙、反爬、正文容器未命中、巡检异常。",
-            "请先到对应平台创作者后台核实，再决定是否补录人工确认证据。",
+            f"飞书人工已复核：{signals.get('human_reviewed_count', 0)} 条，不再重复列为待办。",
+            "待复核项请到对应平台创作者后台核实，并在飞书复核台明确结论。",
             "",
         ])
 
@@ -327,6 +349,7 @@ def write_outputs(dynamic_words: Dict[str, Any], guide_md: str,
         "platforms_covered": len(platform_rules),
         "observed_term_count": dynamic_words["stats"]["observed_term_count"],
         "unverified_records_ignored": dynamic_words["stats"]["unverified_records_ignored"],
+        "human_reviewed_count": dynamic_words["stats"].get("human_reviewed_count", 0),
         "verified_signal_buckets": dynamic_words["stats"]["verified_signal_buckets"],
     }
 
@@ -343,7 +366,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"   去重后记录数：{len(records)}")
 
     signals = extract_violation_signals(records)
-    print(f"   verified 信号桶：{len(signals['buckets'])}；unverified 忽略：{signals['unverified_count']}")
+    print(
+        f"   verified 信号桶：{len(signals['buckets'])}；"
+        f"unverified 待复核：{signals['unverified_count']}；"
+        f"人工已复核：{signals.get('human_reviewed_count', 0)}"
+    )
 
     dynamic_words = build_dynamic_banned_words(signals)
     guide_md = generate_avoid_guide(signals, dynamic_words)

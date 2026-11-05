@@ -38,6 +38,7 @@ from myUtils import preflight  # noqa: E402
 
 SCRIPTS_DIR = OMNIPOST_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
+import feedback_schema  # noqa: E402
 import preflight_notify  # noqa: E402
 
 DB_PATH = Path(BASE_DIR) / "db" / "database.db"
@@ -107,68 +108,9 @@ UNVERIFIABLE_MARKERS: Tuple[str, ...] = (
 
 # ============================================================ 数据库扩展
 
-_FEEDBACK_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS platform_feedback (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    history_id INTEGER NOT NULL,
-    episode TEXT,
-    platform_type INTEGER NOT NULL,
-    platform_name TEXT NOT NULL,
-    published_url TEXT NOT NULL,
-    check_status TEXT NOT NULL,
-    warning_text TEXT,
-    content_visible INTEGER,
-    http_status INTEGER,
-    check_at TEXT NOT NULL,
-    raw_snapshot TEXT,
-    FOREIGN KEY (history_id) REFERENCES publish_history(id)
-);
-CREATE INDEX IF NOT EXISTS idx_platform_feedback_history ON platform_feedback(history_id);
-CREATE INDEX IF NOT EXISTS idx_platform_feedback_episode_platform ON platform_feedback(episode, platform_type);
-CREATE INDEX IF NOT EXISTS idx_platform_feedback_status ON platform_feedback(check_status);
-CREATE INDEX IF NOT EXISTS idx_platform_feedback_history_time ON platform_feedback(history_id, check_at);
-"""
-
-_NEW_HEALTH_COLUMNS = (
-    ("health_status", "TEXT"),
-    ("health_checked_at", "TEXT"),
-    ("health_details", "TEXT"),
-)
-
-# 证据链字段：旧记录默认为 unverified，避免历史脏数据被当作规则依据
-_NEW_FEEDBACK_COLUMNS = (
-    ("evidence_quality", "TEXT DEFAULT 'unverified'"),  # verified / unverified
-    ("evidence_source", "TEXT"),                        # http_status / notice / page_marker / content_selector
-    ("evidence_text", "TEXT"),                          # 命中的具体判词（截断）
-    ("evidence_reason", "TEXT"),                        # unknown 的成因
-)
-
-
 def ensure_health_schema(db_path: Path) -> List[str]:
-    """幂等补齐 publish_history 健康列与 platform_feedback 证据列。"""
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return []
-
-    applied: List[str] = []
-    with sqlite3.connect(str(db_path)) as conn:
-        cur = conn.cursor()
-
-        existing_history = {row[1] for row in cur.execute("PRAGMA table_info(publish_history)")}
-        for column, sql_type in _NEW_HEALTH_COLUMNS:
-            if column not in existing_history:
-                cur.execute(f"ALTER TABLE publish_history ADD COLUMN {column} {sql_type}")
-                applied.append(f"ADD COLUMN publish_history.{column}")
-
-        cur.executescript(_FEEDBACK_TABLE_SQL)
-        existing_feedback = {row[1] for row in cur.execute("PRAGMA table_info(platform_feedback)")}
-        for column, sql_type in _NEW_FEEDBACK_COLUMNS:
-            if column not in existing_feedback:
-                cur.execute(f"ALTER TABLE platform_feedback ADD COLUMN {column} {sql_type}")
-                applied.append(f"ADD COLUMN platform_feedback.{column}")
-
-        conn.commit()
-    return applied
+    """兼容旧调用名；schema 的唯一实现收敛到 feedback_schema.py。"""
+    return feedback_schema.ensure_feedback_schema(db_path)
 
 
 # ============================================================ 纯判定逻辑（可脱离浏览器测试）
@@ -452,9 +394,11 @@ async def run_health_check(
 
     await asyncio.gather(*[worker(r) for r in rows])
 
-    # 回写：同一 (history_id, 当日) 只 UPDATE 不重复 INSERT
+    # 回写：同一 (history_id, 当日) 只 UPDATE 不重复 INSERT；
+    # 已人工复核的记录保留复核结论，机器巡检不得覆盖。
     with sqlite3.connect(str(db_path)) as conn:
         cur = conn.cursor()
+        skipped_human_review = 0
         for r in results:
             cur.execute(
                 """
@@ -467,27 +411,38 @@ async def run_health_check(
             day = str(r["check_at"])[:10]
             existing = cur.execute(
                 """
-                SELECT id FROM platform_feedback
+                SELECT id, review_status, machine_evidence_version
+                FROM platform_feedback
                 WHERE history_id = ? AND substr(check_at, 1, 10) = ?
                 ORDER BY id DESC LIMIT 1
                 """,
                 (r["history_id"], day),
             ).fetchone()
 
+            if existing and existing[1] in feedback_schema.HUMAN_REVIEWED_STATUSES:
+                skipped_human_review += 1
+                continue
+
+            machine_version = feedback_schema.machine_evidence_version(r)
             values = (
                 r["episode"], r["platform_type"], r["platform_name"], r["published_url"],
                 r["check_status"], r["warning_text"], r["content_visible"], r["http_status"],
                 r["check_at"], r["raw_snapshot"], r["evidence_quality"],
                 r["evidence_source"], r["evidence_text"], r["evidence_reason"],
+                machine_version,
             )
             if existing:
+                # 机器证据更新后，旧的「待复核」结论失效；人工已确认项在上面已跳过。
                 cur.execute(
                     """
                     UPDATE platform_feedback SET
                         episode=?, platform_type=?, platform_name=?, published_url=?,
                         check_status=?, warning_text=?, content_visible=?, http_status=?,
                         check_at=?, raw_snapshot=?, evidence_quality=?, evidence_source=?,
-                        evidence_text=?, evidence_reason=?
+                        evidence_text=?, evidence_reason=?, machine_evidence_version=?,
+                        review_status='pending', review_evidence_version=NULL,
+                        review_decision=NULL, review_manual_status=NULL,
+                        review_writeback_at=NULL, review_writeback_note=NULL
                     WHERE id=?
                     """,
                     (*values, existing[0]),
@@ -499,12 +454,15 @@ async def run_health_check(
                     (episode, platform_type, platform_name, published_url,
                      check_status, warning_text, content_visible, http_status,
                      check_at, raw_snapshot, evidence_quality, evidence_source,
-                     evidence_text, evidence_reason, history_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     evidence_text, evidence_reason, machine_evidence_version,
+                     review_status, history_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
                     (*values, r["history_id"]),
                 )
         conn.commit()
+    if skipped_human_review:
+        print(f"🔒 保留 {skipped_human_review} 条已人工复核证据，机器巡检未覆盖复核结论")
 
     stats: Dict[str, int] = {}
     for r in results:
