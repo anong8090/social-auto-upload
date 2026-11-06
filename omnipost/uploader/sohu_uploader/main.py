@@ -212,6 +212,7 @@ class SoHuArticle(object):
         self.cover_paths = self._normalize_cover_paths(cover_path, cover_paths)
         self.cover_path = self.cover_paths[0] if self.cover_paths else None
         self.info_source = self._normalize_info_source(info_source)
+        self.published_url = ""
         self.inline_image_paths = [
             str(Path(p).resolve()) for p in (inline_image_paths or [])
             if p and Path(p).is_file()
@@ -1055,6 +1056,135 @@ class SoHuArticle(object):
             raise RuntimeError(f"点击发布后仍停留在发文页，疑似未发出：{hints}")
         sohu_logger.success(f"已点击文章发布并离开发文页: {page.url}")
 
+    async def verify_publish_result(self, page: Page, title: str) -> str:
+        """回后台核对审核状态，返回公开链接；审核未通过则抛出真实原因。
+
+        搜狐号发文后先走平台审核，审核驳回时页面会跳离发文页，
+        但后台没有任何公开页面。此处查后台「已发布」列表：
+        只接受 auditStatus/status == 4 且 rejectReason 为空的条目。
+
+        新文章刚提交时处于审核中（auditStatus=1），审核有延迟，
+        因此允许轮询等待若干轮再判定。
+        """
+        await page.goto(SOHU_FIRST_PAGE_URL, timeout=90000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(6000)
+
+        headers: dict = {}
+        list_url: str = ""
+
+        async def _capture(request):
+            nonlocal list_url
+            if "/users/news?" not in (request.url or ""):
+                return
+            if not list_url:
+                list_url = request.url
+            try:
+                raw = await request.all_headers()
+            except Exception:
+                return
+            for k, v in raw.items():
+                headers.setdefault(k.lower(), v)
+
+        page.on("request", lambda r: asyncio.ensure_future(_capture(r)))
+        await page.reload(timeout=90000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(8000)
+
+        if "x-requested-with" not in headers:
+            sohu_logger.warning("未捕获到搜狐后台请求头，无法核对审核状态")
+            return ""
+
+        keep_headers = {k: v for k, v in headers.items() if k in (
+            "x-requested-with", "sp-cm", "dv-id", "referer",
+            "accept", "accept-language")}
+
+        def _hit(item):
+            name = str(item.get("title") or item.get("mobileTitle") or "")
+            strip = lambda s: re.sub(
+                r"[\s　，。！？、；：“”‘’（）()\[\]【】《》—\-·….,!?;:'\"#]+", "", s)
+            key = strip(title)
+            return bool(key) and key in strip(name)
+
+        pending: dict = {}
+        # 审核有延迟，给平台若干轮时间；每轮都重查两个列表。
+        # 同一标题可能存在历史条目（含被驳回记录），因此只认「最新一条」，
+        # 避免把上一期或已驳回条目的 ID 当成本期成功链接。
+        for attempt in range(6):
+            published_url = ""
+            newest: dict = {}
+            for status_type in (2, 1):
+                url = re.sub(
+                    r"([?&])statusType=\d+", rf"\1statusType={status_type}",
+                    list_url or (
+                        "https://mp.sohu.com/mpbp/bp/news/v4/users/news"
+                        "?psize=20&newsType=0&statusType=2&columnId=&pno=1&streamId="
+                    ),
+                )
+                try:
+                    payload = await page.evaluate(
+                        """async ([url, headers]) => {
+                            const resp = await fetch(url, {credentials: 'include', headers});
+                            const text = await resp.text();
+                            try { return {ok: true, data: JSON.parse(text)}; }
+                            catch (e) { return {ok: false}; }
+                        }""",
+                        [url, keep_headers],
+                    )
+                except Exception:
+                    continue
+                if not payload.get("ok"):
+                    continue
+                for item in (payload.get("data") or {}).get("news") or []:
+                    if not isinstance(item, dict) or not _hit(item):
+                        continue
+                    created = int(item.get("createdTime") or item.get("postTime") or 0)
+                    if created and created <= newest.get("created", 0):
+                        continue
+                    newest = {
+                        "id": str(item.get("id") or ""),
+                        "audit": str(item.get("auditStatus")),
+                        "status": str(item.get("status")),
+                        "reason": str(item.get("rejectReason") or "").strip(),
+                        "userId": str(item.get("userId") or ""),
+                        "created": created,
+                    }
+
+            if newest:
+                pending = newest
+                if (
+                    (newest["audit"] == "4" or newest["status"] == "4")
+                    and not newest["reason"]
+                ):
+                    item_id = newest["id"]
+                    user_id = newest["userId"]
+                    published_url = (
+                        f"https://www.sohu.com/a/{item_id}_{user_id}"
+                        if user_id else f"https://www.sohu.com/a/{item_id}"
+                    )
+
+            if published_url:
+                sohu_logger.success(f"✅ 搜狐号审核通过并已发布: {published_url}")
+                return published_url
+            if pending.get("reason"):
+                # 已明确被驳回，无需继续等待
+                raise RuntimeError(
+                    f"搜狐号审核未通过：{pending['reason']}；后台文章ID={pending['id']}"
+                )
+            if attempt < 5:
+                sohu_logger.info(
+                    f"搜狐号仍在审核中（第 {attempt + 1} 轮），等待 20s 后复查…"
+                )
+                await asyncio.sleep(20)
+                await page.reload(timeout=90000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(6000)
+
+        if pending:
+            raise RuntimeError(
+                f"搜狐号审核未通过：{pending.get('reason') or '审核未完成'}；"
+                f"后台文章ID={pending.get('id')}"
+            )
+        sohu_logger.warning("搜狐后台「已发布」列表中未找到本期文章，也未查到驳回原因")
+        return ""
+
     async def _title_input_ready(self, page: Page) -> bool:
         try:
             return bool(await page.locator(TITLE_INPUT_SELECTOR).count())
@@ -1320,6 +1450,8 @@ class SoHuArticle(object):
             await self.publish(page)
             await page.wait_for_timeout(3000)
             sohu_logger.success("文章发布流程完成")
+            # 回后台核对审核状态：审核未通过时没有公开页面，必须据实失败
+            self.published_url = await self.verify_publish_result(page, self.title)
 
         await context.storage_state(path=self.account_file)
         sohu_logger.info("cookie 更新完毕")
@@ -1330,3 +1462,4 @@ class SoHuArticle(object):
     async def main(self):
         async with async_playwright() as playwright:
             await self.upload(playwright)
+        return self.published_url

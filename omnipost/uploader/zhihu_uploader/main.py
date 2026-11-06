@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +31,21 @@ ZHIHU_CREATION_STATEMENT_OPTIONS = (
     "无声明",
 )
 ZHIHU_CREATION_STATEMENT_DEFAULT = "包含 AI 辅助创作 作者对内容负责"
+
+# 发布入口在清洗后的正文里保留这些位置标记；上传器逐段插图后必须全部替换。
+INLINE_MARKER_RE = re.compile(r"\[\[插图(\d+)\]\]")
+
+
+def _split_inline_body(body: str) -> list[tuple[str, int]]:
+    """按插图位置标记拆正文，返回 [(文本段, 后随插图序号)]。"""
+    parts = INLINE_MARKER_RE.split(body or "")
+    out: list[tuple[str, int]] = []
+    for i in range(0, len(parts), 2):
+        text = parts[i]
+        marker = int(parts[i + 1]) if i + 1 < len(parts) else 0
+        if text or marker:
+            out.append((text, marker))
+    return out
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
@@ -238,7 +254,7 @@ class ZhiHuArticle(object):
         zhihu_logger.warning(f"未知创作声明「{raw}」，回退为「{ZHIHU_CREATION_STATEMENT_DEFAULT}」")
         return ZHIHU_CREATION_STATEMENT_DEFAULT
 
-    async def upload(self, playwright) -> None:
+    async def upload(self, playwright) -> str:
         browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
         context = await browser.new_context(storage_state=str(self.account_file))
         context = await set_init_script(context)
@@ -265,7 +281,7 @@ class ZhiHuArticle(object):
                     zhihu_logger.info(f"📸 草稿凭证截图已保存: {preview}")
                 except Exception as exc:
                     zhihu_logger.debug(f"草稿截图保存失败: {exc}")
-                return
+                return ""
 
             if self.dry_run:
                 zhihu_logger.warning("🛑 【仅预览不发布】已跳过点击发布按钮")
@@ -282,9 +298,10 @@ class ZhiHuArticle(object):
                     if i in (30, 60, 90):
                         zhihu_logger.info(f"⏳ 预览中…还剩约 {120 - i} 秒自动关闭")
                 zhihu_logger.info("🛑 预览结束，关闭浏览器（未点击发布）")
-                return
-            await self.click_publish(page)
+                return ""
+            published_url = await self.click_publish(page)
             zhihu_logger.success("知乎文章发布流程已完成点击发布")
+            return published_url
         finally:
             await context.close()
             await browser.close()
@@ -372,6 +389,55 @@ class ZhiHuArticle(object):
         await title_field.fill(self.title)
         zhihu_logger.info(f"已填写文章标题: {self.title}")
 
+    @staticmethod
+    async def _paste_text(page: Page, text: str) -> bool:
+        """通过真实 ClipboardEvent 把一段纯文本写入当前 Draft.js 选区。"""
+        return bool(await page.evaluate(
+            """(text) => {
+                const el = document.querySelector('.public-DraftEditor-content') || document.querySelector('[contenteditable="true"]');
+                if (!el) return false;
+                const dt = new DataTransfer();
+                dt.setData('text/plain', text);
+                const evt = new ClipboardEvent('paste', {
+                    bubbles: true,
+                    cancelable: true,
+                    clipboardData: dt
+                });
+                el.dispatchEvent(evt);
+                return true;
+            }""",
+            text,
+        ))
+
+    @staticmethod
+    async def _select_text(page: Page, needle: str, occurrence: int = 1) -> bool:
+        """在正文中选中指定文本，供插图按钮原位替换。"""
+        return bool(await page.evaluate(
+            """([needle, occurrence]) => {
+                const ed = document.querySelector('.public-DraftEditor-content');
+                if (!ed) return false;
+                const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
+                let seen = 0;
+                while (walker.nextNode()) {
+                    const node = walker.currentNode;
+                    const pos = (node.textContent || '').indexOf(needle);
+                    if (pos < 0) continue;
+                    seen += 1;
+                    if (seen < occurrence) continue;
+                    ed.focus();
+                    const range = document.createRange();
+                    range.setStart(node, pos);
+                    range.setEnd(node, pos + needle.length);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    return true;
+                }
+                return false;
+            }""",
+            [needle, occurrence],
+        ))
+
     async def fill_body(self, page: Page) -> None:
         selectors = [
             ".public-DraftEditor-content",
@@ -396,22 +462,7 @@ class ZhiHuArticle(object):
 
         # 优先使用标准的 ClipboardEvent + DataTransfer 注入 Draft.js 富文本编辑器（跨平台可靠）
         try:
-            await page.evaluate(
-                """(text) => {
-                    const el = document.querySelector('.public-DraftEditor-content') || document.querySelector('[contenteditable="true"]');
-                    if (!el) return false;
-                    const dt = new DataTransfer();
-                    dt.setData('text/plain', text);
-                    const evt = new ClipboardEvent('paste', {
-                        bubbles: true,
-                        cancelable: true,
-                        clipboardData: dt
-                    });
-                    el.dispatchEvent(evt);
-                    return true;
-                }""",
-                self.body,
-            )
+            await self._paste_text(page, self.body)
         except Exception as exc:
             zhihu_logger.debug(f"模拟粘贴事件出错: {exc}")
 
@@ -421,12 +472,7 @@ class ZhiHuArticle(object):
         if not text_now or len(text_now) < 10:
             # 降级方案 1: document.execCommand insertText
             try:
-                await page.evaluate(
-                    """(text) => {
-                        document.execCommand('insertText', false, text);
-                    }""",
-                    self.body,
-                )
+                await page.keyboard.insert_text(self.body)
                 await page.wait_for_timeout(1000)
                 text_now = (await editor.inner_text()).strip()
             except Exception as exc:
@@ -446,30 +492,17 @@ class ZhiHuArticle(object):
                 f"知乎正文写入校验失败：期望约 {len(self.body.strip())} 字，实际录入 {final_len} 字"
             )
 
-    async def _insert_inline_images(self, page: Page) -> None:
-        """在正文末尾插入 16:9 内文图。
-
-        知乎图片弹窗的 file input 支持多选，一次选全部后点「插入图片」最稳；
-        逐张插入会因弹窗未关闭导致第二张失败。以编辑器 <img> 增量校验。
-        """
-        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
-        if not paths:
-            return
-
-        editor = page.locator(
-            ".public-DraftEditor-content, .ProseMirror, [contenteditable='true']"
-        ).first
-        if not await editor.count():
-            raise RuntimeError("未找到正文编辑器")
+    @staticmethod
+    async def _editor_image_count(page: Page) -> int:
+        editor = page.locator(".public-DraftEditor-content, .ProseMirror, [contenteditable='true']").first
         try:
-            before = await editor.locator("img").count()
+            return await editor.locator("img").count()
         except Exception:
-            before = 0
+            return 0
 
-        await editor.click(force=True)
-        await page.keyboard.press("ControlOrMeta+End")
-        await page.wait_for_timeout(300)
-
+    async def _insert_one_image(self, page: Page, path: Path, expected_count: int) -> None:
+        """在已选中的插图位置替换一张 16:9 内文图，并校验图片增量。"""
+        before = await self._editor_image_count(page)
         btn = page.locator(
             'button[aria-label*="图片"], '
             '.Editable-toolbar button:has-text("图片"), '
@@ -478,28 +511,49 @@ class ZhiHuArticle(object):
         if not await btn.count():
             raise RuntimeError("未找到知乎图片按钮")
         await btn.click(force=True, timeout=5000)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1000)
 
         file_input = page.locator('.Modal-content input[type="file"]').last
         if not await file_input.count():
             file_input = page.locator('input[type="file"][accept*="image"]').last
         if not await file_input.count():
             raise RuntimeError("知乎图片弹窗无文件输入")
-        await file_input.set_input_files([str(p) for p in paths])
+        await file_input.set_input_files(str(path))
 
-        expected = f"已上传{len(paths)}张"
-        uploaded = False
         last_text = ""
-        for _ in range(45):
+        uploaded = False
+        for _ in range(30):
             await page.wait_for_timeout(1000)
-            last_text = await page.evaluate(
-                """() => (document.querySelector('.Modal-content')?.innerText || '').replace(/\\s/g, '')"""
+            state = await page.evaluate(
+                """() => {
+                    const modal = document.querySelector('.Modal-content');
+                    if (!modal) return ['', 0, 0];
+                    return [
+                        (modal.innerText || '').replace(/\\s/g, ''),
+                        modal.querySelectorAll('.DraggableTags-tag').length,
+                        modal.querySelectorAll('.DraggableTags-tag .CircleLoadingBar').length,
+                    ];
+                }"""
             )
-            if expected in last_text:
+            last_text = str(state[0] or "")
+            if (
+                "已上传1张" in last_text
+                and int(state[1] or 0) >= 1
+                and int(state[2] or 0) == 0
+                and "上传失败" not in last_text
+                and "批量重新上传" not in last_text
+            ):
                 uploaded = True
                 break
         if not uploaded:
-            raise RuntimeError(f"知乎图片弹窗未出现「{expected}」提示，弹窗文本: {last_text[-160:]}")
+            raise RuntimeError(f"知乎内文图上传失败: {path.name}，弹窗文本: {last_text[-160:]}")
+
+        card = page.locator('.Modal-content .DraggableTags-tag').first
+        if not await card.count():
+            raise RuntimeError(f"知乎图片弹窗无已上传卡片: {path.name}")
+        # 关键：新版知乎必须先选中卡片，直接点「插入图片」只会关闭弹窗。
+        await card.locator("img").first.click(force=True, modifiers=["Meta"])
+        await page.wait_for_timeout(300)
 
         insert_btn = page.locator(
             '.Modal-content button:has-text("插入图片"), '
@@ -512,16 +566,58 @@ class ZhiHuArticle(object):
         after = before
         for _ in range(20):
             await page.wait_for_timeout(500)
-            try:
-                after = await editor.locator("img").count()
-            except Exception:
-                after = before
-            if after - before >= len(paths):
+            after = await self._editor_image_count(page)
+            if after >= expected_count:
                 break
-        if after - before < len(paths):
+        if after < expected_count:
+            raise RuntimeError(
+                f"内文图 {path.name} 未进入正文，编辑器图片数 {before}→{after}，已中止发布"
+            )
+
+    async def _insert_inline_images(self, page: Page) -> None:
+        """按母本中的 `[[插图N]]` 精确替换内文图。
+
+        没有位置标记时仍支持旧版：把全部图片追加到正文末尾。
+        发布前始终校验图片增量与残留标记，避免缺图或把标记发到线上。
+        """
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        if not paths:
+            return
+        editor = page.locator(
+            ".public-DraftEditor-content, .ProseMirror, [contenteditable='true']"
+        ).first
+        if not await editor.count():
+            raise RuntimeError("未找到正文编辑器")
+        before = await self._editor_image_count(page)
+        markers = INLINE_MARKER_RE.findall(self.body)
+        expected = before + len(paths)
+
+        if markers:
+            if sorted(int(x) for x in markers) != list(range(1, len(paths) + 1)):
+                raise RuntimeError(f"插图位置标记与内文图数量不一致: markers={markers}, images={len(paths)}")
+            for marker_no in range(1, len(paths) + 1):
+                marker = f"[[插图{marker_no}]]"
+                if not await self._select_text(page, marker):
+                    raise RuntimeError(f"正文中未找到插图位置标记 {marker}")
+                await self._insert_one_image(page, paths[marker_no - 1], before + marker_no)
+        else:
+            await editor.click(force=True)
+            await page.keyboard.press("ControlOrMeta+End")
+            for idx, path in enumerate(paths, 1):
+                await self._insert_one_image(page, path, before + idx)
+                await editor.click(force=True)
+                await page.keyboard.press("ControlOrMeta+End")
+                await page.keyboard.press("Enter")
+
+        after = await self._editor_image_count(page)
+        if after < expected:
             raise RuntimeError(
                 f"内文图仅成功插入 {after - before}/{len(paths)} 张，已中止发布，避免正文缺图"
             )
+        final_text = await editor.inner_text()
+        left = INLINE_MARKER_RE.findall(final_text)
+        if left:
+            raise RuntimeError(f"插图位置标记未被图片替换: {left}，已中止发布")
         zhihu_logger.info(f"内文图 {len(paths)} 张已进入正文，图片数={after}")
 
     async def upload_cover(self, page: Page) -> None:
@@ -552,7 +648,9 @@ class ZhiHuArticle(object):
         except Exception as e:
             zhihu_logger.warning(f"上传封面失败: {e}")
 
-    async def click_publish(self, page: Page) -> None:
+    async def click_publish(self, page: Page) -> str:
+        draft_url = re.search(r"/p/(\d+)", page.url or "")
+        draft_id = draft_url.group(1) if draft_url else ""
         candidates = [
             page.get_by_role("button", name="发布").first,
             page.locator('button:has-text("发布")').first,
@@ -571,11 +669,23 @@ class ZhiHuArticle(object):
                                 await page.wait_for_timeout(2000)
                         except Exception:
                             pass
-                    return
+                    # 编辑器自动保存的 /p/<id>/edit 与公开文章同 id，
+                    # 只有页面离开编辑态且出现发布成功标记时才作为公开链接证据。
+                    published = False
+                    for marker in ("发布成功", "已发布"):
+                        try:
+                            if await page.get_by_text(marker, exact=False).count():
+                                published = True
+                                break
+                        except Exception:
+                            pass
+                    if published and "/edit" not in (page.url or "") and draft_id:
+                        return f"https://zhuanlan.zhihu.com/p/{draft_id}"
+                    return ""
             except Exception:
                 continue
         raise RuntimeError("未找到知乎发布按钮")
 
-    async def main(self):
+    async def main(self) -> str:
         async with async_playwright() as playwright:
-            await self.upload(playwright)
+            return await self.upload(playwright)

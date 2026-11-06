@@ -126,8 +126,9 @@ BODY_WORD_RANGES = {
 LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
 SHORT_FORM_PLATFORMS = (10, 11)
 
-# 要求正文穿插 2 张 16:9 内文图的长文平台（不含微信公众号 12，它走图文混排）
-INLINE_IMAGE_PLATFORMS = (5, 7, 8, 9, 13, 14)
+# 要求正文穿插 2 张 16:9 内文图的长文平台（不含微信公众号 12，它走图文混排）。
+# 企鹅号 15 的封面/内文图同样是发布前硬性条件，不能因旧版上传器是弱 stub 而漏检。
+INLINE_IMAGE_PLATFORMS = (5, 7, 8, 9, 13, 14, 15)
 
 
 # ============================================================ 辅助函数
@@ -231,10 +232,11 @@ def compliance_check(
     elif title_len < low or title_len > high:
         problems.append(f"标题 {title_len} 字，超出该平台 {low}~{high} 字红线")
 
-    # 2) 正文字数区间
+    # 2) 正文字数区间；插图位置标记不是最终可见正文，不计入字数
+    checked_body = re.sub(r"\[\[插图\d+\]\]", "", body or "")
     form = "long" if platform_type in LONG_FORM_PLATFORMS else "short"
     word_low, word_high = BODY_WORD_RANGES[form]
-    length = _body_length(body)
+    length = _body_length(checked_body)
     if length < word_low or length > word_high:
         label = "长文母本" if form == "long" else "短图文母本"
         problems.append(f"正文 {length} 字，超出{label} {word_low}~{word_high} 字要求")
