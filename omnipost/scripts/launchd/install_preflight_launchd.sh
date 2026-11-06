@@ -72,7 +72,7 @@ test_run() {
     "$PYTHON_BIN" "$RUN_SCRIPT" --quiet
     local rc=$?
     if [[ $rc -eq 0 ]]; then
-        log "预检完成：全部正常"
+        log "预检完成：无账号异常、无 verified 链路异常（待复核项见飞书汇总/日志）"
     elif [[ $rc -eq 1 ]]; then
         warn "预检完成：发现账号异常（退出码 1）"
     elif [[ $rc -eq 2 ]]; then

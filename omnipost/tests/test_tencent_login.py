@@ -37,13 +37,19 @@ class _FakeFrameLocator:
 
 
 class _FakePage:
+    """视频号已改为「打开窗口让用户手动授权」，登录成功的判据是 URL 进入平台后台。"""
+
     def __init__(self):
         self.url = "about:blank"
         self.main_frame = object()
         self.frame = _FakeFrameLocator()
 
     async def goto(self, url, **kwargs):
-        self.url = url
+        # 模拟用户已在浏览器里完成授权：页面落到创作者后台
+        self.url = "https://channels.weixin.qq.com/platform/post/create"
+
+    async def wait_for_timeout(self, _ms):
+        return None
 
     def on(self, event, callback):
         self.url += "?logged-in"
@@ -77,7 +83,8 @@ class _FakeBrowser:
     def __init__(self):
         self.context = _FakeContext()
 
-    async def new_context(self):
+    async def new_context(self, **_kwargs):
+        # 真实 Playwright 的 new_context 接受 viewport/locale 等关键字参数
         return self.context
 
     async def close(self):
@@ -134,7 +141,8 @@ class TencentLoginTests(unittest.TestCase):
 
         self.assertEqual(fake_playwright.chromium.launch_options["executable_path"], "C:/Chrome/chrome.exe")
         self.assertFalse(fake_playwright.chromium.launch_options["headless"])
-        self.assertEqual(queue.get_nowait(), "https://open.weixin.qq.com/connect/qrcode/qr")
+        # 视频号已改为手动授权模式：先通知前端进入手动登录，成功后回 200
+        self.assertEqual(queue.get_nowait(), "MANUAL_LOGIN")
         self.assertEqual(queue.get_nowait(), "200")
         conn.cursor.assert_called_once()
 

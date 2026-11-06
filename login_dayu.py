@@ -53,10 +53,14 @@ async def login_dayu():
         for sec in range(600):
             await asyncio.sleep(1)
             cur_url = page.url.lower()
-            if "dashboard" in cur_url or ("dayu.com" in cur_url and "login" not in cur_url):
+            # 阿里侧会话 cookie 名会变（_dayu_s_ / uc_token / login_token 均可能不存在），
+            # 因此以「已进入后台路由」作为主要登录判据，cookie 名只作辅助。
+            in_backend = "dashboard" in cur_url and "login" not in cur_url
+            if in_backend:
                 try:
                     cookies = await context.cookies()
-                    if any(c.get("name") in ("_dayu_s_", "uc_token", "login_token") for c in cookies):
+                    names = {c.get("name") for c in cookies}
+                    if names & {"_dayu_s_", "uc_token", "login_token", "cna", "xlly_s"}:
                         logged_in = True
                         print(f"✅ 检测到大鱼号登录成功！URL: {page.url}")
                         break

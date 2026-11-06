@@ -42,7 +42,9 @@ class TestZhiHuArticle(unittest.TestCase):
             self.assertTrue(str(app.cover_path).endswith("c.jpg"))
             self.assertEqual(app.creation_statement, "虚构创作")
 
-    def test_creation_statement_defaults_to_none(self):
+    def test_creation_statement_defaults_to_ai_declaration(self):
+        # 默认声明必须是 AI 辅助创作：知乎要求 AI 生成内容显式勾选，
+        # 漏勾会被判定为未声明。历史用例断言的是旧的「无声明」默认值，已失效。
         with TemporaryDirectory() as td:
             account = Path(td) / "a.json"
             account.write_text("{}", encoding="utf-8")
@@ -53,7 +55,7 @@ class TestZhiHuArticle(unittest.TestCase):
                 publish_date=0,
                 account_file=account,
             )
-            self.assertEqual(app.creation_statement, "无声明")
+            self.assertEqual(app.creation_statement, "包含 AI 辅助创作 作者对内容负责")
 
     def test_title_truncated_to_100(self):
         with TemporaryDirectory() as td:

@@ -56,6 +56,19 @@ TITLE_LIMITS: Dict[int, tuple[int, int]] = {
 # 需要上传 16:9 封面 + 正文内文图的长文平台
 COVER_REQUIRED_PLATFORMS = (5, 7, 8, 9, 13, 14, 15)
 
+# 零容忍词表唯一来源（AGENTS.md 第二节第 4 条）。
+# compliance_check.py / violation_feedback.py 一律从此处引用，禁止各自复制一份。
+STATIC_BANNED_WORDS: tuple[str, ...] = (
+    "15天免费试点", "免费试跑", "免费领", "私信领资料", "加微信", "扫码体验", "点击链接",
+    "www.ricent.com", "国家级", "第一", "唯一", "100%零失误", "全网最强", "二维码",
+)
+
+# 允许从 verified 平台判词里提取、并考虑升级为拦截词的「词法候选」。
+# 平台判词整句（如「内容因违规被下架」）不在其中，绝不会被当成正文违禁词。
+PROMOTABLE_RISK_TERMS: tuple[str, ...] = (
+    "标题党", "标题夸大", "低质量", "营销推广", "广告嫌疑", "夸大宣传", "诱导点击",
+)
+
 
 class PlatformBlockedError(RuntimeError):
     """平台被永久封禁时抛出，调用方不应捕获后继续发布。"""

@@ -316,7 +316,7 @@ class WeiboPost(object):
                 await page.wait_for_timeout(6000)
 
                 # 确保 logs/screenshots 目录存在
-                logs_dir = Path("logs/screenshots")
+                logs_dir = Path(__file__).resolve().parents[3] / "logs/screenshots"
                 logs_dir.mkdir(parents=True, exist_ok=True)
                 published_screenshot = logs_dir / "weibo_post_published.png"
                 await page.screenshot(path=str(published_screenshot))

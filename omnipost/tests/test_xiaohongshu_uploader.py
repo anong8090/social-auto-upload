@@ -87,6 +87,10 @@ class RecordingPage:
     def locator(self, selector):
         return self.locators[selector]
 
+    async def wait_for_timeout(self, _ms):
+        # fill_tags 在输入标签后会有一次节流等待，桩函数不能省略这个方法
+        return None
+
 
 class XiaohongshuUploaderTests(unittest.TestCase):
     def test_find_xhs_qrcode_locator_prefers_scan_sibling_inside_login_box(self):

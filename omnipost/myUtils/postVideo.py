@@ -554,8 +554,12 @@ def post_article_sohu(
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
-        asyncio.run(app.main(), debug=False)
-        print(f"✅ 搜狐号图文文章发布流程结束", flush=True)
+        published_url = asyncio.run(app.main(), debug=False) or ""
+        print(
+            f"✅ 搜狐号图文文章发布流程结束: {published_url or '未产生公开链接'}",
+            flush=True,
+        )
+        return published_url
 
 
 def post_article_zhihu(
@@ -639,8 +643,9 @@ def post_article_zhihu(
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
-        asyncio.run(app.main(), debug=False)
-        print(f"✅ 知乎文章发布流程结束", flush=True)
+        published_url = asyncio.run(app.main(), debug=False) or ""
+        print(f"✅ 知乎文章发布流程结束: {published_url or '未产生公开链接'}", flush=True)
+        return published_url
 
 
 def post_article_tieba(
@@ -660,8 +665,7 @@ def post_article_tieba(
 ):
     """百度贴吧图文帖发布（type=10）。
 
-    支持通过 fid（贴吧 ID）或 kw（贴吧名）指定目标贴吧。第一期仅保存至贴吧暂存箱/草稿，
-    严禁自动点击「发布」。
+    支持通过 fid（贴吧 ID）或 kw（贴吧名）指定目标贴吧；正式发布时回传 /p/ 帖子链接。
 
     Args:
         title: 帖子标题（≤100字）
@@ -736,8 +740,9 @@ def post_article_tieba(
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
-        asyncio.run(app.main(), debug=False)
-        print(f"✅ 百度贴吧图文帖发布流程结束", flush=True)
+        post_url = asyncio.run(app.main(), debug=False)
+        print(f"✅ 百度贴吧图文帖发布流程结束: {post_url or '未产生公开链接'}", flush=True)
+        return post_url
 
 
 def _build_bilibili_creation_extra_fields(creation_statement):
@@ -959,8 +964,12 @@ def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos
         )
         if dry_run:
             app.headless = False
-        asyncio.run(app.main(), debug=False)
-        print("✅ 大鱼号发布流程结束", flush=True)
+        published_url = asyncio.run(app.main(), debug=False) or ""
+        print(
+            f"✅ 大鱼号发布流程结束: {published_url or '未产生公开链接'}",
+            flush=True,
+        )
+        return published_url
 
 
 def post_article_qiehao(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
@@ -986,8 +995,12 @@ def post_article_qiehao(title, body, tags, account_file, enableTimer=False, vide
         )
         if dry_run:
             app.headless = False
-        asyncio.run(app.main(), debug=False)
-        print("✅ 企鹅号发布流程结束", flush=True)
+        published_url = asyncio.run(app.main(), debug=False) or ""
+        print(
+            f"✅ 企鹅号发布流程结束: {published_url or '未产生公开链接'}",
+            flush=True,
+        )
+        return published_url
 
 
 
