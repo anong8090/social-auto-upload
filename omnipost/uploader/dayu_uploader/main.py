@@ -19,6 +19,10 @@ DAYU_LOGIN_URL = "https://mp.dayu.com/"
 # 后台真实入口是 /dashboard/index（旧版 /dashboard 已 302 到 404 页）
 DAYU_HOME_URL = "https://mp.dayu.com/dashboard/index"
 DAYU_WRITE_URL = "https://mp.dayu.com/dashboard/article/write"
+# 内容管理页真实路径（左侧「我的作品」/「我的草稿」）。
+# 旧代码用的 /dashboard/article/list 会跳 404 页，取链接必然失败。
+DAYU_CONTENT_LIST_URL = "https://mp.dayu.com/dashboard/contents"
+DAYU_DRAFT_LIST_URL = "https://mp.dayu.com/dashboard/draft"
 
 TITLE_MAX_LEN = 30
 COVER_MAX_BYTES = 10 * 1024 * 1024
@@ -418,135 +422,168 @@ class DayuPost(object):
             dayu_logger.warning(f"大鱼号 AI 声明勾选失败: {exc}")
 
     async def _try_cover(self, page: Page) -> bool:
-        """大鱼号封面：走「设置封面」→ 全屏封面面板 → 本地上传。
+        """大鱼号封面：素材库为空时走「临时插图 → 从正文中选择 → 保存」。
 
-        页面上封面槽位的真实结构是
-        `div.article-write-article-cover-cover-item_set`（含 `<i class="iconfont wm-icon-pic">`），
-        点文字「设置封面」不触发 React 事件，必须点容器或图标本身。
-        上传后回读封面区 `<img>` 的 src 是否变化；取不到封面元素时
-        只做「已上传」告警而不谎报成功，避免带病发布。
+        大鱼号封面区的真实结构是
+        `div.article-write-article-cover_normal-items` 下挂 `..._cover-item_set`（文字「设置封面」）。
+        点它弹出的是 `div.article-material-image-dialog` **素材库选择**弹窗，
+        账号素材库为空（显示「暂无可用图片」），弹窗里只有「取消 / 下一步」，
+        没有任何本地文件 input——所以常规「本地上传」路径根本不存在。
+
+        唯一可行的通道是封面槽位上的「从正文中选择」按钮：
+        正文里已插入的图片会出现在同一个弹窗里，选中 →「下一步」→「保存」，
+        封面区随即回读到 `wemedia/s/upload/...` 的封面图。
+
+        由此得到实现顺序：
+          1. 把 16:9 头图临时插进正文（此时正文有 3 张图）；
+          2. 「从正文中选择」→ 选中刚插入的那张 →「下一步」→「保存」；
+          3. 回读封面区 src 确认变化；
+          4. 删掉正文里的临时图，恢复「2 张内文图」的正文结构。
+
+        「从正文中选择」按钮默认隐藏（hover 封面槽位才显示），必须先 hover。
         """
         if not self.cover_path:
             dayu_logger.warning("大鱼号未提供封面")
             return False
 
         old_src = await self._cover_src(page)
+        editor, _frame = await self._editor_locator(page)
+        if not await editor.count():
+            dayu_logger.warning("大鱼号正文编辑器不存在，无法借道设封面")
+            return False
 
-        # 1) 切到「单封面」：三封面模式要求 3 张图，母本只备了 1 张 16:9 头图
+        base_imgs = await editor.locator("img").count()
+
+        # 1) 临时把头图插进正文
+        if not await self._try_inline_image(page, self.cover_path):
+            dayu_logger.warning("大鱼号封面：临时插图失败，无法借道设封面")
+            return False
+        await page.wait_for_timeout(1500)
+        if await editor.locator("img").count() <= base_imgs:
+            dayu_logger.warning("大鱼号封面：临时图未进入正文")
+            return False
+
         try:
-            mode = page.locator(f'{COVER_MODE_SELECTOR}:has-text("单封面")').first
-            if await mode.count() and await mode.is_visible():
-                await mode.click(force=True)
-                await page.wait_for_timeout(1500)
+            # 2) 切单封面 + hover 出「从正文中选择」
+            await self._switch_single_cover(page)
+            opened = await self._open_choose_from_body(page)
+            if not opened:
+                return False
+
+            # 3) 选中刚插入的那张图（正文末尾那张 = 新插入的）
+            imgs = page.locator(
+                "div.article-material-image-dialog .article-material-image_image-choose img"
+            )
+            count = await imgs.count()
+            if not count:
+                dayu_logger.warning("大鱼号封面：「从正文中选择」弹窗里没有可选图片")
+                return False
+            await imgs.nth(count - 1).click(force=True)
+            await page.wait_for_timeout(1500)
+
+            # 4) 下一步 → 保存
+            nxt = page.locator(
+                '.article-material-image-dialog_btn button:has-text("下一步")'
+            ).first
+            if not await nxt.count():
+                dayu_logger.warning("大鱼号封面：弹窗缺少「下一步」")
+                return False
+            await nxt.click(force=True)
+            await page.wait_for_timeout(4000)
+
+            save = page.locator(
+                '.article-material-image-dialog button:has-text("保存")'
+            ).first
+            if not await save.count():
+                dayu_logger.warning("大鱼号封面：预览弹窗缺少「保存」")
+                return False
+            await save.click(force=True)
+            await page.wait_for_timeout(5000)
+
+            changed = await self._cover_changed(page, old_src)
+        finally:
+            # 5) 无论成败都要把临时图从正文里删掉，正文结构不能被封面污染
+            await self._remove_last_editor_image(page, editor)
+
+        if changed:
+            dayu_logger.success(f"已设置大鱼号封面: {self.cover_path}")
+            return True
+        dayu_logger.warning("大鱼号封面未回读到新封面，需人工处理")
+        return False
+
+    async def _switch_single_cover(self, page: Page) -> None:
+        """切到「单封面」模式。
+
+        三封面模式要求 3 张图，母本只备了 1 张 16:9 头图；
+        单选框是一个自定义 div（`w-radio`），点文字不会切换，必须点 radio 本体。
+        """
+        try:
+            radio = page.locator(
+                'div.article-write-article-cover_normal-option:has-text("单封面") div.w-radio'
+            ).first
+            if not await radio.count():
+                return
+            checked = await radio.evaluate(
+                "el => el.className.includes('w-radio_checked')"
+            )
+            if not checked:
+                await radio.click(force=True)
+                await page.wait_for_timeout(2000)
         except Exception as exc:
             dayu_logger.warning(f"大鱼号切换单封面失败: {exc}")
 
-        # 2) 点开封面槽位的「设置封面」（按容器尺寸挑可见的那个）
-        opened = False
-        slots = page.locator('div.article-write-article-cover-cover-item_set')
-        for idx in range(await slots.count()):
-            slot = slots.nth(idx)
-            try:
-                if not await slot.is_visible():
-                    continue
-                await slot.scroll_into_view_if_needed()
-                await page.wait_for_timeout(300)
-                await slot.click(force=True)
-                opened = True
-                break
-            except Exception:
-                continue
-        if not opened:
-            dayu_logger.warning("大鱼号未找到可点击的封面槽位")
-            return False
-        await page.wait_for_timeout(3000)
+    async def _open_choose_from_body(self, page: Page) -> bool:
+        """点开封面槽位上的「从正文中选择」。
 
-        # 3) 全屏封面面板里的本地上传入口
-        uploaded = False
-        panel = page.locator('div.article-write-article-cover_fullscreen').first
-        if await panel.count():
-            for sel in (
-                'text=上传图片', 'text=添加本地图片', 'text=本地上传',
-                '[class*=upload]', 'input[type="file"]',
-            ):
-                loc = panel.locator(sel).first
-                try:
-                    if not await loc.count():
-                        continue
-                    await loc.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
-                    await loc.click(force=True)
-                    uploaded = True
-                    break
-                except Exception:
-                    continue
-        if not uploaded:
-            # 面板没打开时退回到直接找页面里的本地文件 input
-            loc = page.locator(LOCAL_FILE_INPUT_SELECTOR).first
-            uploaded = bool(await loc.count())
-            if uploaded:
-                try:
-                    await loc.click(force=True)
-                except Exception:
-                    uploaded = False
-
-        if not uploaded:
-            dayu_logger.warning("大鱼号封面未找到可用上传入口，需人工处理")
-            return False
-
-        # 4) 灌入本地文件
-        file_input = page.locator(LOCAL_FILE_INPUT_SELECTOR).first
-        if not await file_input.count():
-            file_input = page.locator('input[type="file"]').first
-        if not await file_input.count():
-            dayu_logger.warning("大鱼号封面未找到文件输入框")
-            return False
+        该按钮默认隐藏（需 hover 封面项才显示），且页面里存在多个同名按钮
+        （横版/竖版/隐藏的三封面槽位各一份），必须只点可见的那个。
+        """
+        item = page.locator(
+            "div.article-write-article-cover_normal-item "
+            "div.article-write-article-cover-cover-item"
+        ).first
         try:
-            await file_input.set_input_files(self.cover_path)
-        except Exception as exc:
-            dayu_logger.warning(f"大鱼号封面上传失败: {exc}")
-            return False
-        await page.wait_for_timeout(5000)
-
-        # 5) 弹窗确认
-        confirm = page.locator(MATERIAL_CONFIRM_SELECTOR).first
-        try:
-            if await confirm.count() and await confirm.is_visible():
-                await confirm.click(force=True)
-                await page.wait_for_timeout(3000)
+            if await item.count():
+                await item.hover()
+                await page.wait_for_timeout(1200)
         except Exception:
             pass
 
-        # 6) 关闭全屏面板，回到主编辑区
-        await self._close_cover_panel(page)
-
-        if await self._cover_changed(page, old_src):
-            dayu_logger.success(f"已上传大鱼号封面: {self.cover_path}")
-            return True
-        dayu_logger.warning("大鱼号封面未找到可用上传入口或回读未变化，需人工处理")
+        btns = page.locator('button:has-text("从正文中选择")')
+        for idx in range(await btns.count()):
+            btn = btns.nth(idx)
+            try:
+                if not await btn.is_visible():
+                    continue
+                await btn.click(force=True)
+                await page.wait_for_timeout(4000)
+                return True
+            except Exception:
+                continue
+        dayu_logger.warning("大鱼号未找到可见的「从正文中选择」按钮")
         return False
 
-    async def _close_cover_panel(self, page: Page) -> None:
-        """关掉全屏封面面板，回到主编辑区（否则后续点不到底部的「保存」）。"""
-        for sel in (
-            '.article-write-article-cover_fullscreen-header button:has-text("关闭")',
-            '.article-write-article-cover_fullscreen [class*=close]',
-            'text=关闭',
-        ):
-            loc = page.locator(sel).first
-            try:
-                if await loc.count() and await loc.is_visible():
-                    await loc.click(force=True)
-                    await page.wait_for_timeout(2000)
-                    return
-            except Exception:
-                continue
-        # 没有显式关闭按钮时按 ESC
+    async def _remove_last_editor_image(self, page: Page, editor) -> None:
+        """删掉正文里最后一张（用于封面借道的临时图）。
+
+        UEditor 的图片点一下即选中，按 Delete 即可删除。
+        """
         try:
-            await page.keyboard.press("Escape")
+            imgs = editor.locator("img")
+            count = await imgs.count()
+            if not count:
+                return
+            await imgs.nth(count - 1).click(force=True)
+            await page.wait_for_timeout(800)
+            await page.keyboard.press("Delete")
             await page.wait_for_timeout(1500)
-        except Exception:
-            pass
+            after = await editor.locator("img").count()
+            if after < count:
+                dayu_logger.info(f"已移除正文临时封面图，剩余图片 {after} 张")
+            else:
+                dayu_logger.warning("大鱼号正文临时封面图未能删除")
+        except Exception as exc:
+            dayu_logger.warning(f"大鱼号正文临时封面图删除失败: {exc}")
 
     async def _cover_src(self, page: Page) -> str:
         """回读封面区域当前图片 src（取不到时返回空串）。"""
@@ -651,7 +688,7 @@ class DayuPost(object):
 
         try:
             await page.goto(
-                "https://mp.dayu.com/dashboard/article/list",
+                DAYU_CONTENT_LIST_URL,
                 timeout=90000,
                 wait_until="domcontentloaded",
             )
@@ -778,20 +815,20 @@ class DayuPost(object):
                 await browser.close()
 
     async def _verify_draft_saved(self, page: Page) -> bool:
-        """存草稿后回内容管理页核对标题是否真的落库。
+        """存草稿后回「我的草稿」页核对标题是否真的落库。
 
         只点了「保存」按钮不等于草稿已保存：页面可能弹校验失败、可能被拦在
-        必填项上。这里跳到内容管理页按标题回读，确认后才置 draft_saved。
+        必填项上。这里跳到草稿列表按标题回读，确认后才置 draft_saved。
         """
         try:
             await page.goto(
-                "https://mp.dayu.com/dashboard/article/list",
+                DAYU_DRAFT_LIST_URL,
                 timeout=90000,
                 wait_until="domcontentloaded",
             )
             await page.wait_for_timeout(6000)
         except Exception as exc:
-            dayu_logger.warning(f"大鱼号草稿核验：跳转内容管理页失败 {exc}")
+            dayu_logger.warning(f"大鱼号草稿核验：跳转草稿页失败 {exc}")
             return False
 
         body = ""
