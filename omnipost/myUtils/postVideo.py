@@ -211,7 +211,7 @@ def post_video_xhs(title,files,tags,account_file,category=TencentZoneTypes.LIFES
             asyncio.run(app.main(), debug=False)
 
 
-def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, ai_generated=False, is_draft=False):
+def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, ai_generated=False, is_draft=False, cdp_endpoint="", keep_window_open=False):
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     image_paths = []
     for file in files:
@@ -244,6 +244,8 @@ def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, vid
             dry_run=dry_run,
             ai_generated=ai_generated,
             is_draft=is_draft,
+            cdp_endpoint=cdp_endpoint,
+            keep_window_open=keep_window_open,
         )
         app = XiaoHongShuNote(**kwargs)
         asyncio.run(app.main(), debug=False)

@@ -977,6 +977,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         dry_run: bool = False,
         ai_generated: bool = False,
         is_draft: bool = False,
+        keep_window_open: bool = False,
+        cdp_endpoint: str = "",
     ):
         super().__init__(
             publish_date=publish_date,
@@ -985,6 +987,12 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             debug=debug,
             headless=headless,
         )
+        # 小红书草稿只存在当前 profile 的 IndexedDB 里，换浏览器/换 profile
+        # 就看不到。草稿模式下允许保留同一个可见窗口，交人工复核后自行发布。
+        # Playwright 退出会连带杀掉自己启动的 Chrome，所以留窗模式必须
+        # 由调用方用独立进程拉起 Chrome 并通过 cdp_endpoint attach。
+        self.keep_window_open = bool(keep_window_open)
+        self.cdp_endpoint = (cdp_endpoint or "").strip()
         self.image_paths = image_paths
         self.note = note or ""
         self.tags = tags or []
@@ -1139,12 +1147,21 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
         profile_dir = Path(BASE_DIR) / "browser_profiles" / "xiaohongshu"
         profile_dir.mkdir(parents=True, exist_ok=True)
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=self.headless,
-            channel="chrome",
-            permissions=["geolocation", "clipboard-read", "clipboard-write"],
-        )
+
+        attached_browser = None
+        if self.cdp_endpoint:
+            # attach 到调用方独立拉起的可见 Chrome；绝不 close 这个 browser，
+            # 否则 Chrome 会被 Playwright driver 一并杀掉，窗口就留不住。
+            attached_browser = await playwright.chromium.connect_over_cdp(self.cdp_endpoint)
+            context = attached_browser.contexts[0]
+            xiaohongshu_logger.info(_msg("🔗", f"已连接到可见窗口 {self.cdp_endpoint}"))
+        else:
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=self.headless,
+                channel="chrome",
+                permissions=["geolocation", "clipboard-read", "clipboard-write"],
+            )
         try:
             import json as _json
             acc_path = Path(self.account_file)
@@ -1156,12 +1173,43 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             pass
         context = await set_init_script(context)
 
+        page = None
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             await self.upload_note_content(page)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
-        finally:
+        except Exception:
+            if attached_browser:
+                await attached_browser.close()
+            else:
+                await context.close()
+            raise
+        else:
+            if attached_browser:
+                # 保留窗口：把页面停在小红书发布页（草稿箱入口就在这一页），
+                # 只断开 CDP 连接，不关闭 Chrome 进程。
+                try:
+                    await page.bring_to_front()
+                    await page.goto(
+                        "https://creator.xiaohongshu.com/publish/publish?target=image",
+                        timeout=60000, wait_until="domcontentloaded",
+                    )
+                except Exception as exc:
+                    xiaohongshu_logger.warning(
+                        _msg("⚠️", f"跳转草稿箱失败（窗口仍保留）：{exc}")
+                    )
+                await attached_browser.close()  # 只断 CDP，Chrome 进程继续存活
+                xiaohongshu_logger.success(
+                    _msg("👀", "小红书草稿已留在可见窗口，请人工复核后自行发布；本脚本不会关闭该窗口")
+                )
+                return
+            if self.keep_window_open and self.is_draft and not self.headless:
+                # 非 attach 模式：Playwright 退出会杀掉 Chrome，留不住窗口，
+                # 如实告知调用方改用 cdp_endpoint。
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", "留窗模式需传 cdp_endpoint，否则 Playwright 退出会关闭窗口")
+                )
             await context.close()
 
     async def xiaohongshu_upload_note(self):

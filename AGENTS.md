@@ -214,10 +214,16 @@
    - 素材目录：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/<YYYY-MM-DD>/`，含 `内容.md`（首行 `# 标题`）+ 当日专属配图；**配图里也不得出现蓝枢字样**，不得直接复用主线物料图（主线头图底部带「河狸云蓝枢」）。
    - 发布前离线自检：标题红线（小红书 ≤ 20 字、公众号 ≤ 64 字）、零容忍词、品牌排除词；任一不通过即中止。
    - 存完草稿后**回平台草稿箱按本期标题回读核验**，未命中如实报错，不得只凭 toast/截图宣称成功。
-   - 全程无头浏览器；公众号走系统 Chrome（bundled Chromium 打开 `mp.weixin.qq.com` 必 `Page crashed`）。
+   - 默认全程无头浏览器；公众号走系统 Chrome（bundled Chromium 打开 `mp.weixin.qq.com` 必 `Page crashed`）。
+   - ⚠️ **小红书草稿可见性例外（2026-11-09 用户确认方案 A）**：小红书草稿只存在**当前浏览器 profile 的 IndexedDB**，换浏览器/换 profile 就看不到，无头填完人工基本看不到。因此独立线提供 `--visible-xhs`：用**独立进程**拉起可见 Chrome（`--user-data-dir=omnipost/browser_profiles/xiaohongshu` + `--remote-debugging-port=9333`），Playwright 通过 `connect_over_cdp` attach 填草稿，结束后**只断开 CDP、不关闭窗口**，草稿就留在那个可见窗口里供人工复核后自行发布。**其余平台仍无头**，此例外仅限小红书。
+     - Chrome 136+ 禁止对**默认** user data dir 开远程调试；这里用的是非标准目录，所以合法。本机 Chrome 157 无法用 CDP 接管用户日常窗口，`9222` 端口是早前大鱼号的独立 profile，不是日常 Chrome。
+     - Playwright 自己 `launch` 的 Chrome 会在 driver 退出时被一并杀掉，**留窗必须走独立进程 + attach**（实测 `browser.close()` 只断 CDP，窗口存活）。
+     - 草稿回读核验必须 attach 到**同一个持久化 profile**；早期用 `new_context(storage_state=...)` 的临时 context 读不到 IndexedDB 草稿，会误判。
    ```bash
    omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09 --check-only
    omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09
+   # 小红书专用可见窗口（方案 A）
+   omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09 --platforms 1 --visible-xhs
    ```
 4. **账号实测（2026-11-09）**：
    - 小红书（`type=1`）cookie 有效，创作者后台「Mason」可打开，发布页显示「草稿箱(0)」，上传器 `xiaohongshu_uploader/main.py` 已实现「暂存离开 / 存草稿」分支。但 `user_info.status=0`，且项目铁律仍记其封禁——**独立线是否实跑须由用户明确确认，不得擅自解禁或存草稿**。

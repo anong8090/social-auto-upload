@@ -477,6 +477,28 @@ def test_wechat_mp_uses_system_chrome_and_never_pops_browser():
     print("✅ 公众号：系统 Chrome 绕崩溃 + 全路径强制无头 + 二维码截图落盘")
 
 
+def test_ai_share_visible_xhs_uses_cdp_attach_and_keeps_window():
+    """方案 A：小红书可见窗口必须走独立进程 + CDP attach，且草稿回读用同一 profile。"""
+    src = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
+    assert "--visible-xhs" in src
+    assert "subprocess.Popen" in src, "留窗必须独立进程拉 Chrome，Playwright launch 的会被 driver 杀掉"
+    assert "--remote-debugging-port" in src and "--user-data-dir" in src
+    assert "connect_over_cdp" in src
+    assert "browser.close()  # 只断 CDP" in src or "只断 CDP" in src
+    assert "launch_persistent_context" in src, "小红书回读必须用固定持久化 profile"
+    assert "browser_profiles" in src and "xiaohongshu" in src
+
+    uploader = (OMNIPOST_DIR / "uploader/xiaohongshu_uploader/main.py").read_text(encoding="utf-8")
+    assert "cdp_endpoint" in uploader, "上传器需支持 attach 到可见窗口"
+    assert "connect_over_cdp(self.cdp_endpoint)" in uploader
+    # attach 成功路径不能 close context（否则窗口没意义）
+    assert "attach 到调用方独立拉起的可见 Chrome" in uploader
+
+    pv = (OMNIPOST_DIR / "myUtils/postVideo.py").read_text(encoding="utf-8")
+    assert "cdp_endpoint=cdp_endpoint" in pv, "post_note_xhs 必须透传 CDP 地址"
+    print("✅ 方案 A：独立进程可见窗口 + CDP attach + 同一 profile 回读")
+
+
 def test_ai_share_content_line_is_draft_only_and_brand_free():
     """独立内容线：只存草稿、只走 1/12、不提蓝枢，且不改主线封禁表。"""
     source = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
@@ -529,6 +551,7 @@ def main():
     test_check_only_and_dry_run_are_distinct()
     test_wechat_mp_uses_system_chrome_and_never_pops_browser()
     test_ai_share_content_line_is_draft_only_and_brand_free()
+    test_ai_share_visible_xhs_uses_cdp_attach_and_keeps_window()
     print("\n🎉 发布安全闸门与链接判定测试全部通过（未联网、未启动浏览器、未发布）。")
 
 

@@ -26,7 +26,16 @@
     # 只存其中一个平台
     .venv/bin/python scripts/publish_ai_share.py --date 2026-11-09 --platforms 1
 
+    # 小红书用专用可见窗口填草稿并保留窗口（方案 A，人工复核后自行发布）
+    .venv/bin/python scripts/publish_ai_share.py --date 2026-11-09 --platforms 1 --visible-xhs
+
 ⚠️ 本脚本**不提供** `--publish` 参数；传入任何发布意图参数都会直接报错退出。
+
+⚠️ 小红书草稿只存在 `browser_profiles/xiaohongshu` 的 IndexedDB 里。
+   `--visible-xhs` 会用独立进程拉起可见 Chrome（非默认 user data dir，
+   因此 Chrome 136+ 允许开远程调试），Playwright 通过 CDP attach 填草稿，
+   结束后只断开 CDP、**不关闭窗口**，草稿就留在你能直接看到的那个窗口里。
+   不带该参数时小红书仍走无头（默认），草稿存在同一 profile 但你看不到。
 """
 from __future__ import annotations
 
@@ -137,10 +146,75 @@ def _account_files(ptype: int) -> List[str]:
     return files
 
 
-def _readback_drafts(ptype: int, title: str) -> bool:
-    """存完草稿后回平台草稿箱按本期标题回读核验（无头）。
+XHS_PROFILE = OMNIPOST_DIR / "browser_profiles" / "xiaohongshu"
+XHS_CDP_PORT = 9333
+XHS_CDP_URL = f"http://127.0.0.1:{XHS_CDP_PORT}"
 
-    返回 True 表示命中；抛错表示核验不可用，由调用方如实报告，不得宣称成功。
+
+def _cdp_port_ready(port: int) -> bool:
+    import socket
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _start_visible_xhs_window() -> str:
+    """用独立进程拉起可见 Chrome（专用 profile），返回 CDP 地址。
+
+    Chrome 136+ 禁止对默认 user data dir 开远程调试，但我们用的是非标准
+    目录 `browser_profiles/xiaohongshu`，合法且草稿与无头模式共用一份
+    IndexedDB。独立进程启动是留窗的关键：Playwright 自己 launch 的 Chrome
+    会在 driver 退出时被一并杀掉，attach 模式则不会。
+    """
+    import shutil
+    import subprocess
+    import time
+
+    if _cdp_port_ready(XHS_CDP_PORT):
+        print(f"♻️  复用已打开的小红书可见窗口（{XHS_CDP_URL}）")
+        return XHS_CDP_URL
+
+    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if not Path(chrome).exists():
+        raise RuntimeError(f"未找到系统 Chrome：{chrome}")
+    XHS_PROFILE.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [
+            chrome,
+            f"--remote-debugging-port={XHS_CDP_PORT}",
+            f"--user-data-dir={XHS_PROFILE}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            "https://creator.xiaohongshu.com/publish/publish?target=image",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(60):
+        if _cdp_port_ready(XHS_CDP_PORT):
+            break
+        time.sleep(0.5)
+    else:
+        raise RuntimeError(f"小红书可见窗口启动失败（{XHS_CDP_PORT} 端口未就绪）")
+    print(f"🪟 小红书可见窗口已打开（pid={proc.pid}），本脚本不会关闭它")
+    return XHS_CDP_URL
+
+
+def _readback_drafts(ptype: int, title: str, cdp_endpoint: str = "") -> bool:
+    """存完草稿后回平台草稿箱按本期标题回读核验。
+
+    ⚠️ 小红书草稿存在**固定持久化 profile 的 IndexedDB**，用临时
+    `new_context(storage_state=...)` 读不到（曾因此误判）。因此：
+      - 留窗模式：直接 attach 到可见窗口，读它自己的页面；
+      - 无头模式：用 `launch_persistent_context` 打开同一个 profile。
+    返回 True 表示命中；抛错表示核验不可用，由调用方如实报告。
     """
     import asyncio
     from playwright.async_api import async_playwright
@@ -148,31 +222,55 @@ def _readback_drafts(ptype: int, title: str) -> bool:
     from utils.base_social_media import set_init_script
 
     cookie = OMNIPOST_DIR / "cookiesFile" / _account_files(ptype)[0]
-    if ptype == 12:
-        # 微信公众平台在 bundled Chromium 下必崩，必须走系统 Chrome
-        launch = {"headless": True, "channel": "chrome"}
-        url = "https://mp.weixin.qq.com/cgi-bin/appmsg?type=9&action=list_card&lang=zh_CN"
-    else:
-        launch = {"headless": True}
-        url = "https://creator.xiaohongshu.com/publish/publish?target=image"
-    if LOCAL_CHROME_PATH and ptype == 1:
-        launch["executable_path"] = LOCAL_CHROME_PATH
 
     async def _run() -> bool:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(**launch)
-            ctx = await browser.new_context(
-                storage_state=str(cookie), viewport={"width": 1440, "height": 900}
-            )
+            if ptype == 1:
+                if cdp_endpoint:
+                    browser = await pw.chromium.connect_over_cdp(cdp_endpoint)
+                    ctx = browser.contexts[0]
+                else:
+                    ctx = await pw.chromium.launch_persistent_context(
+                        user_data_dir=str(XHS_PROFILE),
+                        headless=True,
+                        channel="chrome",
+                    )
+                url = "https://creator.xiaohongshu.com/publish/publish?target=image"
+            else:
+                # 微信公众平台在 bundled Chromium 下必崩，必须走系统 Chrome
+                browser = await pw.chromium.launch(
+                    headless=True, channel="chrome",
+                    **({"executable_path": LOCAL_CHROME_PATH} if LOCAL_CHROME_PATH else {}),
+                )
+                ctx = await browser.new_context(
+                    storage_state=str(cookie), viewport={"width": 1440, "height": 900}
+                )
+                url = "https://mp.weixin.qq.com/cgi-bin/appmsg?type=9&action=list_card&lang=zh_CN"
             ctx = await set_init_script(ctx)
-            page = await ctx.new_page()
             try:
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                await page.wait_for_timeout(6000)
+                await page.wait_for_timeout(7000)
                 text = await page.evaluate("() => document.body.innerText")
-                return title in text
+                hit = title in text
+                # 小红书发布页只显示草稿箱计数，标题在列表弹层里；
+                # 若正文没命中，再尝试展开草稿箱列表回读。
+                if not hit and ptype == 1:
+                    try:
+                        await page.get_by_text(re.compile(r"草稿箱\(\d+\)")).first.click()
+                        await page.wait_for_timeout(4000)
+                        text = await page.evaluate("() => document.body.innerText")
+                        hit = title in text
+                    except Exception:
+                        pass
+                return hit
             finally:
-                await browser.close()
+                if ptype == 1 and cdp_endpoint:
+                    await browser.close()  # 只断 CDP，窗口保留
+                elif ptype == 1:
+                    await ctx.close()
+                else:
+                    await browser.close()
 
     return asyncio.run(_run())
 
@@ -191,6 +289,10 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--platforms", default="1,12", help="平台类型，仅允许 1,12")
     parser.add_argument("--check-only", action="store_true", help="只做离线合规自检")
     parser.add_argument("--tags", default="", help="逗号分隔话题标签")
+    parser.add_argument(
+        "--visible-xhs", action="store_true",
+        help="小红书用专用可见窗口填草稿并保留窗口供人工复核（其余平台仍无头）",
+    )
     args = parser.parse_args(argv)
 
     platforms = [int(x) for x in args.platforms.split(",") if x.strip()]
@@ -218,6 +320,17 @@ def main(argv: List[str] | None = None) -> int:
         return 0
 
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    cdp_endpoint = ""
+    if args.visible_xhs and 1 in platforms:
+        # 用户明确选择方案 A：小红书用专用可见窗口，存完草稿保留窗口。
+        # 其余平台（公众号）继续走无头，不受影响。
+        try:
+            cdp_endpoint = _start_visible_xhs_window()
+        except Exception as exc:
+            print(f"❌ 可见窗口启动失败：{exc}", file=sys.stderr)
+            return 2
+        print("ℹ️  小红书草稿只在该窗口的 profile 里；本脚本结束不会关闭它")
+
     results = []
     for ptype in platforms:
         label = PLATFORM_LABELS[ptype]
@@ -232,6 +345,8 @@ def main(argv: List[str] | None = None) -> int:
                     account_file=accounts,
                     is_draft=True,      # 强制存草稿
                     dry_run=False,
+                    cdp_endpoint=cdp_endpoint,
+                    keep_window_open=bool(cdp_endpoint),
                 )
             else:
                 postVideo.post_article_wechat_mp(
@@ -244,11 +359,15 @@ def main(argv: List[str] | None = None) -> int:
                     is_draft=True,      # 强制存草稿
                     dry_run=False,
                 )
-            # 草稿箱回读核验：点了存草稿不等于落库
-            hit = _readback_drafts(ptype, assets["title"])
+            # 草稿箱回读核验：点了存草稿不等于落库。小红书必须读同一个
+            # 持久化 profile（留窗模式下直接 attach 到那个可见窗口）。
+            hit = _readback_drafts(ptype, assets["title"], cdp_endpoint if ptype == 1 else "")
             status = "已存草稿（回读核验通过）" if hit else "存草稿未通过回读核验"
             if not hit:
-                raise RuntimeError(f"{label}草稿箱未命中本期标题，不得误判为已存草稿")
+                raise RuntimeError(
+                    f"{label}草稿箱未命中本期标题，不得误判为已存草稿"
+                    + ("（可见窗口仍保留，可人工复核）" if cdp_endpoint and ptype == 1 else "")
+                )
         except Exception as exc:
             status = f"失败：{exc}"
         results.append({"platform": label, "type": ptype, "status": status})
