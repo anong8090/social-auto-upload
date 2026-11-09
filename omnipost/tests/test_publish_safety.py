@@ -387,6 +387,79 @@ def test_check_only_and_dry_run_are_distinct():
     print("✅ --check-only 与 --dry-run 语义区分")
 
 
+def test_toutiao_draft_never_rewrites_save_param():
+    """头条存草稿：绝不能改写 save 参数（save=1 是直接投稿）。"""
+    from uploader.toutiao_uploader import main as tt_main
+
+    source = Path(tt_main.__file__).read_text(encoding="utf-8")
+    save_block = source.split("async def save_draft")[1].split("async def _verify_draft_in_list")[0]
+    # 不得出现任何改写 save 参数的拦截逻辑
+    for forbidden in ("route.continue_", "page.route", "urlencode", "route_handler"):
+        assert forbidden not in save_block, f"头条草稿分支不得出现 {forbidden}（改写 save 会造成真实发布）"
+    assert "严禁再加拦截" in save_block or "不拦截任何请求" in save_block, save_block
+    print("✅ 头条草稿分支不拦截、不改写 save 参数")
+
+
+def test_toutiao_draft_accepts_any_successful_response():
+    """头条自动保存会连发多次，不能只看最后一次响应判定成败。"""
+    from uploader.toutiao_uploader import main as tt_main
+
+    source = Path(tt_main.__file__).read_text(encoding="utf-8")
+    save_block = source.split("async def save_draft")[1].split("async def _verify_draft_in_list")[0]
+    # 必须记录全部响应，而不是只留最后一次
+    assert "responses.append" in save_block, "头条草稿分支必须记录每一次保存响应"
+    assert "responses: list[dict]" in save_block, save_block
+    # 判定逻辑要遍历全部响应
+    assert "for r in responses" in save_block, save_block
+    print("✅ 头条草稿分支记录并遍历全部保存响应，不被单次 7050 误判")
+
+
+def test_toutiao_draft_verifies_by_draft_box():
+    """头条草稿必须回草稿箱按标题回读核验，核验不过要抛错。"""
+    from uploader.toutiao_uploader import main as tt_main
+
+    source = Path(tt_main.__file__).read_text(encoding="utf-8")
+    assert "async def _verify_draft_in_list" in source, "头条缺少草稿核验方法"
+    assert "draft_list" in source, "头条核验必须读草稿箱列表接口"
+    assert "草稿保存未通过核验" in source, "核验失败必须抛错，不得让调用方误判为已存草稿"
+    print("✅ 头条草稿分支回草稿箱回读核验")
+
+
+def test_toutiao_inline_image_limited_to_one():
+    """头条正文只放得下 1 张内文图（平台限制：插第二张会替换第一张）。"""
+    from uploader.toutiao_uploader import main as tt_main
+
+    source = Path(tt_main.__file__).read_text(encoding="utf-8")
+    block = source.split("async def _insert_inline_images")[1].split("async def _count_image_blocks")[0]
+    assert "paths = paths[:1]" in block, "头条正文只能插 1 张图，超出必须截断"
+    # 计数必须按图片块（.pgc-img）而不是 <img> 元素
+    assert "_count_image_blocks" in block, block
+    assert "div.pgc-img" in source, "图片块计数必须按 .pgc-img 容器来数"
+    print("✅ 头条正文内文图限制为 1 张，且按图片块计数")
+
+
+def test_toutiao_cover_always_uploaded():
+    """头条给了封面就必须真上传，不能因误判 ready 而跳过。"""
+    from uploader.toutiao_uploader import main as tt_main
+
+    source = Path(tt_main.__file__).read_text(encoding="utf-8")
+    assert "展示封面已是真实预览图，跳过重复上传" not in source, (
+        "跳过封面上传会因封面误判而漏传，服务端会拒存（7050）"
+    )
+    print("✅ 头条封面不再因误判而跳过上传")
+
+
+def test_compliance_toutiao_requires_one_inline_image():
+    """头条按 1 张内文图判定，其余长文平台仍是 2 张。"""
+    from scripts import compliance_check as cc
+
+    assert 7 in cc.SINGLE_INLINE_IMAGE_PLATFORMS, "头条必须走单图规则"
+    assert 7 not in cc.INLINE_IMAGE_PLATFORMS, "头条不能同时要求 2 张"
+    for p in (5, 8, 9, 13, 14, 15):
+        assert p in cc.INLINE_IMAGE_PLATFORMS, f"平台 {p} 仍应要求 2 张内文图"
+    print("✅ 合规闸门：头条 1 张内文图，其余长文平台 2 张")
+
+
 def main():
     test_publish_manual_rejects_publish_flag()
     test_publish_manual_default_is_offline()
@@ -399,6 +472,12 @@ def main():
     test_sohu_draft_never_clicks_publish()
     test_qiehao_draft_verifies_by_readback()
     test_wangyi_draft_verifies_by_readback()
+    test_toutiao_draft_never_rewrites_save_param()
+    test_toutiao_draft_accepts_any_successful_response()
+    test_toutiao_draft_verifies_by_draft_box()
+    test_toutiao_inline_image_limited_to_one()
+    test_toutiao_cover_always_uploaded()
+    test_compliance_toutiao_requires_one_inline_image()
     test_draft_is_default_and_zhihu_is_exception()
     test_sohu_ai_declaration_wording_matches_page()
     test_link_collector_item_id_and_public_guard()

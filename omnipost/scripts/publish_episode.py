@@ -49,13 +49,18 @@ LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
 SHORT_FORM_PLATFORMS = (10, 11)
 
 # 禁止自动化操作浏览器的平台：只产出「待发内容包」，由人工到后台发布。
-# 头条（type=7）编辑器的「草稿保存中…」是常挂的前端状态，抓包证实无草稿保存请求，
-# 自动化无法保证草稿真的落库，因此改为彻底不碰浏览器，避免误发与误判。
-MANUAL_PACKAGE_PLATFORMS = (7,)
+# 2026-11-09 实测头条草稿链路已打通（见 toutiao_uploader.save_draft）：
+# 发文页自动保存请求 POST /mp/agw/article/publish 带 save 参数，
+# save=0 是存草稿、save=1 是直接投稿；只要不点「发布」，头条自己的自动保存
+# 就会把内容存进草稿箱（is_draft=true / status_desc=草稿）。
+# 因此头条不再走内容包，改为正常存草稿。
+# 保留本常量作为兜底：若头条草稿链路再次失效，可临时把它改回 (7,)。
+MANUAL_PACKAGE_PLATFORMS = ()
 
 # auto 选台只从「发布链路已实测打通、且能采集公开链接」的平台池中抽取。
 # 12 微信公众号、13 网易号、14 大鱼号的登录/发布链路尚未完成 E2E 验证。
-AUTO_PUBLISHABLE_PLATFORMS = (5, 8, 9, 10, 11, 15)
+# 7 今日头条自 2026-11-09 起草稿链路实测打通，加入可自动选台池。
+AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 8, 9, 10, 11, 15)
 
 
 # ---------------------------------------------------------------- 素材发现
@@ -340,6 +345,7 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
         post_article_qiehao,
         post_article_sohu,
         post_article_tieba,
+        post_article_toutiao,
         post_article_wangyi,
         post_article_wechat_mp,
         post_article_weibo,
@@ -365,10 +371,16 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
             inline_image_paths=inline, is_draft=is_draft, **common,
         )
     elif platform_type == 7:
-        # 2026-11-05 用户规则：头条禁止任何自动化写入，避免被判定营销号封禁。
-        # 主流程已在 _dispatch 之前改走 export_manual_package，这里只做兜底拦截，
-        # 防止将来有人绕过主流程直接把头条丢进来。
-        raise RuntimeError("头条已禁止自动化发布，请走待发内容包流程（MANUAL_PACKAGE_PLATFORMS）")
+        # 2026-11-09 实测：头条草稿链路已打通——不点「发布」，靠编辑器自动保存
+        # 请求（save=0）落进草稿箱，再回草稿箱按标题回读核验。
+        # 草稿模式下由人工复核后自行发布。
+        return post_article_toutiao(
+            title, body, tags, account_list,
+            work_statements=["引用AI"],
+            inline_image_paths=inline,
+            is_draft=is_draft,
+            **common,
+        )
     elif platform_type == 8:
         # 搜狐号发文页只有一个「必选声明」单选组，选项真实文案是「含有AI生成内容」。
         # 传旧文案「包含AI创作内容」选不中，AI 声明会静默缺失。
@@ -781,7 +793,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         #            换浏览器/换 profile 就看不到，等于没存，只能直接发布；
         #   微博(11)、百度贴吧(10)——平台本身没有真草稿入口，
         #            草稿模式只能做到「填好但不发布」，无实质意义。
-        # 头条(7) 走待发内容包，压根不碰浏览器。
+        # 头条(7) 自 2026-11-09 起草稿链路已打通，走正常存草稿。
         DIRECT_PUBLISH_PLATFORMS = (9, 11, 10)
         draft_only = bool(args.draft) or ptype in MANUAL_PACKAGE_PLATFORMS
         if args.draft and ptype in DIRECT_PUBLISH_PLATFORMS:

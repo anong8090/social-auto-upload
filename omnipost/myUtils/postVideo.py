@@ -309,12 +309,15 @@ def post_article_toutiao(
     cover_path="",
     work_statements=None,
     inline_image_paths=None,
+    is_draft=False,
 ):
     """今日头条图文文章发布（contentType=article）。
 
     cover_path: 前端 /upload 返回的文件名（位于 videoFile/），或绝对/相对路径。
     单张封面最大 20MB，建议 JPEG/PNG。
     work_statements: 作品声明（单选）。可传字符串，或仅含一项的列表，如 "引用AI" / ["引用AI"]。
+    is_draft: 是否只存为头条草稿（True 时不点「发布」，靠编辑器自动保存请求
+        （save=0）落进头条草稿箱，由人工复核后自行发布）。
     """
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = None
@@ -367,6 +370,7 @@ def post_article_toutiao(
             cover_path=cover,
             work_statements=work_statements,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
