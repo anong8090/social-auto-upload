@@ -386,6 +386,7 @@ def post_article_baijiahao(
     cover_path="",
     ai_generated=False,
     inline_image_paths=None,
+    is_draft=False,
 ):
     """百家号图文文章发布（contentType=article）。
 
@@ -401,6 +402,7 @@ def post_article_baijiahao(
         dry_run: 是否仅预览不发布
         cover_path: 封面图片路径（百家号图文必填）
         ai_generated: 是否勾选「采用AI生成内容」
+        is_draft: 是否只存草稿（只点「存草稿」，绝不点「发布」）
     """
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = None
@@ -453,6 +455,7 @@ def post_article_baijiahao(
             cover_path=cover,
             ai_generated=ai_generated,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
         )
         # 百家号图文因百度安全验证机制，使用可见窗口执行以便通过验证
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
@@ -475,6 +478,7 @@ def post_article_sohu(
     info_source=None,
     cover_paths=None,
     inline_image_paths=None,
+    is_draft=False,
 ):
     """搜狐号图文文章发布（type=8, contentType=article）。
 
@@ -551,6 +555,7 @@ def post_article_sohu(
             cover_paths=resolved_covers,
             info_source=info_source,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False

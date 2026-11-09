@@ -362,7 +362,7 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     if platform_type == 5:
         return post_article_baijiahao(
             title, body, tags, account_list, ai_generated=True,
-            inline_image_paths=inline, **common,
+            inline_image_paths=inline, is_draft=is_draft, **common,
         )
     elif platform_type == 7:
         # 2026-11-05 用户规则：头条禁止任何自动化写入，避免被判定营销号封禁。
@@ -370,12 +370,14 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
         # 防止将来有人绕过主流程直接把头条丢进来。
         raise RuntimeError("头条已禁止自动化发布，请走待发内容包流程（MANUAL_PACKAGE_PLATFORMS）")
     elif platform_type == 8:
-        # 搜狐号「信息来源」单选需声明含 AI 创作内容（当期母本元数据已标注）。
+        # 搜狐号发文页只有一个「必选声明」单选组，选项真实文案是「含有AI生成内容」。
+        # 传旧文案「包含AI创作内容」选不中，AI 声明会静默缺失。
         return post_article_sohu(
             title, body, tags, account_list,
             cover_paths=[cover] if cover else [],
             inline_image_paths=inline,
-            info_source="包含AI创作内容",
+            info_source="含有AI生成内容",
+            is_draft=is_draft,
             **common,
         )
     elif platform_type == 9:
@@ -604,7 +606,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--check-only", action="store_true",
         help="完全离线预检：只做素材发现与合规检查，不启动浏览器、不写数据库、不发布",
     )
-    parser.add_argument("--draft", action="store_true", help="保存为平台草稿")
+    parser.add_argument(
+        "--publish",
+        dest="draft",
+        action="store_false",
+        help="真实发布（默认只存草稿，不点「发布」）",
+    )
+    parser.add_argument(
+        "--draft",
+        dest="draft",
+        action="store_true",
+        help="只存草稿（默认行为，保留此参数仅为兼容旧调用）",
+    )
+    parser.set_defaults(draft=True)
     parser.add_argument("--verify-cookie", action="store_true", help="发布前真正开浏览器校验 cookie（慢）")
     parser.add_argument("--force", action="store_true", help="忽略幂等检查，强制重新发布")
     parser.add_argument("--tieba-kw", default="", help="贴吧目标吧名（type=10 必填）")
@@ -761,8 +775,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             for w in warnings:
                 print(f"  ⚠️ {pname} 合规告警: {w}")
 
-        # 待发内容包平台只出包不发布，历史记录统一记 draft
+        # 草稿优先：默认只存草稿、绝不点发布。
+        # 例外平台走真实发布：
+        #   知乎(9)——专栏编辑器是纯前端自动存草稿，草稿只存在本地浏览器，
+        #            换浏览器/换 profile 就看不到，等于没存，只能直接发布；
+        #   微博(11)、百度贴吧(10)——平台本身没有真草稿入口，
+        #            草稿模式只能做到「填好但不发布」，无实质意义。
+        # 头条(7) 走待发内容包，压根不碰浏览器。
+        DIRECT_PUBLISH_PLATFORMS = (9, 11, 10)
         draft_only = bool(args.draft) or ptype in MANUAL_PACKAGE_PLATFORMS
+        if args.draft and ptype in DIRECT_PUBLISH_PLATFORMS:
+            draft_only = False
+            print(
+                f"  ℹ️ {pname} 不支持平台侧草稿（草稿仅存本地浏览器/无草稿入口），"
+                f"本次按真实发布执行"
+            )
 
         history_id = publish_record.create_record(
             DB_PATH,

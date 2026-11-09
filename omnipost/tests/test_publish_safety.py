@@ -121,6 +121,84 @@ def test_dayu_draft_never_clicks_publish():
     print("✅ 大鱼号草稿分支只点「保存」，不点「发表」")
 
 
+def test_baijiahao_draft_never_clicks_publish():
+    """百家号存草稿：只点「存草稿」，不得点「发布」。"""
+    from uploader.baijiahao_uploader import main as bjh_main
+
+    source = Path(bjh_main.__file__).read_text(encoding="utf-8")
+    assert "async def save_draft" in source, "百家号缺少 save_draft 方法"
+    save_block = source.split("async def save_draft")[1].split("async def _verify_draft_in_list")[0]
+    assert "存草稿" in save_block, save_block
+    # 草稿分支里不得出现点「发布」
+    assert "发布按钮" not in save_block and "发布主按钮" not in save_block, save_block
+    # save_draft 内部不得出现 publish_button（发布按钮定位）
+    assert "publish_button" not in save_block, save_block
+    # 草稿分支必须做回读核验，不能只截图就宣称成功
+    assert "_verify_draft_in_list" in save_block, save_block
+    print("✅ 百家号草稿分支只点「存草稿」，并回读核验")
+
+
+def test_sohu_draft_never_clicks_publish():
+    """搜狐号存草稿：只点「存草稿」，不得点「发布」。"""
+    from uploader.sohu_uploader import main as sohu_main
+
+    source = Path(sohu_main.__file__).read_text(encoding="utf-8")
+    assert "async def save_draft" in source, "搜狐号缺少 save_draft 方法"
+    save_block = source.split("async def save_draft")[1].split("async def _verify_draft_in_list")[0]
+    assert "存草稿" in save_block, save_block
+    assert "publish_candidates" not in save_block, "草稿分支不得复用发布按钮定位"
+    assert "_verify_draft_in_list" in save_block, save_block
+    print("✅ 搜狐号草稿分支只点「存草稿」，并回读核验")
+
+
+def test_qiehao_draft_verifies_by_readback():
+    """企鹅号草稿必须回读内容管理页核验，不能只截图就宣称成功。"""
+    from uploader.qiehao_uploader import main as qh_main
+
+    source = Path(qh_main.__file__).read_text(encoding="utf-8")
+    assert "async def _verify_draft_in_list" in source, "企鹅号缺少草稿核验方法"
+    assert "QIEHAO_MANAGE_URL" in source, "企鹅号核验必须回内容管理页"
+    print("✅ 企鹅号草稿分支回读核验")
+
+
+def test_wangyi_draft_verifies_by_readback():
+    """网易号草稿必须回草稿箱核验，核验不过要抛错而不是静默成功。"""
+    from uploader.wangyi_uploader import main as wy_main
+
+    source = Path(wy_main.__file__).read_text(encoding="utf-8")
+    assert "async def _verify_draft_in_list" in source, "网易号缺少草稿核验方法"
+    assert "草稿保存未通过核验" in source, "核验失败必须抛错，不得让调用方误判为已存草稿"
+    print("✅ 网易号草稿分支回读核验")
+
+
+def test_draft_is_default_and_zhihu_is_exception():
+    """默认走草稿；知乎/微博/贴吧因平台侧无真草稿，例外走真实发布。"""
+    source = (OMNIPOST_DIR / "scripts" / "publish_episode.py").read_text(encoding="utf-8")
+    assert "parser.set_defaults(draft=True)" in source, "草稿必须是默认行为"
+    assert "DIRECT_PUBLISH_PLATFORMS = (9, 11, 10)" in source, "知乎/微博/贴吧应为例外"
+    print("✅ 草稿为默认行为，知乎/微博/贴吧例外直接发布")
+
+
+def test_sohu_ai_declaration_wording_matches_page():
+    """搜狐号必选声明文案必须是页面真实存在的「含有AI生成内容」。
+
+    旧文案「包含AI创作内容」在页面上不存在，会导致 AI 声明静默缺失。
+    """
+    from uploader.sohu_uploader.main import SOHU_INFO_SOURCE_AI, SOHU_INFO_SOURCE_OPTIONS
+
+    assert SOHU_INFO_SOURCE_AI == "含有AI生成内容", SOHU_INFO_SOURCE_AI
+    assert "含有AI生成内容" in SOHU_INFO_SOURCE_OPTIONS
+    # 旧文案不得再作为有效选项出现
+    assert "包含AI创作内容" not in SOHU_INFO_SOURCE_OPTIONS
+    assert "无特别声明" not in SOHU_INFO_SOURCE_OPTIONS
+
+    # 统一入口必须传页面真实文案
+    source = (OMNIPOST_DIR / "scripts" / "publish_episode.py").read_text(encoding="utf-8")
+    assert 'info_source="含有AI生成内容"' in source, "统一入口须传真实文案"
+    assert 'info_source="包含AI创作内容"' not in source, "旧文案会导致 AI 声明丢失"
+    print("✅ 搜狐号必选声明文案与页面一致")
+
+
 def test_link_collector_item_id_and_public_guard():
     assert link_collector._item_id_from_url(
         15, "https://page.om.qq.com/page/OwJ_rWtDsBy4t35YdrvT5S7A0"
@@ -317,6 +395,12 @@ def main():
     test_dayu_public_url_only()
     test_dayu_login_redirect_is_detected()
     test_dayu_draft_never_clicks_publish()
+    test_baijiahao_draft_never_clicks_publish()
+    test_sohu_draft_never_clicks_publish()
+    test_qiehao_draft_verifies_by_readback()
+    test_wangyi_draft_verifies_by_readback()
+    test_draft_is_default_and_zhihu_is_exception()
+    test_sohu_ai_declaration_wording_matches_page()
     test_link_collector_item_id_and_public_guard()
     test_qiehao_title_match_exact()
     test_compliance_blocks_missing_inline_images()

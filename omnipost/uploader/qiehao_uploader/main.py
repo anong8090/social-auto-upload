@@ -547,6 +547,22 @@ class QiehaoPost(object):
             f"已填写企鹅号正文并按位置插入 {img_count} 张内文图，编辑器文本长度={len(actual)}"
         )
 
+    async def _verify_draft_in_list(self, page: Page) -> bool:
+        """回内容管理页按标题核对草稿是否真的落库。
+
+        点了「存草稿」不等于草稿保存成功——页面可能弹校验失败、
+        可能拦在必填项上。只截图就宣称成功会误导调用方。
+        """
+        try:
+            await page.goto(QIEHAO_MANAGE_URL, timeout=90000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(6000)
+            body = await page.evaluate("() => document.body.innerText") or ""
+            if self.title and self.title in body:
+                return True
+        except Exception as exc:
+            qiehao_logger.warning(f"企鹅号草稿核验跳转内容管理页失败: {exc}")
+        return False
+
     async def _collect_published_url(self, page: Page) -> str:
         """到真实内容管理页按标题取 `page.om.qq.com/page/<id>` 公开链接。
 
@@ -689,11 +705,23 @@ class QiehaoPost(object):
 
             if action_btn and await action_btn.count() and await action_btn.is_visible():
                 await action_btn.click(force=True)
-                qiehao_logger.info("已点击企鹅号发布按钮，等待平台确认…")
+                if self.is_draft:
+                    qiehao_logger.info("已点击企鹅号「存草稿」按钮，等待平台确认…")
+                else:
+                    qiehao_logger.info("已点击企鹅号发布按钮，等待平台确认…")
                 await page.wait_for_timeout(6000)
                 done_shot = Path(self.account_file).parent / "qiehao_article_done.png"
                 await page.screenshot(path=str(done_shot))
                 qiehao_logger.success(f"🎉 企鹅号发布流程结束！截图: {done_shot}")
+                if self.is_draft:
+                    # 存草稿必须回读核验：点了按钮不等于草稿真的落库
+                    if not await self._verify_draft_in_list(page):
+                        raise RuntimeError(
+                            "企鹅号草稿保存未通过核验：内容管理页未找到本期标题，"
+                            "不得让调用方误判为已存草稿"
+                        )
+                    qiehao_logger.success(f"✅ 企鹅号草稿核验通过：内容管理页已出现「{self.title}」")
+                    return
                 self.published_url = await self._collect_published_url(page)
                 if self.published_url:
                     qiehao_logger.success(f"✅ 企鹅号公开链接: {self.published_url}")
