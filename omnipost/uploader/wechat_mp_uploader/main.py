@@ -25,8 +25,21 @@ COVER_EXTS = {".jpg", ".jpeg", ".png"}
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
+    """构建浏览器启动参数。
+
+    ⚠️ 微信公众平台必崩坑（2026-11-09 实测）：Playwright 自带的 Chromium
+    内核打开 mp.weixin.qq.com 会稳定触发 `Page.goto: Page crashed`，
+    空 context 也崩，与 cookie 文件无关；换系统 Chrome
+    (`channel="chrome"`) 则正常返回 200。四种启动参数变体
+    （UA / --single-process / 关闭站点隔离 / 禁用 JS）都救不了 bundled 内核。
+    所以这里对微信域名固定优先走系统 Chrome，失败再回退到默认内核，
+    并保留 user 配置的 executable_path 优先级。
+
+    另外：用户明确要求「走无头浏览器模式，不要干扰工作」，
+    因此扫码登录分支也强制 headless=True，绝不弹出可见窗口。
+    """
     options = {
-        "headless": headless,
+        "headless": True,  # 强制无头：公众号任何路径都不弹浏览器
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--lang=zh-CN",
@@ -36,7 +49,25 @@ def _build_launch_kwargs(headless: bool) -> dict:
     }
     if LOCAL_CHROME_PATH:
         options["executable_path"] = LOCAL_CHROME_PATH
+        return options
+    # 微信站点与 bundled Chromium 不兼容；优先系统 Chrome。
+    # channel 与 executable_path 互斥，两者都设会让 Playwright 报错。
+    options["channel"] = "chrome"
     return options
+
+
+async def _launch_wechat_browser(playwright):
+    """启动微信专用浏览器；系统 Chrome 不可用时降级到 bundled 内核。"""
+    try:
+        return await playwright.chromium.launch(**_build_launch_kwargs(True))
+    except Exception as exc:
+        wechat_mp_logger.warning(
+            f"系统 Chrome 不可用（{exc}），降级到 Playwright 自带内核；"
+            "微信页面仍可能 Page crashed"
+        )
+        fallback = _build_launch_kwargs(True)
+        fallback.pop("channel", None)
+        return await playwright.chromium.launch(**fallback)
 
 
 def _is_login_url(url: str) -> bool:
@@ -84,7 +115,7 @@ def _extract_token_from_url(url: str) -> str | None:
 async def cookie_auth(account_file) -> bool:
     """校验微信公众号 Cookie 是否仍然有效。"""
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=LOCAL_CHROME_HEADLESS))
+        browser = await _launch_wechat_browser(playwright)
         try:
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
@@ -121,19 +152,48 @@ async def cookie_auth(account_file) -> bool:
 
 
 async def wechat_mp_cookie_gen(account_file):
-    """CLI/本地打开浏览器扫码登录并保存微信公众号 cookie。"""
+    """无头扫码登录并保存微信公众号 cookie。
+
+    无头模式下二维码不在屏幕上，所以把二维码**截图落盘**，由人工扫码；
+    绝不弹出可见浏览器（用户明确要求不干扰工作）。截图路径通过日志给出。
+    """
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=False))
-        context = await browser.new_context()
+        browser = await _launch_wechat_browser(playwright)
+        context = await browser.new_context(viewport={"width": 1440, "height": 900})
         context = await set_init_script(context)
         page = await context.new_page()
         await page.goto(WECHAT_MP_LOGIN_URL, timeout=60000)
-        wechat_mp_logger.info("请使用微信扫描屏幕中的公众号登录二维码并手机端确认…")
-        ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+        qr_path = Path(account_file).with_suffix(".login_qr.png")
+        try:
+            await page.screenshot(path=str(qr_path), full_page=False)
+            wechat_mp_logger.info(
+                f"无头登录二维码截图已保存：{qr_path}，请用微信扫码并在手机端确认"
+            )
+        except Exception as exc:
+            wechat_mp_logger.warning(f"二维码截图失败：{exc}")
+
+        # 二维码会过期刷新，等待扫码期间定期重截，保证人工拿到的是当前有效二维码
+        async def _refresh_qr():
+            elapsed = 0
+            while elapsed < 200_000:
+                await page.wait_for_timeout(10_000)
+                elapsed += 10_000
+                try:
+                    await page.screenshot(path=str(qr_path), full_page=False)
+                except Exception:
+                    return
+
+        refresh_task = asyncio.create_task(_refresh_qr())
+        try:
+            ok = await _wait_until_logged_in(page, context, timeout_ms=200_000)
+        finally:
+            refresh_task.cancel()
         if not ok:
             await context.close()
             await browser.close()
-            raise RuntimeError("微信公众号登录超时：未检测到扫码确认，请重试")
+            raise RuntimeError(
+                f"微信公众号登录超时：未检测到扫码确认；最新二维码在 {qr_path}，请重试"
+            )
         await page.wait_for_timeout(3000)
         Path(account_file).parent.mkdir(parents=True, exist_ok=True)
         await context.storage_state(path=account_file)
@@ -146,7 +206,10 @@ async def wechat_mp_setup(account_file, handle=False):
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             return False
-        wechat_mp_logger.error("cookie文件不存在或已失效，即将打开浏览器，请扫码登录微信公众号")
+        wechat_mp_logger.error(
+            "cookie 文件不存在或已失效；将在无头模式下生成二维码截图，"
+            "请按日志中的截图路径扫码（不弹出可见浏览器）"
+        )
         await wechat_mp_cookie_gen(account_file)
     return True
 
@@ -181,14 +244,15 @@ class WechatMpPost(object):
             str(Path(p).resolve()) for p in (file_list or [])
             if p and Path(p).is_file()
         ]
-        self.headless = LOCAL_CHROME_HEADLESS if not self.dry_run else False
+        # 用户明确要求全部走无头，dry_run 也不弹可见窗口
+        self.headless = True
 
     async def main(self) -> None:
         async with async_playwright() as playwright:
             await self.upload(playwright)
 
     async def upload(self, playwright) -> None:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
+        browser = await _launch_wechat_browser(playwright)
         context = await browser.new_context(
             storage_state=self.account_file,
             viewport={"width": 1440, "height": 900},

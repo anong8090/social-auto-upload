@@ -917,8 +917,8 @@ def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, v
             is_draft=is_draft,
             file_list=file_list,
         )
-        if dry_run:
-            app.headless = False
+        # 公众号上传器内部已强制无头（系统 Chrome + 二维码截图落盘），
+        # 这里不能再把 headless 改回 False，否则会弹出可见浏览器。
         asyncio.run(app.main(), debug=False)
         print("✅ 微信公众号发布流程结束", flush=True)
 

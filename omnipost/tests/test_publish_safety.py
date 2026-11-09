@@ -460,6 +460,43 @@ def test_compliance_toutiao_requires_one_inline_image():
     print("✅ 合规闸门：头条 1 张内文图，其余长文平台 2 张")
 
 
+def test_wechat_mp_uses_system_chrome_and_never_pops_browser():
+    """公众号必须用系统 Chrome 绕开 bundled 内核崩溃，且任何路径都强制无头。"""
+    source = (OMNIPOST_DIR / "uploader/wechat_mp_uploader/main.py").read_text(encoding="utf-8")
+    assert '"channel"] = "chrome"' in source or '"channel": "chrome"' in source, (
+        "微信公众平台在 Playwright bundled Chromium 下稳定 Page crashed，必须走系统 Chrome"
+    )
+    assert "_launch_wechat_browser" in source, "缺少系统 Chrome 不可用时的降级启动函数"
+    assert source.count("await _launch_wechat_browser(playwright)") == 3, (
+        "cookie_auth / cookie_gen / upload 三处启动点都必须走专用启动函数"
+    )
+    assert '"headless": True' in source, "公众号任何路径都不得弹出可见浏览器"
+    assert "headless=False" not in source and "headless=False" not in source.replace(" ", "")
+    assert "self.headless = True" in source, "dry_run 也不得把 headless 改回 False"
+    assert "login_qr.png" in source, "无头扫码必须把二维码截图落盘供人工扫描"
+    print("✅ 公众号：系统 Chrome 绕崩溃 + 全路径强制无头 + 二维码截图落盘")
+
+
+def test_ai_share_content_line_is_draft_only_and_brand_free():
+    """独立内容线：只存草稿、只走 1/12、不提蓝枢，且不改主线封禁表。"""
+    source = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
+    assert "ALLOWED_PLATFORMS = (1, 12)" in source, "独立内容线只允许小红书 + 公众号"
+    assert 'for forbidden in ("--publish", "--no-draft", "--direct")' in source
+    assert "is_draft=True" in source, "两个平台都必须强制存草稿"
+    assert "BRAND_EXCLUSIONS" in source and '"蓝枢"' in source, (
+        "必须校验正文不出现蓝枢"
+    )
+    assert "_readback_drafts" in source, "存完草稿必须回读核验"
+    assert "preflight.BANNED_PLATFORMS[" not in source, (
+        "独立脚本不得写入/改动主线的封禁拦截表"
+    )
+    # 主线仍保留小红书硬拦截，随机池不含小红书
+    from myUtils import preflight
+    assert 1 in preflight.BANNED_PLATFORMS, "主线必须继续硬拦截小红书"
+    assert 1 not in preflight.DEFAULT_POOL, "主线随机 5 平台池不得含小红书"
+    print("✅ 独立内容线：只存草稿 + 只走 1/12 + 不提蓝枢 + 主线封禁不受影响")
+
+
 def main():
     test_publish_manual_rejects_publish_flag()
     test_publish_manual_default_is_offline()
@@ -490,6 +527,8 @@ def main():
     asyncio.run(test_qiehao_prepare_only_never_clicks_publish())
     test_check_only_does_not_touch_database()
     test_check_only_and_dry_run_are_distinct()
+    test_wechat_mp_uses_system_chrome_and_never_pops_browser()
+    test_ai_share_content_line_is_draft_only_and_brand_free()
     print("\n🎉 发布安全闸门与链接判定测试全部通过（未联网、未启动浏览器、未发布）。")
 
 
