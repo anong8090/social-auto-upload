@@ -28,7 +28,7 @@ from myUtils import link_collector  # noqa: E402
 from scripts import compliance_check as cc  # noqa: E402
 from scripts import publish_episode as pe  # noqa: E402
 from scripts import publish_manual as pm  # noqa: E402
-from uploader.dayu_uploader.main import _is_public_dayu_url  # noqa: E402
+from uploader.dayu_uploader.main import _is_public_dayu_url, _is_login_url  # noqa: E402
 from uploader.qiehao_uploader.main import (  # noqa: E402
     QiehaoPost,
     _is_public_qiehao_url,
@@ -93,6 +93,32 @@ def test_dayu_public_url_only():
     assert not _is_public_dayu_url("https://mp.dayu.com/dashboard/index")
     assert not _is_public_dayu_url("")
     print("✅ 大鱼号公开链接判定")
+
+
+def test_dayu_login_redirect_is_detected():
+    """cookie 失效时大鱼号会重定向到首页并带 redirect_url，URL 里没有 /login。
+
+    旧实现只按 /login/passport/auth 判路径，会把登录页误判成「已登录」，
+    随后报「未找到标题输入框」这种误导性错误。这里锁定修复后的判定。
+    """
+    assert _is_login_url("https://mp.dayu.com/?redirect_url=%2Fdashboard%2Farticle%2Fwrite")
+    assert _is_login_url("https://mp.dayu.com/login")
+    assert not _is_login_url("https://mp.dayu.com/dashboard/article/write")
+    assert not _is_login_url("https://mp.dayu.com/dashboard/index")
+    print("✅ 大鱼号登录重定向判定")
+
+
+def test_dayu_draft_never_clicks_publish():
+    """大鱼号存草稿：草稿分支只点「保存」，不得点「发表」。"""
+    from uploader.dayu_uploader import main as dayu_main
+
+    source = Path(dayu_main.__file__).read_text(encoding="utf-8")
+    # 草稿候选按钮里不得出现「发表」「发布」
+    draft_block = source.split('if self.is_draft:')[1].split('else:')[0]
+    assert "发表" not in draft_block and "发布" not in draft_block, draft_block
+    # 保存按钮候选必须覆盖页面真实文案「保存」
+    assert 'has-text("保存")' in draft_block, draft_block
+    print("✅ 大鱼号草稿分支只点「保存」，不点「发表」")
 
 
 def test_link_collector_item_id_and_public_guard():
@@ -160,8 +186,11 @@ def test_inline_markers_only_for_supported_platforms():
     # 知乎同样支持标记
     assert "[[插图1]]" in assets["long_body_by_platform"][9]
 
+    # 大鱼号已改为按标记把图片插到母本指定位置
+    assert "[[插图1]]" in assets["long_body_by_platform"][14]
+
     # 其余长文平台不得出现标记，否则标记会被原样发到线上
-    for ptype in (5, 8, 13, 14):
+    for ptype in (5, 8, 13):
         body = assets["long_body_by_platform"].get(ptype, "")
         assert "[[插图" not in body, f"平台 {ptype} 不应带插图标记"
     print("✅ 插图标记只对支持精确插图的平台生成")
@@ -286,6 +315,8 @@ def main():
     test_publish_manual_module_has_no_browser_import()
     test_qiehao_public_url_only()
     test_dayu_public_url_only()
+    test_dayu_login_redirect_is_detected()
+    test_dayu_draft_never_clicks_publish()
     test_link_collector_item_id_and_public_guard()
     test_qiehao_title_match_exact()
     test_compliance_blocks_missing_inline_images()

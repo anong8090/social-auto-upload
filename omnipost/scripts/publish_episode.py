@@ -294,9 +294,9 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
             gallery = [cover]
 
     inline_count = len(inline or [])
-    # 知乎、企鹅号上传器已支持按标记把图片精确插到母本指定位置；
+    # 知乎、企鹅号、大鱼号上传器已支持按标记把图片精确插到母本指定位置；
     # 其余平台仍沿用原正文（图片追加到末尾），避免把位置标记发到线上。
-    inline_marker_platforms = (9, 15)
+    inline_marker_platforms = (9, 14, 15)
     long_body_by_platform: Dict[int, str] = {
         ptype: (
             _body_with_inline_markers(raw, inline_count)
@@ -424,14 +424,17 @@ def sync_published_draft(
     files: List[str],
     account_name: str,
     url: str,
+    status: str = "published",
+    note: str = "",
 ) -> None:
-    """把成功发布的一条记录同步到 publish_drafts，供 OmniPost 前端核对。
+    """把成功发布（或已存草稿）的一条记录同步到 publish_drafts，供 OmniPost 前端核对。
 
     按「期数备注 + 平台 + 标题」幂等；已有记录只更新状态、链接与文件，
     不重复插入。该表是前端发布记录视图，publish_history 才是审计主表。
     """
-    note = f"第{episode}期 {platform_name} 已真实发布：{url}"
     account = str(account_name or "默认账号")
+    default_note = f"第{episode}期 {platform_name} 已真实发布：{url}"
+    completion_note = note or default_note
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -444,14 +447,15 @@ def sync_published_draft(
         if row:
             cur.execute(
                 """UPDATE publish_drafts
-                   SET platform_name = ?, body = ?, status = 'published',
+                   SET platform_name = ?, body = ?, status = ?,
                        ai_generated = 1, dry_run = 0, completion_note = ?,
                        synced_platforms = ?, updated_at = datetime('now', 'localtime')
                    WHERE id = ?""",
                 (
                     platform_name,
                     body,
-                    note,
+                    status,
+                    completion_note,
                     json.dumps([platform_name], ensure_ascii=False),
                     row[0],
                 ),
@@ -463,7 +467,7 @@ def sync_published_draft(
                     files_json, account_ids_json, ai_generated, dry_run,
                     status, completion_note, synced_platforms, created_at, updated_at)
                    VALUES (?, ?, ?, 'article', ?, '', ?, ?, 1, 0,
-                           'published', ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))""",
+                           ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))""",
                 (
                     platform_title,
                     ptype,
@@ -471,7 +475,8 @@ def sync_published_draft(
                     body,
                     json.dumps(files, ensure_ascii=False),
                     json.dumps([account], ensure_ascii=False),
-                    note,
+                    status,
+                    completion_note,
                     json.dumps([platform_name], ensure_ascii=False),
                 ),
             )
@@ -844,6 +849,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             results.append({"platform": pname, "type": ptype, "status": final_status})
             hint = "预览" if args.dry_run else "存草稿"
             print(f"  ✅ {pname} 已{hint}")
+            if draft_only and not args.dry_run:
+                # 草稿同样入前端记录视图：状态记 draft，备注写明「待人工发布」
+                try:
+                    draft_files = (
+                        [str(p) for p in sorted(Path(assets["image_dir"]).glob("*.png"))]
+                        if assets.get("image_dir") and Path(assets["image_dir"]).is_dir()
+                        else assets["gallery"]
+                    )
+                    sync_published_draft(
+                        args.episode, ptype, pname, platform_title, audit_body,
+                        draft_files, str(check.get("account") or ""), "",
+                        status="draft",
+                        note=(
+                            f"第{args.episode}期 {pname} 已保存为平台草稿"
+                            "（未点击发表），待人工到平台后台确认发布后再补链接"
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  ⚠️ {pname} 草稿记录同步失败（主记录已写入）: {exc}")
             continue
 
         url, item_id = collect_sync(ptype, cookie, platform_title, args.episode)
