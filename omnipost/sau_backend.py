@@ -316,7 +316,7 @@ def retry_publish():
                     case 11:
                         post_article_weibo(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
                     case 12:
-                        post_article_wechat_mp(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, True)
+                        post_article_wechat_mp(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, True, file_list=file_list)
                     case 13:
                         post_article_wangyi(title, article_body, tags, account_list, False, 1, ['10:00'], 0, False, thumbnail_path, False, file_list)
                     case 14:
@@ -1400,6 +1400,7 @@ def postVideo():
                         dry_run=dry_run,
                         cover_path=thumbnail_path,
                         is_draft=is_draft,
+                        file_list=file_list,
                     )
                 case 13:
                     post_article_wangyi(
@@ -1768,6 +1769,7 @@ def postVideoBatch():
                     dry_run=dry_run,
                     cover_path=thumbnail_path,
                     is_draft=is_draft,
+                    file_list=file_list,
                 )
             case 13:
                 post_article_wangyi(

@@ -474,7 +474,64 @@ def test_wechat_mp_uses_system_chrome_and_never_pops_browser():
     assert "headless=False" not in source and "headless=False" not in source.replace(" ", "")
     assert "self.headless = True" in source, "dry_run 也不得把 headless 改回 False"
     assert "login_qr.png" in source, "无头扫码必须把二维码截图落盘供人工扫描"
-    print("✅ 公众号：系统 Chrome 绕崩溃 + 全路径强制无头 + 二维码截图落盘")
+    assert "img.login__type__container__scan__qrcode" in source, (
+        "必须等真实二维码元素渲染，不能截登录页首屏空白图"
+    )
+    assert "naturalWidth > 100" in source, "二维码图片必须加载完成后才交付给人工扫码"
+    assert "await qr_locator.screenshot(path=str(qr_path))" in source, (
+        "必须裁剪二维码元素，由同一个无头登录进程等待并保存扫码后的 cookie"
+    )
+    assert "_dismiss_education_dialog" in source, (
+        "公众号新版编辑器的教育提示弹窗会遮住标题输入框，必须先关闭"
+    )
+    assert "save_draft_btn.evaluate(\"(el) => el.click()\")" in source, (
+        "底部「保存为草稿」按钮可能在视口外，必须有 DOM click 兜底"
+    )
+    print("✅ 公众号：系统 Chrome 绕崩溃 + 全路径强制无头 + 二维码可见后截图")
+
+
+def test_wechat_mp_draft_requires_real_inline_image_and_cover():
+    """公众号草稿必须真正插图/设封面，保存前硬闸门 + 草稿箱配图回读。"""
+    uploader = (OMNIPOST_DIR / "uploader/wechat_mp_uploader/main.py").read_text(encoding="utf-8")
+    for symbol in (
+        "_body_editor", "_editor_image_count", "_cover_ready",
+        "_insert_inline_images", "_set_cover_from_body",
+        "_assert_media_ready", "_open_existing_draft", "_draft_patch_mode",
+    ):
+        assert symbol in uploader, f"公众号上传器缺少 {symbol}"
+    assert "self.file_list" in uploader and "self.cover_path" in uploader
+    assert "公众号保存前图文闸门未通过" in uploader
+    assert "不得保存缺图草稿" in uploader and "不得保存缺封面草稿" in uploader
+    # 草稿分支只点「保存为草稿」，不得触及「发表」链路。
+    draft_block = uploader.split("if self.is_draft:")[1].split("send_btn =")[0]
+    assert "保存为草稿" in draft_block
+    draft_code = "\n".join(
+        line for line in draft_block.splitlines()
+        if not line.lstrip().startswith("#") and not line.lstrip().startswith('"""')
+    )
+    assert "#js_send" not in draft_code and "发表" not in draft_code, draft_code
+
+    ai = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
+    assert "type=77" in ai, "公众号草稿箱必须用 type=77，type=9 是发表记录"
+    assert r"\xa0" in ai and "NBSP" in ai, "草稿箱标题 NBSP 必须归一化后回读"
+    assert "require_image=(ptype == 12)" in ai, "公众号回读必须校验配图"
+    assert "--patch-existing-wechat-draft" in ai
+    assert "只允许与 --platforms 12 一起使用" in ai
+    assert "mmbiz" in ai, "封面回读需识别公众号素材域名，不能只认 computed background-image"
+
+    pv = (OMNIPOST_DIR / "myUtils/postVideo.py").read_text(encoding="utf-8")
+    assert "existing_draft_title=existing_draft_title" in pv
+    assert "effective_inline" in pv, "后台只给封面时也要补正文图来源，避免缺图草稿"
+
+    backend = (OMNIPOST_DIR / "sau_backend.py").read_text(encoding="utf-8")
+    import re
+    blocks = backend.split("case 12:")[1:]
+    assert len(blocks) >= 3, f"后台应有 3 处公众号调用，实际 {len(blocks)}"
+    for block in blocks[:3]:
+        segment = block.split("case ")[0][:1200]
+        assert "post_article_wechat_mp(" in segment
+        assert "file_list=file_list" in segment, "后台公众号调用必须透传配图"
+    print("✅ 公众号：正文插图/封面硬闸门 + type=77/NBSP 回读 + 既有草稿修补 + 后台配图透传")
 
 
 def test_ai_share_visible_xhs_uses_cdp_attach_and_keeps_window():
@@ -499,6 +556,45 @@ def test_ai_share_visible_xhs_uses_cdp_attach_and_keeps_window():
     print("✅ 方案 A：独立进程可见窗口 + CDP attach + 同一 profile 回读")
 
 
+def test_sohu_upload_respects_global_headless_setting():
+    """搜狐号发文也服从全局无头配置，不再强制弹出可见浏览器。"""
+    source = (OMNIPOST_DIR / "uploader/sohu_uploader/main.py").read_text(encoding="utf-8")
+    assert "_build_launch_kwargs(self.headless)" in source
+    assert "_build_launch_kwargs(False)" not in source
+    assert "self.headless = LOCAL_CHROME_HEADLESS if not dry_run else False" in source
+    print("✅ 搜狐号：发文路径遵循全局无头配置")
+
+
+def test_auto_pool_excludes_warned_sohu():
+    """搜狐号被平台警告后，主线随机选台不得继续抽中它。"""
+    source = (OMNIPOST_DIR / "scripts/publish_episode.py").read_text(encoding="utf-8")
+    assert "AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 9, 10, 11, 15)" in source
+    assert "被平台警告" in source
+    print("✅ 主线随机选台：已排除被警告的搜狐号")
+
+
+def test_ai_share_xhs_readback_regressions():
+    """小红书独立线：修复可见窗口 profile 路径依赖与图文草稿标签回读。"""
+    uploader_source = (OMNIPOST_DIR / "uploader/xiaohongshu_uploader/main.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from conf import BASE_DIR" in uploader_source, (
+        "CDP 可见窗口的 profile 路径依赖 conf.BASE_DIR，不能漏导入"
+    )
+    import importlib
+
+    xhs_uploader = importlib.import_module("uploader.xiaohongshu_uploader.main")
+    assert hasattr(xhs_uploader, "BASE_DIR"), "上传器模块必须能实际导入 BASE_DIR"
+
+    source = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
+    assert r'图文笔记\(\d+\)' in source, (
+        "小红书草稿箱默认停在视频笔记，必须切到图文笔记标签再按标题回读"
+    )
+    assert "image_tab.first.click()" in source, "图文笔记标签必须真实点击后才回读"
+    assert "草稿箱抽屉默认停在「视频笔记(0)」" in source
+    print("✅ 小红书独立线：BASE_DIR 导入 + 图文笔记草稿回读")
+
+
 def test_ai_share_content_line_is_draft_only_and_brand_free():
     """独立内容线：只存草稿、只走 1/12、不提蓝枢，且不改主线封禁表。"""
     source = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
@@ -509,6 +605,7 @@ def test_ai_share_content_line_is_draft_only_and_brand_free():
         "必须校验正文不出现蓝枢"
     )
     assert "_readback_drafts" in source, "存完草稿必须回读核验"
+    assert "_wechat_token" in source, "公众号草稿箱回读必须从后台链接取当前 token"
     assert "preflight.BANNED_PLATFORMS[" not in source, (
         "独立脚本不得写入/改动主线的封禁拦截表"
     )
@@ -517,6 +614,98 @@ def test_ai_share_content_line_is_draft_only_and_brand_free():
     assert 1 in preflight.BANNED_PLATFORMS, "主线必须继续硬拦截小红书"
     assert 1 not in preflight.DEFAULT_POOL, "主线随机 5 平台池不得含小红书"
     print("✅ 独立内容线：只存草稿 + 只走 1/12 + 不提蓝枢 + 主线封禁不受影响")
+
+
+def test_ai_share_personal_ip_is_concise_daily_and_not_mainline_repost():
+    """个人 IP 线：每天一条、更精炼，且不得复用蓝枢标题/正文/配图。"""
+    import tempfile
+    from scripts import publish_ai_share as ai
+
+    src = (OMNIPOST_DIR / "scripts/publish_ai_share.py").read_text(encoding="utf-8")
+    ag = (OMNIPOST_DIR.parent / "AGENTS.md").read_text(encoding="utf-8")
+    assert "打造个人 IP" in ag and "每天只发一条" in ag
+    assert "比蓝枢主线更精炼" in ag and "不得重复发布蓝枢内容" in ag
+    assert "BODY_CHAR_RANGE = (180, 320)" in src
+    assert "MAX_PARAGRAPHS = 3" in src and "MAX_SUBHEADINGS = 1" in src
+    assert "_assert_one_daily_content" in src and "_find_repetition" in src
+    assert "_assert_distinct_images" in src
+    assert "publish_history" in src and "MAINLINE_TEXT_ROOT" in src
+
+    original_material_root = ai.MATERIAL_ROOT
+    original_text_root = ai.MAINLINE_TEXT_ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "AI能力分享内容线"
+        day = root / "2026-11-10"
+        day.mkdir(parents=True)
+        ai.MATERIAL_ROOT = root
+        ai.MAINLINE_TEXT_ROOT = Path(tmp) / "文案合集"
+        ai.MAINLINE_TEXT_ROOT.mkdir()
+        try:
+            body = (
+                "# 一个判断，今天先讲清楚\n\n"
+                "今天只记一个很朴素的判断：工程里的 AI 是否可靠，不看回答得多流畅，"
+                "而看它有没有把依据、口径和没检查到的地方一并交出来。"
+                "现场要的是能追回去的数字，不是一句听起来很像结论的话。"
+                "真正让人安心的，往往不是更聪明的措辞，而是能被复核的来路。\n\n"
+                "所以我更愿意把边界写在前面：模型负责理解，程序负责计算和核对，"
+                "关键动作留给人确认。遇到资料不全，就老实标出未执行；"
+                "遇到口径不一致，就把差异摆出来。"
+                "少一点神奇感，反而更容易被工程人长期相信。\n\n"
+                "个人做产品复盘时，这类克制并不抢眼，却决定了工具能不能进真实流程。"
+                "今天先把这句话记下来：AI 的价值不是替人拍板，"
+                "而是让每一次拍板都有更清楚的证据。"
+            )
+            (day / "内容.md").write_text(body, encoding="utf-8")
+            (day / "配图.png").write_bytes(b"fake")
+            (day / "内容-第二篇.md").write_text("# 今天另一条\n\n正文", encoding="utf-8")
+            try:
+                ai.precheck(day, [1, 12])
+            except ValueError as exc:
+                assert "每天一条" in str(exc)
+            else:
+                raise AssertionError("同一天两份内容稿必须被拒绝")
+
+            (day / "内容-第二篇.md").unlink()
+            assert 180 <= ai._chinese_char_count(body.split("\n", 1)[1]) <= 320
+            ai.precheck(day, [1, 12])  # 精炼、原创、当日配图应通过
+
+            # 复用主线发布历史里的整句，必须判为重复
+            contaminated = body.replace(
+                "所以我更愿意把边界写在前面：",
+                "。入口统一、包按需切小、缓存钉在现行版上——这三件事做到位，"
+                "没信号的区域也能把图看对、把版次说清。\n\n所以我更愿意把边界写在前面：",
+            )
+            (day / "内容.md").write_text(contaminated, encoding="utf-8")
+            try:
+                ai.precheck(day, [1, 12])
+            except ValueError as exc:
+                assert any(
+                    word in str(exc)
+                    for word in ("重复", "压缩改写", "最多 3 个", "正文 4 个自然段")
+                ), f"复用主线稿必须被任一内容闸门拒绝，实际：{exc}"
+            else:
+                raise AssertionError("复用主线历史句子必须被拒绝")
+
+            # 单独测相似度闸门，避免只被段落数闸门拦下
+            assert ai._find_repetition(
+                "一个判断，今天先讲清楚", contaminated.split("\n", 1)[1], day
+            ), "复用主线稿必须命中历史去重闸门"
+
+            (day / "内容.md").write_text(body, encoding="utf-8")
+            (day / "配图.png").unlink()
+            outside = OMNIPOST_DIR.parent / "河狸云蓝枢_自媒体物料包" / "品牌标准资产" / "official_logo_transparent.png"
+            assert outside.exists(), "缺少用于验证配图闸门的主线素材"
+            try:
+                ai._assert_distinct_images([str(outside)], day)
+            except ValueError as exc:
+                assert "禁止复用主线物料" in str(exc)
+            else:
+                raise AssertionError("主线配图必须被拒绝")
+        finally:
+            ai.MATERIAL_ROOT = original_material_root
+            ai.MAINLINE_TEXT_ROOT = original_text_root
+
+    print("✅ 个人 IP：每日一条 + 180~320 字 + 主线历史/配图去重")
 
 
 def main():
@@ -539,6 +728,8 @@ def main():
     test_compliance_toutiao_requires_one_inline_image()
     test_draft_is_default_and_zhihu_is_exception()
     test_sohu_ai_declaration_wording_matches_page()
+    test_sohu_upload_respects_global_headless_setting()
+    test_auto_pool_excludes_warned_sohu()
     test_link_collector_item_id_and_public_guard()
     test_qiehao_title_match_exact()
     test_compliance_blocks_missing_inline_images()
@@ -550,8 +741,11 @@ def main():
     test_check_only_does_not_touch_database()
     test_check_only_and_dry_run_are_distinct()
     test_wechat_mp_uses_system_chrome_and_never_pops_browser()
+    test_wechat_mp_draft_requires_real_inline_image_and_cover()
     test_ai_share_content_line_is_draft_only_and_brand_free()
     test_ai_share_visible_xhs_uses_cdp_attach_and_keeps_window()
+    test_ai_share_xhs_readback_regressions()
+    test_ai_share_personal_ip_is_concise_daily_and_not_mainline_repost()
     print("\n🎉 发布安全闸门与链接判定测试全部通过（未联网、未启动浏览器、未发布）。")
 
 

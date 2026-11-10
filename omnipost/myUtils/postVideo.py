@@ -898,9 +898,19 @@ def post_article_weibo(title, body, tags, account_file, enableTimer=False, video
     return results[0] if results else ""
 
 
-def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None):
+def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None, existing_draft_title=""):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
+    # 后台旧调用可能只给了封面、没给 file_list；公众号保存前图文闸门要求正文图。
+    # file_list 里的图片名也需按 videoFile 目录解析成绝对路径，再把已解析封面
+    # 补作正文图来源，绝不放行「无图草稿」。
+    effective_inline = []
+    for item in file_list or []:
+        resolved = _resolve_cover_helper(item)
+        if resolved and resolved not in effective_inline:
+            effective_inline.append(resolved)
+    if cover and cover not in effective_inline:
+        effective_inline.insert(0, cover)
     publish_date = 0
     if enableTimer:
         publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
@@ -917,7 +927,8 @@ def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, v
             dry_run=dry_run,
             cover_path=cover,
             is_draft=is_draft,
-            file_list=file_list,
+            file_list=effective_inline,
+            existing_draft_title=existing_draft_title,
         )
         # 公众号上传器内部已强制无头（系统 Chrome + 二维码截图落盘），
         # 这里不能再把 headless 改回 False，否则会弹出可见浏览器。

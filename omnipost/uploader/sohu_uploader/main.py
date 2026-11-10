@@ -1559,8 +1559,8 @@ class SoHuArticle(object):
         if not (self.body or "").strip() and not self.tags:
             raise ValueError("文章正文不能为空")
 
-        # 搜狐发文页常出滑块验证，强制有头方便人工处理
-        launch_kwargs = _build_launch_kwargs(False)
+        # 遵循全局无头要求；如需人工处理滑块验证，由调用方显式设置 headless=False。
+        launch_kwargs = _build_launch_kwargs(self.headless)
         browser = await playwright.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
