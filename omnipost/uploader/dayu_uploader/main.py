@@ -11,7 +11,7 @@ from pathlib import Path
 
 from playwright.async_api import Page, async_playwright
 
-from conf import LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from utils.base_social_media import set_init_script
 from utils.log import dayu_logger
 
@@ -55,8 +55,15 @@ TITLE_SELECTOR = (
 )
 # 封面回读：大鱼号封面区常见结构，若干候选依次尝试。
 COVER_IMAGE_SELECTOR = (
+    '.article-write_box-cover .article-write-article-cover-cover-item img, '
+    '.article-write-article-cover_fullscreen-item img, '
     '.cover-container img, [class*=cover] img, [class*=Cover] img, '
     '[class*=cover] [class*=thumb] img, [class*=coverImg], [class*=cover-img]'
+)
+# 只有真正上传到平台素材域名的图片才算封面；编辑器临时图与占位空图不算。
+COVER_UPLOADED_SELECTOR = (
+    '.article-write_box-cover .article-write-article-cover-cover-item '
+    'img[src*="image.uc.cn/s/wemedia/s/upload/"]'
 )
 # UEditor 图片按钮：点开「图片」面板后，弹窗内是「添加本地图片」的 webuploader。
 TOOLBAR_PIC_SELECTOR = (
@@ -97,6 +104,50 @@ def _is_public_dayu_url(url: str) -> bool:
         or re.match(r"^https?://mp\.dayu\.com/content/[A-Za-z0-9_-]+", u)
         or re.match(r"^https?://mp\.dayu\.com/article/[A-Za-z0-9_-]+", u)
     )
+
+
+def find_draft_edit_url(account_files, title: str, *, headless: bool = True) -> str:
+    """按标题从大鱼号草稿箱找出既有草稿的编辑 URL，供原位修补使用。
+
+    只读草稿管理页，不修改、不新建、不删除任何平台草稿。
+    """
+    async def _find() -> str:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                **_build_launch_kwargs(headless=headless)
+            )
+            try:
+                for name in account_files:
+                    path = Path(BASE_DIR) / "cookiesFile" / name
+                    if not path.is_file():
+                        continue
+                    context = await browser.new_context(
+                        storage_state=str(path),
+                        viewport={"width": 1440, "height": 900},
+                    )
+                    context = await set_init_script(context)
+                    page = await context.new_page()
+                    await page.goto(
+                        DAYU_DRAFT_LIST_URL, timeout=90000,
+                        wait_until="domcontentloaded",
+                    )
+                    await page.wait_for_timeout(6000)
+                    item = page.locator("li.w-list-item").filter(has_text=title).first
+                    if not await item.count():
+                        continue
+                    link = item.locator('a[href*="draft_id="]').first
+                    if not await link.count():
+                        continue
+                    href = await link.get_attribute("href") or ""
+                    if href.startswith("/"):
+                        return "https://mp.dayu.com" + href
+                    if href.startswith("https://mp.dayu.com/"):
+                        return href
+            finally:
+                await browser.close()
+            return ""
+
+    return asyncio.run(_find())
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
@@ -261,6 +312,8 @@ class DayuPost(object):
         is_draft=False,
         file_list=None,
         prepare_only=False,
+        existing_draft_url="",
+        patch_existing_draft=False,
     ):
         raw_title = (title or "").strip()
         self.title = re.sub(r"^【.*?】\s*", "", raw_title).strip()[:TITLE_MAX_LEN]
@@ -274,6 +327,10 @@ class DayuPost(object):
         self.file_list = file_list or []
         # prepare_only：只填内容并等待人工点「发布」
         self.prepare_only = bool(prepare_only)
+        # existing_draft_url：修补平台侧既有草稿，避免重复新建。
+        # patch_existing_draft=True 时保留原标题与正文，只补内文图/封面后保存。
+        self.existing_draft_url = str(existing_draft_url or "").strip()
+        self.patch_existing_draft = bool(patch_existing_draft)
         self.headless = LOCAL_CHROME_HEADLESS if not self.dry_run else False
         if self.prepare_only:
             self.headless = False
@@ -313,73 +370,131 @@ class DayuPost(object):
 
     # ---------------------------------------------------------------- 填写
 
+    async def _dismiss_tips(self, page: Page) -> None:
+        """关掉新版编辑器的教育提示，避免遮挡标题框或封面按钮。"""
+        buttons = page.locator('button:has-text("我知道了")')
+        for idx in range(await buttons.count()):
+            button = buttons.nth(idx)
+            try:
+                if await button.is_visible():
+                    await button.click(force=True)
+            except Exception:
+                continue
+
+    async def _patch_images_only(self, page: Page, editor) -> int:
+        """修补既有草稿：保留原文，只在正文末尾追加缺失的 2 张内文图。"""
+        expected = len(re.findall(r"\[\[插图\d+\]\]", self.body or "")) or len(self.file_list)
+        existing = await editor.locator("img").count()
+        if existing >= expected:
+            return existing
+        await editor.click(force=True)
+        await page.keyboard.press("End")
+        for image_path in self.file_list[existing:expected]:
+            await page.keyboard.press("Enter")
+            if not await self._try_inline_image(page, image_path):
+                raise RuntimeError(f"大鱼号修补既有草稿插图失败: {image_path}")
+        return await editor.locator("img").count()
+
     async def fill_fields(self, page: Page) -> None:
         """把标题、正文、封面、内文图填进大鱼号发文页。"""
-        # 标题
+        await self._dismiss_tips(page)
         title_input = page.locator(TITLE_SELECTOR).first
         if not await title_input.count():
             raise RuntimeError("未找到大鱼号标题输入框")
-        await title_input.click(force=True)
-        await page.wait_for_timeout(300)
-        tag = await title_input.evaluate("el => el.tagName")
-        if tag == "INPUT":
-            await title_input.fill(self.title)
+        if not self.patch_existing_draft:
+            await title_input.click(force=True)
+            await page.wait_for_timeout(300)
+            tag = await title_input.evaluate("el => el.tagName")
+            if tag == "INPUT":
+                await title_input.fill(self.title)
+            else:
+                await page.keyboard.insert_text(self.title)
+            await page.wait_for_timeout(600)
+            actual = (await title_input.inner_text() or "") if tag != "INPUT" else (await title_input.input_value() or "")
+            if self.title not in actual:
+                raise RuntimeError(f"大鱼号标题写入校验失败：期望含「{self.title}」，实际「{actual[:40]}」")
+            dayu_logger.info(f"已填写大鱼号标题: {self.title} ({len(self.title)}字)")
         else:
-            await page.keyboard.insert_text(self.title)
-        await page.wait_for_timeout(600)
-        actual = (await title_input.inner_text() or "") if tag != "INPUT" else (await title_input.input_value() or "")
-        if self.title not in actual:
-            raise RuntimeError(f"大鱼号标题写入校验失败：期望含「{self.title}」，实际「{actual[:40]}」")
-        dayu_logger.info(f"已填写大鱼号标题: {self.title} ({len(self.title)}字)")
+            title_value = await title_input.input_value()
+            if title_value.strip() != self.title:
+                raise RuntimeError(
+                    f"大鱼号既有草稿标题不匹配：期望「{self.title}」，实际「{title_value[:40]}」"
+                )
+            dayu_logger.info(f"保留大鱼号既有草稿标题: {title_value}")
 
         # 正文（UEditor 在 iframe 内，键盘事件必须打到该 frame 上）
         editor, frame = await self._editor_locator(page)
         if not await editor.count():
             raise RuntimeError("未找到大鱼号正文编辑器")
-        await editor.click(force=True)
-        await page.wait_for_timeout(400)
-
-        # 正文按 [[插图N]] 标记切段，插图要落在标记所在位置而不是文末
-        segments = self._split_body_by_markers(self.body)
         inline_index = 0
-        for text, marker_no in segments:
-            for idx, line in enumerate(text.splitlines()):
-                if idx:
-                    await page.keyboard.press("Enter")
-                if line.strip():
-                    await page.keyboard.insert_text(line)
-            if marker_no is None:
-                continue
-            inline_index += 1
-            image_path = (
-                self.file_list[marker_no - 1]
-                if marker_no - 1 < len(self.file_list)
-                else (self.file_list[inline_index - 1] if inline_index - 1 < len(self.file_list) else "")
-            )
-            if not image_path:
-                raise RuntimeError(f"大鱼号插图 {marker_no} 缺少对应图片文件")
-            ok = await self._try_inline_image(page, image_path)
-            if not ok:
-                raise RuntimeError(f"大鱼号内文图插入失败，禁止带病发布: {image_path}")
-            dayu_logger.success(f"已插入大鱼号内文图 {marker_no}: {image_path}")
+        if self.patch_existing_draft:
+            inline_index = await self._patch_images_only(page, editor)
+        else:
+            await editor.click(force=True)
+            await page.wait_for_timeout(400)
+            # 正文按 [[插图N]] 标记切段，插图要落在标记所在位置而不是文末
+            segments = self._split_body_by_markers(self.body)
+            for text, marker_no in segments:
+                for idx, line in enumerate(text.splitlines()):
+                    if idx:
+                        await page.keyboard.press("Enter")
+                    if line.strip():
+                        await page.keyboard.insert_text(line)
+                if marker_no is None:
+                    continue
+                inline_index += 1
+                image_path = (
+                    self.file_list[marker_no - 1]
+                    if marker_no - 1 < len(self.file_list)
+                    else (self.file_list[inline_index - 1] if inline_index - 1 < len(self.file_list) else "")
+                )
+                if not image_path:
+                    raise RuntimeError(f"大鱼号插图 {marker_no} 缺少对应图片文件")
+                ok = await self._try_inline_image(page, image_path)
+                if not ok:
+                    raise RuntimeError(f"大鱼号内文图插入失败，禁止带病发布: {image_path}")
+                dayu_logger.success(f"已插入大鱼号内文图 {marker_no}: {image_path}")
 
         await page.wait_for_timeout(900)
         actual = (await editor.inner_text() or "")
-        probe = next((ln.strip() for ln in self.body.splitlines() if ln.strip()), "")
+        probe = next((ln.strip() for ln in self.body.splitlines() if ln.strip() and "[[" not in ln), "")
         if probe and probe[:12] not in actual:
             raise RuntimeError(
                 f"大鱼号正文写入校验失败：期望含「{probe[:12]}」，实际长度={len(actual)}"
             )
         if "[[插图" in actual:
             raise RuntimeError("大鱼号正文仍残留插图标记，禁止发布")
+        # 长文硬闸门：2 张内文图必须真实进入 UEditor，回退母本缺标记时不得静默放行。
+        editor_img_count = await editor.locator("img").count()
+        expected_inline_count = len(
+            re.findall(r"\[\[插图\d+\]\]", self.body or "")
+        ) or min(2, len(self.file_list))
+        if editor_img_count < expected_inline_count:
+            raise RuntimeError(
+                f"大鱼号内文图不足：正文需 {expected_inline_count} 张，"
+                f"编辑器实际 {editor_img_count} 张，禁止存草稿"
+            )
         dayu_logger.info(
             f"已填写大鱼号正文，长度={len(self.body)}，编辑器实际={len(actual)}，"
-            f"插图 {inline_index} 张（{'iframe 内 UEditor' if frame is not None else '顶层编辑器'}）"
+            f"插图 {inline_index} 张 / 编辑器图片 {editor_img_count} 张"
+            f"（{'iframe 内 UEditor' if frame is not None else '顶层编辑器'}）"
         )
 
-        # 封面：优先找封面区域的图片上传入口
-        if not await self._try_cover(page):
-            raise RuntimeError("大鱼号封面上传未通过回读校验，禁止带病发布")
+        # 单张横版头图统一使用单封面模式。不能先用“已有封面”判断跳过模式切换，
+        # 否则占位/残留图片可能让三封面模式漏过，保存时平台静默拒绝。
+        await self._switch_single_cover(page)
+
+        # 封面：已有真实上传封面时保留，否则先从正文已有图片重新确认封面；
+        # 若仍无封面，再临时插入头图借道，并在删除临时图后重新确认一次。
+        if not await self._has_uploaded_cover(page):
+            if not await self._confirm_cover_from_body(page):
+                if not await self._try_cover(page):
+                    raise RuntimeError("大鱼号封面上传未通过回读校验，禁止带病发布")
+                # 删除借道临时图会连带撤销刚设的封面，用剩余内文图再确认一次。
+                if not await self._confirm_cover_from_body(page):
+                    raise RuntimeError("大鱼号封面在移除临时图后丢失，禁止带病发布")
+        if not await self._has_uploaded_cover(page):
+            raise RuntimeError("大鱼号横版封面没有真实上传图片，禁止存草稿")
 
         # 合规声明：「信息来源」勾选 AI生成
         await self._select_ai_source(page)
@@ -420,6 +535,42 @@ class DayuPost(object):
             dayu_logger.warning("大鱼号未找到「信息来源 - AI生成」单选项，需人工确认")
         except Exception as exc:
             dayu_logger.warning(f"大鱼号 AI 声明勾选失败: {exc}")
+
+    async def _confirm_cover_from_body(self, page: Page, *, image_index: int = -1) -> bool:
+        """从正文已有图片中重新确认横版封面，不新增也不删除正文图片。"""
+        # 当前素材只有一张横版头图；三封面模式要求三个槽位，单张确认会被误判为封面已就绪，
+        # 但保存时因其余槽位为空而无法落库，因此在选择正文图前强制切到单封面模式。
+        await self._switch_single_cover(page)
+        normal_item = page.locator(
+            "div.article-write_box-cover .article-write-article-cover-cover-item"
+        ).first
+        if not await normal_item.count():
+            return False
+        await normal_item.hover()
+        await page.wait_for_timeout(700)
+        choose = normal_item.locator('button:has-text("从正文中选择")')
+        if not await choose.count():
+            return False
+        await choose.click(force=True)
+        await page.wait_for_timeout(3500)
+        dialog = page.locator(".article-material-image-dialog:visible").last
+        images = dialog.locator(".article-material-image_image-choose img")
+        count = await images.count()
+        if not count:
+            return False
+        index = count - 1 if image_index < 0 else min(image_index, count - 1)
+        await images.nth(index).click(force=True)
+        await page.wait_for_timeout(1200)
+        next_btn = dialog.locator('button:has-text("下一步")')
+        if await next_btn.count():
+            await next_btn.click(force=True)
+            await page.wait_for_timeout(4000)
+        dialog = page.locator(".article-material-image-dialog:visible").last
+        save = dialog.locator('button:has-text("保存")').last
+        if await save.count():
+            await save.click(force=True)
+            await page.wait_for_timeout(4500)
+        return await self._has_uploaded_cover(page)
 
     async def _try_cover(self, page: Page) -> bool:
         """大鱼号封面：素材库为空时走「临时插图 → 从正文中选择 → 保存」。
@@ -511,26 +662,34 @@ class DayuPost(object):
         dayu_logger.warning("大鱼号封面未回读到新封面，需人工处理")
         return False
 
-    async def _switch_single_cover(self, page: Page) -> None:
-        """切到「单封面」模式。
+    async def _switch_single_cover(self, page: Page) -> bool:
+        """切到并核验「单封面」模式；失败时中止，避免无封面草稿被平台静默拒绝。
 
-        三封面模式要求 3 张图，母本只备了 1 张 16:9 头图；
-        单选框是一个自定义 div（`w-radio`），点文字不会切换，必须点 radio 本体。
+        三封面模式要求 3 张图，母本只备了 1 张 16:9 头图；单选框是自定义 div，
+        必须点 radio 本体，并在点击后回读 `w-radio_checked` 状态。
         """
-        try:
-            radio = page.locator(
-                'div.article-write-article-cover_normal-option:has-text("单封面") div.w-radio'
-            ).first
-            if not await radio.count():
-                return
+        option = page.locator(
+            'div.article-write-article-cover_normal-option:has-text("单封面")'
+        ).first
+        if not await option.count():
+            raise RuntimeError("大鱼号未找到「单封面」模式选项，禁止保存草稿")
+        radio = option.locator(".w-radio").first
+        if not await radio.count():
+            raise RuntimeError("大鱼号「单封面」选项缺少单选控件，禁止保存草稿")
+
+        checked = await radio.evaluate(
+            "el => el.className.includes('w-radio_checked')"
+        )
+        if not checked:
+            await radio.click(force=True)
+            await page.wait_for_timeout(1200)
             checked = await radio.evaluate(
                 "el => el.className.includes('w-radio_checked')"
             )
-            if not checked:
-                await radio.click(force=True)
-                await page.wait_for_timeout(2000)
-        except Exception as exc:
-            dayu_logger.warning(f"大鱼号切换单封面失败: {exc}")
+        if not checked:
+            raise RuntimeError("大鱼号切换「单封面」后回读仍未选中，禁止保存草稿")
+        dayu_logger.info("已切换并核验大鱼号「单封面」模式")
+        return True
 
     async def _open_choose_from_body(self, page: Page) -> bool:
         """点开封面槽位上的「从正文中选择」。
@@ -596,12 +755,36 @@ class DayuPost(object):
                 continue
         return ""
 
-    async def _cover_changed(self, page: Page, old_src: str) -> bool:
-        """封面 src 是否发生变化；页面没有封面元素时按「无法确认」处理。"""
-        new_src = await self._cover_src(page)
-        if not new_src:
+    async def _has_uploaded_cover(self, page: Page) -> bool:
+        """横版封面槽位里是否已有真实上传后的图片。
+
+        `src` 变化可能只是临时图或页面占位，不能据此认定封面已上传；
+        大鱼号保存成功后会把封面转成 `image.uc.cn/s/wemedia/s/upload/` 地址。
+        """
+        try:
+            images = page.locator(COVER_UPLOADED_SELECTOR)
+            for index in range(await images.count()):
+                image = images.nth(index)
+                if not await image.is_visible():
+                    continue
+                box = await image.bounding_box()
+                if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+                    continue
+                loaded = await image.evaluate(
+                    "el => Boolean(el.complete && el.naturalWidth > 0)"
+                )
+                if loaded:
+                    return True
             return False
-        return new_src != old_src
+        except Exception:
+            return False
+
+    async def _cover_changed(self, page: Page, old_src: str) -> bool:
+        """封面是否真实落库；仅 src 变化不足以通过合规闸门。"""
+        new_src = await self._cover_src(page)
+        if not new_src or new_src == old_src:
+            return False
+        return await self._has_uploaded_cover(page)
 
     async def _try_inline_image(self, page: Page, image_path: str) -> bool:
         """内文图：走 UEditor 工具栏「图片」按钮 →「添加本地图片」→ 确认。
@@ -734,8 +917,9 @@ class DayuPost(object):
         context = await set_init_script(context)
         page = await context.new_page()
         try:
-            dayu_logger.info("正在打开大鱼号发文页...")
-            await page.goto(DAYU_WRITE_URL, timeout=90000, wait_until="domcontentloaded")
+            target_url = self.existing_draft_url or DAYU_WRITE_URL
+            dayu_logger.info(f"正在打开大鱼号发文页... {'(修补既有草稿)' if self.existing_draft_url else ''}")
+            await page.goto(target_url, timeout=90000, wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
 
             if _is_login_url(page.url) or await _looks_logged_out(page):

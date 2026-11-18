@@ -312,6 +312,7 @@ def post_article_toutiao(
     work_statements=None,
     inline_image_paths=None,
     is_draft=False,
+    prepare_only=False,
 ):
     """今日头条图文文章发布（contentType=article）。
 
@@ -373,6 +374,7 @@ def post_article_toutiao(
             work_statements=work_statements,
             inline_image_paths=inline_image_paths,
             is_draft=is_draft,
+            prepare_only=prepare_only,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
@@ -963,7 +965,7 @@ def post_article_wangyi(title, body, tags, account_file, enableTimer=False, vide
         print("✅ 网易号发布流程结束", flush=True)
 
 
-def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None, existing_draft_url="", patch_existing_draft=False, prepare_only=False):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
     publish_date = 0
@@ -983,6 +985,9 @@ def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos
             cover_path=cover,
             is_draft=is_draft,
             file_list=file_list,
+            existing_draft_url=existing_draft_url,
+            patch_existing_draft=patch_existing_draft,
+            prepare_only=prepare_only,
         )
         if dry_run:
             app.headless = False

@@ -250,6 +250,33 @@ def find_published_record(
         return None
 
 
+def find_any_attempt_record(
+    db_path: Path, episode: str | int, platform_type: int
+) -> Optional[Dict[str, Any]]:
+    """按「期数 + 平台」查找任意发布尝试记录（含失败/草稿/预览）。
+
+    失败不等于「没发布」：以今日头条为例，自动保存回读草稿箱失败时，内容
+    仍可能已经由人工在窗口里发布。普通重发必须按最保守口径拦截，不能只看
+    `status=published`，也不能让 `--force` 无条件绕过。
+    """
+    ep = _as_episode(episode)
+    if not ep:
+        return None
+    try:
+        with _connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM publish_history
+                WHERE episode = ? AND platform_type = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (ep, int(platform_type)),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
 def _as_episode(value: Any) -> Optional[str]:
     if value is None:
         return None

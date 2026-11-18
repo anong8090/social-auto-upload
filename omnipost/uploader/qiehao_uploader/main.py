@@ -556,9 +556,18 @@ class QiehaoPost(object):
         try:
             await page.goto(QIEHAO_MANAGE_URL, timeout=90000, wait_until="domcontentloaded")
             await page.wait_for_timeout(6000)
+            # 内容管理页可能加载慢；存草稿后前端也未必立刻刷新。按标题多轮回读，
+            # 避免把已落库草稿误判为失败（但仍不靠 toast/截图直接宣称成功）。
+            for _ in range(4):
+                body = await page.evaluate("() => document.body.innerText") or ""
+                if self.title and self.title in body:
+                    return True
+                await page.reload(timeout=90000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(4000)
             body = await page.evaluate("() => document.body.innerText") or ""
             if self.title and self.title in body:
                 return True
+            qiehao_logger.warning(f"企鹅号内容管理页未找到草稿标题「{self.title}」，页面摘要: {body[:200]!r}")
         except Exception as exc:
             qiehao_logger.warning(f"企鹅号草稿核验跳转内容管理页失败: {exc}")
         return False

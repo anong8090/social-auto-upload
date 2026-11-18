@@ -365,6 +365,59 @@ def _count_rows(table: str) -> int:
         conn.close()
 
 
+def test_toutiao_force_cannot_bypass_republish_guard():
+    """2026-11-18 第23期头条重复发布复盘：普通 --force 不得放行。
+
+    上次先用自动草稿（记 failed），又以 --toutiao-prepare-only + --force
+    再开可见窗口；脚本把代填直接记 draft，但平台后台实际在窗口内发布了。
+    修复后头条必须按任意尝试记录拦截，published 永远硬拦截。
+    """
+    import sqlite3
+    import tempfile
+
+    from myUtils import publish_record as pr
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "publish.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """CREATE TABLE publish_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform_type INTEGER, platform_name TEXT, account_name TEXT,
+                    content_type TEXT, title TEXT, content TEXT, tags TEXT, files TEXT,
+                    tieba_fid TEXT, tieba_kw TEXT, product_id INTEGER,
+                    status TEXT, error_msg TEXT, published_url TEXT,
+                    platform_item_id TEXT, screenshot_dir TEXT,
+                    topic TEXT, published_at TEXT, created_at TEXT
+                )"""
+            )
+        pr.ensure_publish_history_schema(db)
+        history_id = pr.create_record(
+            db, platform_type=7, platform_name="今日头条", account_name="测试账号",
+            content_type="article", title="现场照片和标注，别再散在群里",
+            status=pr.STATUS_FAILED, episode="23",
+        )
+        assert history_id is not None
+
+        # 旧逻辑只查 published，会误判「没发过」；新逻辑必须查到 failed 尝试。
+        assert pr.find_published_record(db, "23", 7) is None
+        failed_attempt = pr.find_any_attempt_record(db, "23", 7)
+        assert failed_attempt and failed_attempt["status"] == pr.STATUS_FAILED
+
+        pr.finish_record(
+            db, history_id, pr.STATUS_PUBLISHED,
+            published_url="https://www.toutiao.com/article/7709335666614452755/",
+        )
+        assert pr.find_any_attempt_record(db, "23", 7)["status"] == pr.STATUS_PUBLISHED
+
+    source = (OMNIPOST_DIR / "scripts" / "publish_episode.py").read_text(encoding="utf-8")
+    assert "REPUBLISH_FORBIDDEN_PLATFORMS = (7,)" in source
+    assert "--force-retry-failed" in source
+    assert "find_any_attempt_record(DB_PATH, args.episode, ptype)" in source
+    assert "普通 --force 不再放行" in source
+    print("✅ 今日头条 --force 不再绕过防重发闸门")
+
+
 def test_check_only_does_not_touch_database():
     """--check-only 必须只做静态预检：不写发布记录、不启动浏览器。"""
     before_history = _count_rows("publish_history")
@@ -738,6 +791,7 @@ def main():
     test_inline_markers_not_counted_in_body_length()
     asyncio.run(test_qiehao_dry_run_never_clicks_publish())
     asyncio.run(test_qiehao_prepare_only_never_clicks_publish())
+    test_toutiao_force_cannot_bypass_republish_guard()
     test_check_only_does_not_touch_database()
     test_check_only_and_dry_run_are_distinct()
     test_wechat_mp_uses_system_chrome_and_never_pops_browser()

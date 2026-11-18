@@ -64,6 +64,18 @@ MANUAL_PACKAGE_PLATFORMS = ()
 # 但默认不再把它算作有效候选，避免一稿五投的随机名额被警告账号占用。
 AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 9, 10, 11, 15)
 
+# 微信公众号只承接个人 IP 独立线（publish_ai_share.py），2026-11-12 用户明确
+# 「不要发蓝枢的内容」。主线显式 --platforms 12 也必须硬拦截，不能靠选台遗漏规避。
+MAINLINE_FORBIDDEN_PLATFORMS = {
+    12: "微信公众号仅用于个人 IP 独立线，禁止发布蓝枢主线内容",
+}
+
+# 2026-11-18 第23期今日头条重复发布复盘：
+# 头条没有可靠的服务端草稿回执，自动保存失败/草稿箱未命中时，内容仍可能已由
+# 可见窗口里的人工操作发布；而 --force 又会跳过唯一的「已发布」幂等检查。
+# 因此头条不能用普通 --force 重投，必须按最保守口径拦截任意尝试记录。
+REPUBLISH_FORBIDDEN_PLATFORMS = (7,)
+
 
 # ---------------------------------------------------------------- 素材发现
 
@@ -304,6 +316,9 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
     # 知乎、企鹅号、大鱼号上传器已支持按标记把图片精确插到母本指定位置；
     # 其余平台仍沿用原正文（图片追加到末尾），避免把位置标记发到线上。
     inline_marker_platforms = (9, 14, 15)
+    # 专属母本只对部分平台存在；支持精确插图的平台即使回退到通用母本，
+    # 也必须保留 [[插图N]]，否则上传器会静默写出 0 张内文图的草稿。
+    long_body_with_markers = _body_with_inline_markers(long_raw, inline_count)
     long_body_by_platform: Dict[int, str] = {
         ptype: (
             _body_with_inline_markers(raw, inline_count)
@@ -313,6 +328,9 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
         for ptype, raw in platform_raw.items()
     }
     long_body = _extract_clean_body(long_raw)
+    # 让调用方按平台取正文时，回退值也带正确插图位置，避免误用无标记通用母本。
+    for ptype in inline_marker_platforms:
+        long_body_by_platform.setdefault(ptype, long_body_with_markers)
     short_body = _extract_clean_body(short_raw)
 
     return {
@@ -339,7 +357,8 @@ from scripts.compliance_check import compliance_check, ComplianceRuleError
 
 
 def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
-              account_list: List[str], *, dry_run: bool, is_draft: bool, tieba_kw: str = "") -> None:
+              account_list: List[str], *, dry_run: bool, is_draft: bool, tieba_kw: str = "",
+              patch_existing_dayu_draft: bool = False, toutiao_prepare_only: bool = False) -> None:
     """调用对应平台的 post_article_*。导入放在函数内，避免 CLI 启动即加载全部浏览器依赖。"""
     from myUtils.postVideo import (
         post_article_baijiahao,
@@ -381,6 +400,7 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
             work_statements=["引用AI"],
             inline_image_paths=inline,
             is_draft=is_draft,
+            prepare_only=toutiao_prepare_only,
             **common,
         )
     elif platform_type == 8:
@@ -421,7 +441,19 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     elif platform_type == 13:
         return post_article_wangyi(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     elif platform_type == 14:
-        return post_article_dayu(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
+        existing_draft_url = ""
+        if patch_existing_dayu_draft:
+            from uploader.dayu_uploader.main import find_draft_edit_url
+            existing_draft_url = find_draft_edit_url(
+                account_list, title, headless=True
+            )
+            if not existing_draft_url:
+                raise RuntimeError(f"大鱼号草稿箱未找到本期标题，无法修补既有草稿: {title}")
+        return post_article_dayu(
+            title, body, tags, account_list, is_draft=is_draft, file_list=inline,
+            existing_draft_url=existing_draft_url,
+            patch_existing_draft=patch_existing_dayu_draft, **common,
+        )
     elif platform_type == 15:
         return post_article_qiehao(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     else:
@@ -590,6 +622,10 @@ def export_manual_package(
 def resolve_platforms(args, assets: Dict[str, Any]) -> List[int]:
     if args.platforms != "auto":
         requested = [int(x) for x in args.platforms.split(",") if x.strip()]
+        forbidden = [p for p in requested if p in MAINLINE_FORBIDDEN_PLATFORMS]
+        if forbidden:
+            reasons = "；".join(MAINLINE_FORBIDDEN_PLATFORMS[p] for p in forbidden)
+            raise SystemExit(f"❌ 主线平台硬拦截：{reasons}；请改用 publish_ai_share.py")
         return [p for p in requested if p not in preflight.BANNED_PLATFORMS]
 
     picked = preflight.pick_random_platforms(
@@ -634,10 +670,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.set_defaults(draft=True)
     parser.add_argument("--verify-cookie", action="store_true", help="发布前真正开浏览器校验 cookie（慢）")
-    parser.add_argument("--force", action="store_true", help="忽略幂等检查，强制重新发布")
+    parser.add_argument("--force", action="store_true", help="忽略已发布幂等检查；对今日头条仍按任意尝试记录拦截")
+    parser.add_argument(
+        "--force-retry-failed", action="store_true",
+        help="仅今日头条：显式重试已失败且确认未发布的同篇内容；已发布记录仍硬拦截",
+    )
     parser.add_argument("--tieba-kw", default="", help="贴吧目标吧名（type=10 必填）")
+    parser.add_argument(
+        "--patch-existing-dayu-draft", action="store_true",
+        help="修补大鱼号本篇既有草稿：打开草稿编辑页补齐内文图/封面并保存，不新建重复草稿",
+    )
+    parser.add_argument(
+        "--toutiao-prepare-only", action="store_true",
+        help="今日头条安全代填：可见浏览器填好内容后由人工复核发布，自动化不点发布、不触发保存请求",
+    )
     parser.add_argument("--rule-check", action="store_true", help="仅校验合规规则是否可信，不加载素材/不发布")
     args = parser.parse_args(argv)
+
+    if args.toutiao_prepare_only and not args.draft:
+        print("❌ --toutiao-prepare-only 不能与 --publish 同时使用（代填模式绝不点发布）", file=sys.stderr)
+        return 2
+
+    if args.force_retry_failed and args.force:
+        print("❌ --force-retry-failed 不能与 --force 同时使用", file=sys.stderr)
+        return 2
 
     if args.rule_check:
         import compliance_check as rule_module
@@ -729,7 +785,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             results.append({"platform": pname, "type": ptype, "status": "skipped", "reason": check["reason"]})
             continue
 
-        if not args.force:
+        existing = None
+        if ptype in REPUBLISH_FORBIDDEN_PLATFORMS:
+            # 头条这类平台即使上次记 failed/draft，也可能已由人工在窗口里发布；
+            # 普通 --force 不再放行，必须显式 --force-retry-failed 才能重试失败。
+            existing = publish_record.find_any_attempt_record(DB_PATH, args.episode, ptype)
+            if existing:
+                status = str(existing.get("status") or "").strip()
+                if status == publish_record.STATUS_PUBLISHED:
+                    results.append({
+                        "platform": pname, "type": ptype, "status": "already_published",
+                        "url": existing.get("published_url"),
+                        "reason": "该期该平台已成功发布，禁止重复发布",
+                    })
+                    continue
+                if not args.force_retry_failed:
+                    results.append({
+                        "platform": pname, "type": ptype, "status": "already_attempted",
+                        "url": existing.get("published_url"),
+                        "reason": (
+                            f"该期该平台已有{status}记录（id={existing.get('id')}），"
+                            "可能已由人工发布；禁止重复。确需重试失败请用 --force-retry-failed"
+                        ),
+                    })
+                    continue
+        elif not args.force:
             existing = publish_record.find_published_record(DB_PATH, args.episode, ptype)
             if existing:
                 results.append({
@@ -860,6 +940,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _dispatch(
                     ptype, assets, platform_title, body, account_file,
                     dry_run=args.dry_run, is_draft=draft_only, tieba_kw=args.tieba_kw,
+                    patch_existing_dayu_draft=args.patch_existing_dayu_draft,
+                    toutiao_prepare_only=args.toutiao_prepare_only,
                 ) or ""
             ).strip()
         except Exception as exc:  # noqa: BLE001
@@ -966,9 +1048,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     published = sum(1 for r in results if r["status"] == "published")
+    drafted = sum(1 for r in results if r["status"] == "draft")
     packaged = sum(1 for r in results if r["status"] == "manual_package")
-    print(f"\n📊 自动发布 {published} 个平台，待发内容包 {packaged} 个，明细已写入 {out}")
-    return 0 if (published or packaged or args.dry_run) else 1
+    print(
+        f"\n📊 自动发布 {published} 个平台，已存草稿 {drafted} 个平台，"
+        f"待发内容包 {packaged} 个，明细已写入 {out}"
+    )
+    return 0 if (published or drafted or packaged or args.dry_run) else 1
 
 
 def asyncio_run_preflight(platforms: List[int], verify_cookie: bool) -> List[Dict[str, Any]]:

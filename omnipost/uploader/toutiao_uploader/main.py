@@ -429,6 +429,7 @@ class TouTiaoArticle(object):
         work_statements=None,
         inline_image_paths=None,
         is_draft=False,
+        prepare_only=False,
     ):
         self.title = (title or "")[:30]
         self.body = body or ""
@@ -436,7 +437,10 @@ class TouTiaoArticle(object):
         self.publish_date = publish_date
         self.account_file = account_file
         self.local_executable_path = LOCAL_CHROME_PATH
+        self.prepare_only = bool(prepare_only)
         self.headless = LOCAL_CHROME_HEADLESS if not dry_run else False
+        if self.prepare_only:
+            self.headless = False
         self.dry_run = bool(dry_run)
         # is_draft：只存为头条草稿，绝不点「发布」。
         # 头条没有草稿按钮，但不发发布请求时，其自动保存（save=0）会存进草稿箱。
@@ -2439,6 +2443,22 @@ class TouTiaoArticle(object):
             raise RuntimeError(f"点击发布后未确认成功，当前页面: {page.url}")
         toutiao_logger.success(f"已点击文章发布并确认成功，当前页面: {page.url}")
 
+    async def _wait_for_manual_publish(self, page: Page) -> None:
+        """保持已填好的今日头条编辑页打开；不监测发布提示，也不主动点击发布。"""
+        toutiao_logger.info(
+            "⏸️ 内容已填好；请在浏览器窗口人工复核并点击「发布」。"
+            "操作完成后请手动关闭窗口；自动化不会点击发布。"
+        )
+        while True:
+            try:
+                if page.is_closed():
+                    toutiao_logger.info("今日头条编辑页已由人工关闭")
+                    return
+                await page.wait_for_timeout(1000)
+            except Exception:
+                toutiao_logger.info("今日头条窗口已关闭，结束代填等待")
+                return
+
     async def upload(self, playwright: Playwright) -> None:
         if not (self.body or "").strip() and not self.tags:
             raise ValueError("文章正文不能为空")
@@ -2496,7 +2516,17 @@ class TouTiaoArticle(object):
         await self.apply_work_statements(page)
         await _dismiss_overlays(page)
 
-        if self.dry_run:
+        if self.prepare_only:
+            toutiao_logger.info("📸 今日头条代填预览截图已保存")
+            try:
+                await page.screenshot(
+                    full_page=True,
+                    path=str(Path(self.account_file).with_name("toutiao_article_manual_preview.png")),
+                )
+            except Exception:
+                pass
+            await self._wait_for_manual_publish(page)
+        elif self.dry_run:
             toutiao_logger.warning("🛑 【仅预览不发布】已跳过点击发布按钮")
             toutiao_logger.info(
                 "👀 请在浏览器窗口核对：标题、正文、文末话题标签（非纯文本 #）、展示封面、以及作品声明"
