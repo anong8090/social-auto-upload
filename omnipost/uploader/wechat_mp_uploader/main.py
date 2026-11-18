@@ -700,9 +700,17 @@ class WechatMpPost(object):
                 if await author_input.count():
                     await author_input.fill(self.author)
 
-            # 正文：修补既有草稿时不重写，避免把刚上传的图片块整段冲掉。
+            # 正文：普通修补保留原文，避免把既有图片块冲掉；调用方显式提供
+            # HTML 排版母本时，允许对既有草稿做一次可控重排。
             editor = await self._body_editor(page)
-            if patch_mode:
+            body_is_html = bool(
+                re.search(
+                    r"<(?:p|section|div|h[1-6]|blockquote|br|strong|span)\b",
+                    self.body,
+                    re.I,
+                )
+            )
+            if patch_mode and not body_is_html:
                 got = len(((await editor.inner_text()) or "").strip())
                 if got < max(80, int(len(self.body) * 0.6)):
                     raise RuntimeError(
@@ -711,33 +719,57 @@ class WechatMpPost(object):
                 wechat_mp_logger.info(f"修补既有草稿，保留原文，读回 {got} 字")
                 await editor.click(position={"x": 20, "y": 20})
             else:
+                if patch_mode:
+                    wechat_mp_logger.info("修补既有草稿：按调用方提供的 HTML 重排正文")
                 await editor.click()
                 await page.wait_for_timeout(500)
-                await editor.evaluate(
-                    """(el, text) => {
-                        const esc = (s) => s.replace(/&/g, '&amp;')
-                            .replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                        const lines = text.split(/\\r?\\n/);
-                        el.innerHTML = lines.map(p =>
-                            p.trim() ? '<p>' + esc(p) + '</p>' : '<p><br></p>'
-                        ).join('');
-                        el.dispatchEvent(new InputEvent('input', {
-                            bubbles: true, inputType: 'insertHTML'
-                        }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }""",
-                    self.body,
-                )
+                # 个人 IP 的公众号母本允许使用内联 HTML 做精美排版（小标题、
+                # 重点色、引用块）；主线母本仍是纯文本，不能让 Markdown 原文
+                # 泄漏到正文。只有看起来像完整 HTML 文档/片段时才走富文本分支。
+                if body_is_html:
+                    safe_html = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", self.body)
+                    safe_html = re.sub(r"(?i)\son\w+\s*=\s*(['\"]).*?\1", "", safe_html)
+                    await editor.evaluate(
+                        """(el, html) => {
+                            el.innerHTML = html;
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true, inputType: 'insertHTML'
+                            }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        safe_html,
+                    )
+                else:
+                    await editor.evaluate(
+                        """(el, text) => {
+                            const esc = (s) => s.replace(/&/g, '&amp;')
+                                .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                            const lines = text.split(/\\r?\\n/);
+                            el.innerHTML = lines.map(p =>
+                                p.trim() ? '<p>' + esc(p) + '</p>' : '<p><br></p>'
+                            ).join('');
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true, inputType: 'insertHTML'
+                            }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""",
+                        self.body,
+                    )
                 await page.wait_for_timeout(800)
                 got = len(((await editor.inner_text()) or "").strip())
-                if got < max(80, int(len(self.body) * 0.6)):
+                # HTML 母本的源码含标签与 style，渲染后的纯文本必然短得多；
+                # 只校验可读正文确实落进编辑器，避免把合法排版误判为失败。
+                min_chars = 80 if body_is_html else max(80, int(len(self.body) * 0.6))
+                if got < min_chars:
                     raise RuntimeError(
-                        f"公众号正文注入校验失败：期望约 {len(self.body)} 字，实际 {got} 字"
+                        f"公众号正文注入校验失败：期望至少 {min_chars} 字，实际 {got} 字"
                     )
                 wechat_mp_logger.info(f"正文注入完成，长度={len(self.body)}，读回 {got} 字")
 
             # 图文硬闸门：上传器必须真正插图、设置非空封面后才能保存。
-            await self._insert_inline_images(page, editor)
+            # 普通修补保留原文图片；若调用方显式重排了正文，则重新插图。
+            if not patch_mode or body_is_html:
+                await self._insert_inline_images(page, editor)
             await self._set_cover_from_body(page)
             await self._assert_media_ready(page, editor)
             await page.wait_for_timeout(1200)
