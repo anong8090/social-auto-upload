@@ -49,13 +49,32 @@ LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
 SHORT_FORM_PLATFORMS = (10, 11)
 
 # 禁止自动化操作浏览器的平台：只产出「待发内容包」，由人工到后台发布。
-# 头条（type=7）编辑器的「草稿保存中…」是常挂的前端状态，抓包证实无草稿保存请求，
-# 自动化无法保证草稿真的落库，因此改为彻底不碰浏览器，避免误发与误判。
-MANUAL_PACKAGE_PLATFORMS = (7,)
+# 2026-11-09 实测头条草稿链路已打通（见 toutiao_uploader.save_draft）：
+# 发文页自动保存请求 POST /mp/agw/article/publish 带 save 参数，
+# save=0 是存草稿、save=1 是直接投稿；只要不点「发布」，头条自己的自动保存
+# 就会把内容存进草稿箱（is_draft=true / status_desc=草稿）。
+# 因此头条不再走内容包，改为正常存草稿。
+# 保留本常量作为兜底：若头条草稿链路再次失效，可临时把它改回 (7,)。
+MANUAL_PACKAGE_PLATFORMS = ()
 
 # auto 选台只从「发布链路已实测打通、且能采集公开链接」的平台池中抽取。
 # 12 微信公众号、13 网易号、14 大鱼号的登录/发布链路尚未完成 E2E 验证。
-AUTO_PUBLISHABLE_PLATFORMS = (5, 8, 9, 10, 11, 15)
+# 7 今日头条自 2026-11-09 起草稿链路实测打通，加入可自动选台池。
+# 8 搜狐号于 2026-11-10 被平台警告，随机选台暂停使用；显式指定时仍走既有链路，
+# 但默认不再把它算作有效候选，避免一稿五投的随机名额被警告账号占用。
+AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 9, 10, 11, 15)
+
+# 微信公众号只承接个人 IP 独立线（publish_ai_share.py），2026-11-12 用户明确
+# 「不要发蓝枢的内容」。主线显式 --platforms 12 也必须硬拦截，不能靠选台遗漏规避。
+MAINLINE_FORBIDDEN_PLATFORMS = {
+    12: "微信公众号仅用于个人 IP 独立线，禁止发布蓝枢主线内容",
+}
+
+# 2026-11-18 第23期今日头条重复发布复盘：
+# 头条没有可靠的服务端草稿回执，自动保存失败/草稿箱未命中时，内容仍可能已由
+# 可见窗口里的人工操作发布；而 --force 又会跳过唯一的「已发布」幂等检查。
+# 因此头条不能用普通 --force 重投，必须按最保守口径拦截任意尝试记录。
+REPUBLISH_FORBIDDEN_PLATFORMS = (7,)
 
 
 # ---------------------------------------------------------------- 素材发现
@@ -294,9 +313,12 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
             gallery = [cover]
 
     inline_count = len(inline or [])
-    # 知乎、企鹅号上传器已支持按标记把图片精确插到母本指定位置；
+    # 知乎、企鹅号、大鱼号上传器已支持按标记把图片精确插到母本指定位置；
     # 其余平台仍沿用原正文（图片追加到末尾），避免把位置标记发到线上。
-    inline_marker_platforms = (9, 15)
+    inline_marker_platforms = (9, 14, 15)
+    # 专属母本只对部分平台存在；支持精确插图的平台即使回退到通用母本，
+    # 也必须保留 [[插图N]]，否则上传器会静默写出 0 张内文图的草稿。
+    long_body_with_markers = _body_with_inline_markers(long_raw, inline_count)
     long_body_by_platform: Dict[int, str] = {
         ptype: (
             _body_with_inline_markers(raw, inline_count)
@@ -306,6 +328,9 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
         for ptype, raw in platform_raw.items()
     }
     long_body = _extract_clean_body(long_raw)
+    # 让调用方按平台取正文时，回退值也带正确插图位置，避免误用无标记通用母本。
+    for ptype in inline_marker_platforms:
+        long_body_by_platform.setdefault(ptype, long_body_with_markers)
     short_body = _extract_clean_body(short_raw)
 
     return {
@@ -332,7 +357,8 @@ from scripts.compliance_check import compliance_check, ComplianceRuleError
 
 
 def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
-              account_list: List[str], *, dry_run: bool, is_draft: bool, tieba_kw: str = "") -> None:
+              account_list: List[str], *, dry_run: bool, is_draft: bool, tieba_kw: str = "",
+              patch_existing_dayu_draft: bool = False, toutiao_prepare_only: bool = False) -> None:
     """调用对应平台的 post_article_*。导入放在函数内，避免 CLI 启动即加载全部浏览器依赖。"""
     from myUtils.postVideo import (
         post_article_baijiahao,
@@ -340,6 +366,7 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
         post_article_qiehao,
         post_article_sohu,
         post_article_tieba,
+        post_article_toutiao,
         post_article_wangyi,
         post_article_wechat_mp,
         post_article_weibo,
@@ -362,20 +389,29 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     if platform_type == 5:
         return post_article_baijiahao(
             title, body, tags, account_list, ai_generated=True,
-            inline_image_paths=inline, **common,
+            inline_image_paths=inline, is_draft=is_draft, **common,
         )
     elif platform_type == 7:
-        # 2026-11-05 用户规则：头条禁止任何自动化写入，避免被判定营销号封禁。
-        # 主流程已在 _dispatch 之前改走 export_manual_package，这里只做兜底拦截，
-        # 防止将来有人绕过主流程直接把头条丢进来。
-        raise RuntimeError("头条已禁止自动化发布，请走待发内容包流程（MANUAL_PACKAGE_PLATFORMS）")
+        # 2026-11-09 实测：头条草稿链路已打通——不点「发布」，靠编辑器自动保存
+        # 请求（save=0）落进草稿箱，再回草稿箱按标题回读核验。
+        # 草稿模式下由人工复核后自行发布。
+        return post_article_toutiao(
+            title, body, tags, account_list,
+            work_statements=["引用AI"],
+            inline_image_paths=inline,
+            is_draft=is_draft,
+            prepare_only=toutiao_prepare_only,
+            **common,
+        )
     elif platform_type == 8:
-        # 搜狐号「信息来源」单选需声明含 AI 创作内容（当期母本元数据已标注）。
+        # 搜狐号发文页只有一个「必选声明」单选组，选项真实文案是「含有AI生成内容」。
+        # 传旧文案「包含AI创作内容」选不中，AI 声明会静默缺失。
         return post_article_sohu(
             title, body, tags, account_list,
             cover_paths=[cover] if cover else [],
             inline_image_paths=inline,
-            info_source="包含AI创作内容",
+            info_source="含有AI生成内容",
+            is_draft=is_draft,
             **common,
         )
     elif platform_type == 9:
@@ -405,7 +441,19 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     elif platform_type == 13:
         return post_article_wangyi(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     elif platform_type == 14:
-        return post_article_dayu(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
+        existing_draft_url = ""
+        if patch_existing_dayu_draft:
+            from uploader.dayu_uploader.main import find_draft_edit_url
+            existing_draft_url = find_draft_edit_url(
+                account_list, title, headless=True
+            )
+            if not existing_draft_url:
+                raise RuntimeError(f"大鱼号草稿箱未找到本期标题，无法修补既有草稿: {title}")
+        return post_article_dayu(
+            title, body, tags, account_list, is_draft=is_draft, file_list=inline,
+            existing_draft_url=existing_draft_url,
+            patch_existing_draft=patch_existing_dayu_draft, **common,
+        )
     elif platform_type == 15:
         return post_article_qiehao(title, body, tags, account_list, is_draft=is_draft, file_list=inline, **common)
     else:
@@ -424,14 +472,17 @@ def sync_published_draft(
     files: List[str],
     account_name: str,
     url: str,
+    status: str = "published",
+    note: str = "",
 ) -> None:
-    """把成功发布的一条记录同步到 publish_drafts，供 OmniPost 前端核对。
+    """把成功发布（或已存草稿）的一条记录同步到 publish_drafts，供 OmniPost 前端核对。
 
     按「期数备注 + 平台 + 标题」幂等；已有记录只更新状态、链接与文件，
     不重复插入。该表是前端发布记录视图，publish_history 才是审计主表。
     """
-    note = f"第{episode}期 {platform_name} 已真实发布：{url}"
     account = str(account_name or "默认账号")
+    default_note = f"第{episode}期 {platform_name} 已真实发布：{url}"
+    completion_note = note or default_note
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -444,14 +495,15 @@ def sync_published_draft(
         if row:
             cur.execute(
                 """UPDATE publish_drafts
-                   SET platform_name = ?, body = ?, status = 'published',
+                   SET platform_name = ?, body = ?, status = ?,
                        ai_generated = 1, dry_run = 0, completion_note = ?,
                        synced_platforms = ?, updated_at = datetime('now', 'localtime')
                    WHERE id = ?""",
                 (
                     platform_name,
                     body,
-                    note,
+                    status,
+                    completion_note,
                     json.dumps([platform_name], ensure_ascii=False),
                     row[0],
                 ),
@@ -463,7 +515,7 @@ def sync_published_draft(
                     files_json, account_ids_json, ai_generated, dry_run,
                     status, completion_note, synced_platforms, created_at, updated_at)
                    VALUES (?, ?, ?, 'article', ?, '', ?, ?, 1, 0,
-                           'published', ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))""",
+                           ?, ?, ?, datetime('now', 'localtime'), datetime('now', 'localtime'))""",
                 (
                     platform_title,
                     ptype,
@@ -471,7 +523,8 @@ def sync_published_draft(
                     body,
                     json.dumps(files, ensure_ascii=False),
                     json.dumps([account], ensure_ascii=False),
-                    note,
+                    status,
+                    completion_note,
                     json.dumps([platform_name], ensure_ascii=False),
                 ),
             )
@@ -569,6 +622,10 @@ def export_manual_package(
 def resolve_platforms(args, assets: Dict[str, Any]) -> List[int]:
     if args.platforms != "auto":
         requested = [int(x) for x in args.platforms.split(",") if x.strip()]
+        forbidden = [p for p in requested if p in MAINLINE_FORBIDDEN_PLATFORMS]
+        if forbidden:
+            reasons = "；".join(MAINLINE_FORBIDDEN_PLATFORMS[p] for p in forbidden)
+            raise SystemExit(f"❌ 主线平台硬拦截：{reasons}；请改用 publish_ai_share.py")
         return [p for p in requested if p not in preflight.BANNED_PLATFORMS]
 
     picked = preflight.pick_random_platforms(
@@ -599,12 +656,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--check-only", action="store_true",
         help="完全离线预检：只做素材发现与合规检查，不启动浏览器、不写数据库、不发布",
     )
-    parser.add_argument("--draft", action="store_true", help="保存为平台草稿")
+    parser.add_argument(
+        "--publish",
+        dest="draft",
+        action="store_false",
+        help="真实发布（默认只存草稿，不点「发布」）",
+    )
+    parser.add_argument(
+        "--draft",
+        dest="draft",
+        action="store_true",
+        help="只存草稿（默认行为，保留此参数仅为兼容旧调用）",
+    )
+    parser.set_defaults(draft=True)
     parser.add_argument("--verify-cookie", action="store_true", help="发布前真正开浏览器校验 cookie（慢）")
-    parser.add_argument("--force", action="store_true", help="忽略幂等检查，强制重新发布")
+    parser.add_argument("--force", action="store_true", help="忽略已发布幂等检查；对今日头条仍按任意尝试记录拦截")
+    parser.add_argument(
+        "--force-retry-failed", action="store_true",
+        help="仅今日头条：显式重试已失败且确认未发布的同篇内容；已发布记录仍硬拦截",
+    )
     parser.add_argument("--tieba-kw", default="", help="贴吧目标吧名（type=10 必填）")
+    parser.add_argument(
+        "--patch-existing-dayu-draft", action="store_true",
+        help="修补大鱼号本篇既有草稿：打开草稿编辑页补齐内文图/封面并保存，不新建重复草稿",
+    )
+    parser.add_argument(
+        "--toutiao-prepare-only", action="store_true",
+        help="今日头条安全代填：可见浏览器填好内容后由人工复核发布，自动化不点发布、不触发保存请求",
+    )
     parser.add_argument("--rule-check", action="store_true", help="仅校验合规规则是否可信，不加载素材/不发布")
     args = parser.parse_args(argv)
+
+    if args.toutiao_prepare_only and not args.draft:
+        print("❌ --toutiao-prepare-only 不能与 --publish 同时使用（代填模式绝不点发布）", file=sys.stderr)
+        return 2
+
+    if args.force_retry_failed and args.force:
+        print("❌ --force-retry-failed 不能与 --force 同时使用", file=sys.stderr)
+        return 2
 
     if args.rule_check:
         import compliance_check as rule_module
@@ -696,7 +785,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             results.append({"platform": pname, "type": ptype, "status": "skipped", "reason": check["reason"]})
             continue
 
-        if not args.force:
+        existing = None
+        if ptype in REPUBLISH_FORBIDDEN_PLATFORMS:
+            # 头条这类平台即使上次记 failed/draft，也可能已由人工在窗口里发布；
+            # 普通 --force 不再放行，必须显式 --force-retry-failed 才能重试失败。
+            existing = publish_record.find_any_attempt_record(DB_PATH, args.episode, ptype)
+            if existing:
+                status = str(existing.get("status") or "").strip()
+                if status == publish_record.STATUS_PUBLISHED:
+                    results.append({
+                        "platform": pname, "type": ptype, "status": "already_published",
+                        "url": existing.get("published_url"),
+                        "reason": "该期该平台已成功发布，禁止重复发布",
+                    })
+                    continue
+                if not args.force_retry_failed:
+                    results.append({
+                        "platform": pname, "type": ptype, "status": "already_attempted",
+                        "url": existing.get("published_url"),
+                        "reason": (
+                            f"该期该平台已有{status}记录（id={existing.get('id')}），"
+                            "可能已由人工发布；禁止重复。确需重试失败请用 --force-retry-failed"
+                        ),
+                    })
+                    continue
+        elif not args.force:
             existing = publish_record.find_published_record(DB_PATH, args.episode, ptype)
             if existing:
                 results.append({
@@ -756,8 +869,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             for w in warnings:
                 print(f"  ⚠️ {pname} 合规告警: {w}")
 
-        # 待发内容包平台只出包不发布，历史记录统一记 draft
+        # 草稿优先：默认只存草稿、绝不点发布。
+        # 例外平台走真实发布：
+        #   知乎(9)——专栏编辑器是纯前端自动存草稿，草稿只存在本地浏览器，
+        #            换浏览器/换 profile 就看不到，等于没存，只能直接发布；
+        #   微博(11)、百度贴吧(10)——平台本身没有真草稿入口，
+        #            草稿模式只能做到「填好但不发布」，无实质意义。
+        # 头条(7) 自 2026-11-09 起草稿链路已打通，走正常存草稿。
+        DIRECT_PUBLISH_PLATFORMS = (9, 11, 10)
         draft_only = bool(args.draft) or ptype in MANUAL_PACKAGE_PLATFORMS
+        if args.draft and ptype in DIRECT_PUBLISH_PLATFORMS:
+            draft_only = False
+            print(
+                f"  ℹ️ {pname} 不支持平台侧草稿（草稿仅存本地浏览器/无草稿入口），"
+                f"本次按真实发布执行"
+            )
 
         history_id = publish_record.create_record(
             DB_PATH,
@@ -814,6 +940,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 _dispatch(
                     ptype, assets, platform_title, body, account_file,
                     dry_run=args.dry_run, is_draft=draft_only, tieba_kw=args.tieba_kw,
+                    patch_existing_dayu_draft=args.patch_existing_dayu_draft,
+                    toutiao_prepare_only=args.toutiao_prepare_only,
                 ) or ""
             ).strip()
         except Exception as exc:  # noqa: BLE001
@@ -844,6 +972,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             results.append({"platform": pname, "type": ptype, "status": final_status})
             hint = "预览" if args.dry_run else "存草稿"
             print(f"  ✅ {pname} 已{hint}")
+            if draft_only and not args.dry_run:
+                # 草稿同样入前端记录视图：状态记 draft，备注写明「待人工发布」
+                try:
+                    draft_files = (
+                        [str(p) for p in sorted(Path(assets["image_dir"]).glob("*.png"))]
+                        if assets.get("image_dir") and Path(assets["image_dir"]).is_dir()
+                        else assets["gallery"]
+                    )
+                    sync_published_draft(
+                        args.episode, ptype, pname, platform_title, audit_body,
+                        draft_files, str(check.get("account") or ""), "",
+                        status="draft",
+                        note=(
+                            f"第{args.episode}期 {pname} 已保存为平台草稿"
+                            "（未点击发表），待人工到平台后台确认发布后再补链接"
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  ⚠️ {pname} 草稿记录同步失败（主记录已写入）: {exc}")
             continue
 
         url, item_id = collect_sync(ptype, cookie, platform_title, args.episode)
@@ -901,9 +1048,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     published = sum(1 for r in results if r["status"] == "published")
+    drafted = sum(1 for r in results if r["status"] == "draft")
     packaged = sum(1 for r in results if r["status"] == "manual_package")
-    print(f"\n📊 自动发布 {published} 个平台，待发内容包 {packaged} 个，明细已写入 {out}")
-    return 0 if (published or packaged or args.dry_run) else 1
+    print(
+        f"\n📊 自动发布 {published} 个平台，已存草稿 {drafted} 个平台，"
+        f"待发内容包 {packaged} 个，明细已写入 {out}"
+    )
+    return 0 if (published or drafted or packaged or args.dry_run) else 1
 
 
 def asyncio_run_preflight(platforms: List[int], verify_cookie: bool) -> List[Dict[str, Any]]:

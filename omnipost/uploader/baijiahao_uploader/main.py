@@ -659,6 +659,7 @@ class BaiJiaHaoArticle(object):
         cover_path=None,
         ai_generated=False,
         inline_image_paths=None,
+        is_draft=False,
     ):
         self.title = (title or "")[:64]
         self.body = body or ""
@@ -669,6 +670,10 @@ class BaiJiaHaoArticle(object):
         self.dry_run = bool(dry_run)
         self.cover_path = cover_path
         self.ai_generated = bool(ai_generated)
+        # is_draft：只点「存草稿」，绝不点「发布」。
+        # 百家号图文编辑器底栏有四个按钮：存草稿 / 预览 / 定时发布 / 发布，
+        # 「存草稿」落在平台服务端草稿箱，换浏览器、换设备都看得见。
+        self.is_draft = bool(is_draft)
         self.inline_image_paths = [
             str(Path(p).resolve()) for p in (inline_image_paths or [])
             if p and Path(p).is_file()
@@ -1958,6 +1963,13 @@ class BaiJiaHaoArticle(object):
             baijiahao_logger.warning(f"AI 创作声明勾选失败: {exc}")
 
     async def publish(self, page: Page) -> None:
+        # 草稿模式：只点「存草稿」，绝不点「发布」。
+        # 底栏四个按钮真实文案是 存草稿 / 预览 / 定时发布 / 发布，
+        # 「发布」是 primary 样式，必须用精确文本匹配避免误伤「定时发布」。
+        if self.is_draft:
+            await self.save_draft(page)
+            return
+
         # 定位真正的发布主按钮（排除“定时发布”）
         publish_button = page.locator("button.cheetah-btn-primary:has-text('发布')").first
         if not await publish_button.count():
@@ -2003,6 +2015,67 @@ class BaiJiaHaoArticle(object):
 
         if "edit" in (page.url or ""):
             raise RuntimeError("点击发布后未成功跳转到发布成功页，请检查百家号账号状态或内容合规要求")
+
+    async def save_draft(self, page: Page) -> None:
+        """只点「存草稿」，绝不点「发布」。
+
+        百家号图文编辑器底栏四个按钮的真实文案是
+        「存草稿 / 预览 / 定时发布 / 发布」，「存草稿」是 default 样式，
+        「发布」是 primary 样式——按样式找「发布」容易误命中，
+        这里一律用精确文本匹配「存草稿」。
+
+        点完必须回读：草稿箱里出现本期标题才算存成功。
+        """
+        draft_btn = page.locator("button:has-text('存草稿')").first
+        if not await draft_btn.count():
+            draft_btn = page.get_by_role("button", name="存草稿", exact=True).first
+        if not (await draft_btn.count() and await draft_btn.is_visible()):
+            raise RuntimeError("未定位到可见的「存草稿」按钮，禁止退化为直接发布")
+
+        await draft_btn.scroll_into_view_if_needed()
+        await draft_btn.click()
+        baijiahao_logger.info("已点击百家号「存草稿」按钮，等待平台响应...")
+        await page.wait_for_timeout(6000)
+
+        # 平台可能弹二次确认；有「确认」且可见时点掉
+        confirm = page.locator("button.bjh-btn-primary:has-text('确认')").first
+        try:
+            if await confirm.count() and await confirm.is_visible():
+                await confirm.click(force=True)
+                await page.wait_for_timeout(3000)
+        except Exception:
+            pass
+
+        shot = Path(self.account_file).with_name("baijiahao_article_draft_saved.png")
+        try:
+            await page.screenshot(full_page=True, path=str(shot))
+            baijiahao_logger.info(f"📸 百家号存草稿截图已保存: {shot}")
+        except Exception as exc:
+            baijiahao_logger.debug(f"存草稿截图保存失败: {exc}")
+
+        # 回读校验：内容管理页必须出现本期标题
+        if not await self._verify_draft_in_list(page):
+            raise RuntimeError(
+                "百家号草稿保存未通过核验：内容管理页未找到本期标题，"
+                "不得让调用方误判为已存草稿"
+            )
+        baijiahao_logger.success(f"✅ 百家号草稿核验通过：内容管理页已出现「{self.title}」")
+
+    async def _verify_draft_in_list(self, page: Page) -> bool:
+        """回内容管理页按标题核对草稿是否真的落库。"""
+        for url in (
+            "https://baijiahao.baidu.com/builder/rc/content",
+            "https://baijiahao.baidu.com/builder/rc/home",
+        ):
+            try:
+                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                body = await page.evaluate("() => document.body.innerText") or ""
+                if self.title and self.title in body:
+                    return True
+            except Exception as exc:
+                baijiahao_logger.debug(f"百家号草稿核验跳转 {url} 失败: {exc}")
+        return False
 
     async def _open_article_page(self, page: Page) -> None:
         opened = False
@@ -2097,8 +2170,13 @@ class BaiJiaHaoArticle(object):
         else:
             if self.publish_date != 0:
                 baijiahao_logger.warning("百家号图文定时发布暂未实现，将立即发布")
+            if self.is_draft:
+                baijiahao_logger.info("🛑 【存草稿模式】只点「存草稿」，不点「发布」")
             await self.publish(page)
-            baijiahao_logger.success("百家号文章发布流程完成")
+            if self.is_draft:
+                baijiahao_logger.success("百家号文章草稿保存流程完成（未点击发布）")
+            else:
+                baijiahao_logger.success("百家号文章发布流程完成")
 
         await context.storage_state(path=self.account_file)
         baijiahao_logger.info("cookie 更新完毕")

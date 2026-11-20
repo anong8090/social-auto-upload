@@ -241,8 +241,43 @@ class WangyiPost(object):
                 done_shot = Path(self.account_file).parent / "wangyi_article_done.png"
                 await page.screenshot(path=str(done_shot))
                 wangyi_logger.success(f"🎉 网易号操作完成！截图: {done_shot}")
+                if self.is_draft:
+                    # 存草稿必须回读核验：点了按钮不等于草稿真的落库
+                    if not await self._verify_draft_in_list(page):
+                        raise RuntimeError(
+                            "网易号草稿保存未通过核验：草稿箱未找到本期标题，"
+                            "不得让调用方误判为已存草稿"
+                        )
+                    wangyi_logger.success(f"✅ 网易号草稿核验通过：草稿箱已出现「{self.title}」")
             else:
                 wangyi_logger.warning("未定位到操作按钮")
 
         finally:
             await browser.close()
+
+    async def _verify_draft_in_list(self, page: Page) -> bool:
+        """回后台草稿箱按标题核对草稿是否真的落库。
+
+        点了「存草稿」不等于草稿保存成功——页面可能弹校验失败、
+        可能拦在必填项上。只截图就宣称成功会误导调用方。
+        """
+        # 网易号草稿箱入口是后台左侧菜单，页面路径随版本变化，
+        # 这里优先走菜单点击，失败再退回首页找链接。
+        try:
+            await page.goto(WANGYI_HOME_URL, timeout=90000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(5000)
+            for sel in ('text=草稿箱', 'a[href*="draft"]', 'a:has-text("草稿")'):
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() and await loc.is_visible():
+                        await loc.click()
+                        await page.wait_for_timeout(5000)
+                        break
+                except Exception:
+                    continue
+            body = await page.evaluate("() => document.body.innerText") or ""
+            if self.title and self.title in body:
+                return True
+        except Exception as exc:
+            wangyi_logger.warning(f"网易号草稿核验失败: {exc}")
+        return False

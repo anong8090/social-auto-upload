@@ -211,7 +211,7 @@ def post_video_xhs(title,files,tags,account_file,category=TencentZoneTypes.LIFES
             asyncio.run(app.main(), debug=False)
 
 
-def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, ai_generated=False, is_draft=False):
+def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, ai_generated=False, is_draft=False, cdp_endpoint="", keep_window_open=False):
     account_file = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     image_paths = []
     for file in files:
@@ -244,6 +244,8 @@ def post_note_xhs(title, files, note, tags, account_file, enableTimer=False, vid
             dry_run=dry_run,
             ai_generated=ai_generated,
             is_draft=is_draft,
+            cdp_endpoint=cdp_endpoint,
+            keep_window_open=keep_window_open,
         )
         app = XiaoHongShuNote(**kwargs)
         asyncio.run(app.main(), debug=False)
@@ -309,12 +311,16 @@ def post_article_toutiao(
     cover_path="",
     work_statements=None,
     inline_image_paths=None,
+    is_draft=False,
+    prepare_only=False,
 ):
     """今日头条图文文章发布（contentType=article）。
 
     cover_path: 前端 /upload 返回的文件名（位于 videoFile/），或绝对/相对路径。
     单张封面最大 20MB，建议 JPEG/PNG。
     work_statements: 作品声明（单选）。可传字符串，或仅含一项的列表，如 "引用AI" / ["引用AI"]。
+    is_draft: 是否只存为头条草稿（True 时不点「发布」，靠编辑器自动保存请求
+        （save=0）落进头条草稿箱，由人工复核后自行发布）。
     """
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = None
@@ -367,6 +373,8 @@ def post_article_toutiao(
             cover_path=cover,
             work_statements=work_statements,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
+            prepare_only=prepare_only,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
@@ -386,6 +394,7 @@ def post_article_baijiahao(
     cover_path="",
     ai_generated=False,
     inline_image_paths=None,
+    is_draft=False,
 ):
     """百家号图文文章发布（contentType=article）。
 
@@ -401,6 +410,7 @@ def post_article_baijiahao(
         dry_run: 是否仅预览不发布
         cover_path: 封面图片路径（百家号图文必填）
         ai_generated: 是否勾选「采用AI生成内容」
+        is_draft: 是否只存草稿（只点「存草稿」，绝不点「发布」）
     """
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = None
@@ -453,6 +463,7 @@ def post_article_baijiahao(
             cover_path=cover,
             ai_generated=ai_generated,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
         )
         # 百家号图文因百度安全验证机制，使用可见窗口执行以便通过验证
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
@@ -475,6 +486,7 @@ def post_article_sohu(
     info_source=None,
     cover_paths=None,
     inline_image_paths=None,
+    is_draft=False,
 ):
     """搜狐号图文文章发布（type=8, contentType=article）。
 
@@ -551,6 +563,7 @@ def post_article_sohu(
             cover_paths=resolved_covers,
             info_source=info_source,
             inline_image_paths=inline_image_paths,
+            is_draft=is_draft,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False
@@ -887,9 +900,19 @@ def post_article_weibo(title, body, tags, account_file, enableTimer=False, video
     return results[0] if results else ""
 
 
-def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None):
+def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None, existing_draft_title=""):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
+    # 后台旧调用可能只给了封面、没给 file_list；公众号保存前图文闸门要求正文图。
+    # file_list 里的图片名也需按 videoFile 目录解析成绝对路径，再把已解析封面
+    # 补作正文图来源，绝不放行「无图草稿」。
+    effective_inline = []
+    for item in file_list or []:
+        resolved = _resolve_cover_helper(item)
+        if resolved and resolved not in effective_inline:
+            effective_inline.append(resolved)
+    if cover and cover not in effective_inline:
+        effective_inline.insert(0, cover)
     publish_date = 0
     if enableTimer:
         publish_datetimes = generate_schedule_time_next_day(1, videos_per_day, daily_times, start_days)
@@ -906,10 +929,11 @@ def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, v
             dry_run=dry_run,
             cover_path=cover,
             is_draft=is_draft,
-            file_list=file_list,
+            file_list=effective_inline,
+            existing_draft_title=existing_draft_title,
         )
-        if dry_run:
-            app.headless = False
+        # 公众号上传器内部已强制无头（系统 Chrome + 二维码截图落盘），
+        # 这里不能再把 headless 改回 False，否则会弹出可见浏览器。
         asyncio.run(app.main(), debug=False)
         print("✅ 微信公众号发布流程结束", flush=True)
 
@@ -941,7 +965,7 @@ def post_article_wangyi(title, body, tags, account_file, enableTimer=False, vide
         print("✅ 网易号发布流程结束", flush=True)
 
 
-def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None):
+def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=False, file_list=None, existing_draft_url="", patch_existing_draft=False, prepare_only=False):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
     publish_date = 0
@@ -961,6 +985,9 @@ def post_article_dayu(title, body, tags, account_file, enableTimer=False, videos
             cover_path=cover,
             is_draft=is_draft,
             file_list=file_list,
+            existing_draft_url=existing_draft_url,
+            patch_existing_draft=patch_existing_draft,
+            prepare_only=prepare_only,
         )
         if dry_run:
             app.headless = False

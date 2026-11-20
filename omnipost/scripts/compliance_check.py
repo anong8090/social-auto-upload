@@ -128,7 +128,11 @@ SHORT_FORM_PLATFORMS = (10, 11)
 
 # 要求正文穿插 2 张 16:9 内文图的长文平台（不含微信公众号 12，它走图文混排）。
 # 企鹅号 15 的封面/内文图同样是发布前硬性条件，不能因旧版上传器是弱 stub 而漏检。
-INLINE_IMAGE_PLATFORMS = (5, 7, 8, 9, 13, 14, 15)
+INLINE_IMAGE_PLATFORMS = (5, 8, 9, 13, 14, 15)
+
+# 头条（7）例外：正文同一时刻只保留**一个**图片块，插第二张会替换第一张
+# （平台限制，实测编辑器 DOM 只有一份 .pgc-img）。所以它只要求 1 张内文图。
+SINGLE_INLINE_IMAGE_PLATFORMS = (7,)
 
 
 # ============================================================ 辅助函数
@@ -273,7 +277,13 @@ def compliance_check(
         problems.append("该平台要求 16:9 封面，但未找到 01_16x9 头图")
 
     # 6) 内文图要求
-    if platform_type in INLINE_IMAGE_PLATFORMS and inline_count < 2:
+    if platform_type in SINGLE_INLINE_IMAGE_PLATFORMS:
+        # 头条正文只放得下一个图片块（插第二张会替换第一张）
+        if inline_count < 1:
+            problems.append(
+                f"该平台要求正文穿插 16:9 内文图（正文仅支持 1 个图片块），当前仅 {inline_count} 张"
+            )
+    elif platform_type in INLINE_IMAGE_PLATFORMS and inline_count < 2:
         problems.append(f"该平台要求正文穿插 2 张 16:9 内文图，当前仅 {inline_count} 张")
 
     return {

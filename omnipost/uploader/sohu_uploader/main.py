@@ -45,14 +45,22 @@ TITLE_INPUT_SELECTOR = (
     'input[name="title"], .publish-title input, input[class*="title"]'
 )
 
-# 搜狐号发文页「信息来源」单选选项
+# 搜狐号发文页「必选声明」单选选项的真实文案。
+# 页面只有一个单选组（div.el-radio-group.info-radio），选项文案是
+#   无需声明 / 含有虚构演绎内容 / 含有AI生成内容 / 含有营销信息 / 内容为转载 / 内容为个人观点
+# 旧代码里写的「无特别声明」「包含AI创作内容」「包含虚构创作」在页面上并不存在，
+# 导致 AI 声明永远选不中（实测报「未能选择信息来源」）。
 SOHU_INFO_SOURCE_OPTIONS = (
-    "无特别声明",
-    "引用声明",
-    "包含AI创作内容",
-    "包含虚构创作",
+    "无需声明",
+    "含有虚构演绎内容",
+    "含有AI生成内容",
+    "含有营销信息",
+    "内容为转载",
+    "内容为个人观点",
 )
-SOHU_INFO_SOURCE_DEFAULT = "无特别声明"
+SOHU_INFO_SOURCE_DEFAULT = "无需声明"
+# AI 声明对应的选项，供「必须勾上 AI 声明」的场景直接引用
+SOHU_INFO_SOURCE_AI = "含有AI生成内容"
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
@@ -199,6 +207,7 @@ class SoHuArticle(object):
         cover_paths=None,
         info_source=None,
         inline_image_paths=None,
+        is_draft=False,
     ):
         self.title = (title or "").strip()[:72]
         if len(self.title) < 5:
@@ -213,6 +222,10 @@ class SoHuArticle(object):
         self.cover_path = self.cover_paths[0] if self.cover_paths else None
         self.info_source = self._normalize_info_source(info_source)
         self.published_url = ""
+        # is_draft：只点「存草稿」，绝不点「发布」。
+        # 搜狐号发文页底栏四个按钮的真实文案是 发布 / 定时发布 / 存草稿 / 预览，
+        # 「存草稿」落在平台服务端草稿箱，换浏览器、换设备都看得见。
+        self.is_draft = bool(is_draft)
         self.inline_image_paths = [
             str(Path(p).resolve()) for p in (inline_image_paths or [])
             if p and Path(p).is_file()
@@ -256,15 +269,23 @@ class SoHuArticle(object):
             return SOHU_INFO_SOURCE_DEFAULT
 
         aliases = {
-            "无": "无特别声明",
-            "无特别": "无特别声明",
+            "无": "无需声明",
+            "无特别": "无需声明",
+            "无特别声明": "无需声明",
             "引用": "引用声明",
-            "ai": "包含AI创作内容",
-            "AI": "包含AI创作内容",
-            "包含ai": "包含AI创作内容",
-            "包含AI": "包含AI创作内容",
-            "虚构": "包含虚构创作",
-            "虚构创作": "包含虚构创作",
+            "ai": SOHU_INFO_SOURCE_AI,
+            "AI": SOHU_INFO_SOURCE_AI,
+            "包含ai": SOHU_INFO_SOURCE_AI,
+            "包含AI": SOHU_INFO_SOURCE_AI,
+            "包含AI创作内容": SOHU_INFO_SOURCE_AI,
+            "含有AI生成内容": SOHU_INFO_SOURCE_AI,
+            "ai生成": SOHU_INFO_SOURCE_AI,
+            "虚构": "含有虚构演绎内容",
+            "虚构创作": "含有虚构演绎内容",
+            "包含虚构创作": "含有虚构演绎内容",
+            "营销": "含有营销信息",
+            "转载": "内容为转载",
+            "观点": "内容为个人观点",
         }
         text = aliases.get(raw, aliases.get(raw.lower(), raw))
         if text in SOHU_INFO_SOURCE_OPTIONS:
@@ -402,20 +423,35 @@ class SoHuArticle(object):
         sohu_logger.info(f"已填写正文，长度={len(body_text)}")
 
     async def _apply_ai_statement(self, page: Page) -> None:
-        """勾选创作声明「含有AI生成内容」。"""
+        """勾选必选声明里的「含有AI生成内容」。
+
+        注意：页面只有**一个**必选声明单选组（div.info-radio），
+        「信息来源」与「创作声明」在搜狐号发文页是同一个控件。
+        这里保留为 apply_info_source 的兜底：当 info_source 不是 AI 选项时，
+        仍要确保 AI 声明被勾上，避免带病发布。
+        """
+        if self.info_source == SOHU_INFO_SOURCE_AI:
+            return  # apply_info_source 已经处理
         try:
-            ai_radio = page.locator(
-                'label.el-radio:has-text("含有AI生成内容"), '
-                'span.el-radio__label:has-text("含有AI生成内容")'
+            group = page.locator("div.el-radio-group.info-radio").first
+            scoped = group if await group.count() else page
+            option = scoped.locator(
+                f'label.info-radio-label:has-text("{SOHU_INFO_SOURCE_AI}")'
             ).first
-            if await ai_radio.count() and await ai_radio.is_visible():
-                await ai_radio.scroll_into_view_if_needed(timeout=5000)
-                await ai_radio.click(force=True, timeout=5000)
-                sohu_logger.success("已勾选创作声明: 含有AI生成内容")
+            if await option.count() and await option.is_visible():
+                radio = option.locator('input[type="radio"]').first
+                if await radio.count():
+                    await radio.check(force=True, timeout=5000)
+                else:
+                    await option.click(force=True, timeout=5000)
+                await page.wait_for_timeout(800)
+                sohu_logger.success(f"已勾选必选声明: {SOHU_INFO_SOURCE_AI}")
             else:
-                sohu_logger.warning("未找到创作声明「含有AI生成内容」，请 dry_run 人工确认")
+                sohu_logger.warning(
+                    f"未找到必选声明「{SOHU_INFO_SOURCE_AI}」，请人工确认"
+                )
         except Exception as exc:
-            sohu_logger.warning(f"勾选创作声明失败: {exc}")
+            sohu_logger.warning(f"勾选必选声明失败: {exc}")
 
     async def _editor_image_count(self, page: Page) -> int:
         try:
@@ -786,65 +822,71 @@ class SoHuArticle(object):
         return None
 
     async def apply_info_source(self, page: Page) -> None:
-        """选择发文页「信息来源」单选项。"""
+        """选择发文页「必选声明」单选项。
+
+        页面真实结构：标题是「必选声明」，单选组是 `div.el-radio-group.info-radio`，
+        选项标签是 `label.el-radio.info-radio-label`，内部 `span.el-radio__label` 是文案，
+        `input[type=radio]` 是真正的输入框。
+        旧实现按「信息来源」这个不存在的标题定位，必然落空。
+        """
         label = self.info_source or SOHU_INFO_SOURCE_DEFAULT
-        sohu_logger.info(f"设置信息来源: {label}")
+        sohu_logger.info(f"设置必选声明: {label}")
         try:
-            try:
-                section = page.get_by_text("信息来源", exact=False).first
-                if await section.count():
-                    await section.scroll_into_view_if_needed(timeout=3000)
-            except Exception:
-                await page.evaluate(
-                    "window.scrollTo(0, Math.max(document.body.scrollHeight * 0.5, 700))"
-                )
-            await page.wait_for_timeout(300)
+            # 1) 精确定位单选组里的对应选项
+            group = page.locator("div.el-radio-group.info-radio").first
+            scoped = group if await group.count() else page
 
-            # 优先在「信息来源」附近查找选项，避免误点其它区域
-            scopes = []
-            for sel in (
-                'div:has-text("信息来源"):has-text("无特别声明")',
-                'div:has-text("信息来源"):has-text("引用声明")',
-                'section:has-text("信息来源")',
-                'div:has-text("信息来源")',
-            ):
-                try:
-                    loc = page.locator(sel)
-                    count = await loc.count()
-                    best = None
-                    best_h = 10**9
-                    for i in range(min(count, 8)):
-                        item = loc.nth(i)
-                        box = await item.bounding_box()
-                        if not box:
-                            continue
-                        h = box.get("height") or 0
-                        w = box.get("width") or 0
-                        if 20 < h < 200 and w > 200 and h < best_h:
-                            best = item
-                            best_h = h
-                    if best is not None:
-                        scopes.append(best)
-                        break
-                except Exception:
-                    continue
-            scopes.append(page)
+            option = scoped.locator(
+                f'label.info-radio-label:has-text("{label}"), '
+                f'label.el-radio:has-text("{label}")'
+            ).first
+            if await option.count() and await option.is_visible():
+                radio = option.locator('input[type="radio"]').first
+                if await radio.count():
+                    if await radio.is_checked():
+                        sohu_logger.info(f"必选声明已是「{label}」")
+                        return
+                    await radio.check(force=True, timeout=5000)
+                else:
+                    await option.click(force=True, timeout=5000)
+                await page.wait_for_timeout(800)
+                # 回读确认真的选中了
+                checked = await scoped.locator(
+                    f'label.info-radio-label:has-text("{label}") input[type="radio"]'
+                ).first.is_checked()
+                if not checked:
+                    raise RuntimeError(f"必选声明「{label}」点击后未选中")
+                sohu_logger.success(f"已设置必选声明: {label}")
+                return
 
-            candidates = []
-            for scope in scopes:
-                try:
-                    candidates.extend(
-                        [
-                            scope.get_by_label(label, exact=True),
-                            scope.locator(f'label:has-text("{label}")'),
-                            scope.get_by_text(label, exact=True),
-                            scope.locator(f'span:has-text("{label}")'),
-                            scope.locator(f'div:has-text("{label}")'),
-                            scope.locator(f'label:has-text("{label}") input[type="radio"]'),
-                        ]
-                    )
-                except Exception:
-                    continue
+            # 2) 兜底：JS 精确匹配自身文本的 label
+            acted = await page.evaluate(
+                """(label) => {
+                    const nodes = Array.from(document.querySelectorAll(
+                        'label.el-radio.info-radio-label, label.el-radio'
+                    ));
+                    const hit = nodes.find(el => {
+                        const t = (el.innerText || el.textContent || '').trim();
+                        if (t !== label) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 10 && r.height > 10;
+                    });
+                    if (!hit) return false;
+                    const radio = hit.querySelector('input[type="radio"]');
+                    if (radio) { radio.click(); return true; }
+                    hit.click();
+                    return true;
+                }""",
+                label,
+            )
+            if acted:
+                await page.wait_for_timeout(800)
+                sohu_logger.success(f"已设置必选声明: {label}")
+                return
+
+            sohu_logger.warning(f"未能选择必选声明「{label}」，请人工确认")
+        except Exception as exc:
+            sohu_logger.warning(f"设置必选声明失败（可忽略）: {exc}")
 
             for loc in candidates:
                 try:
@@ -967,6 +1009,11 @@ class SoHuArticle(object):
             sohu_logger.warning(f"设置定时发布失败，将按立即发布处理: {exc}")
 
     async def publish(self, page: Page) -> None:
+        # 草稿模式：只点「存草稿」，绝不点「发布」。
+        if self.is_draft:
+            await self.save_draft(page)
+            return
+
         if self.publish_date != 0 and isinstance(self.publish_date, datetime):
             await self.set_schedule_time(page, self.publish_date)
 
@@ -1055,6 +1102,113 @@ class SoHuArticle(object):
             )
             raise RuntimeError(f"点击发布后仍停留在发文页，疑似未发出：{hints}")
         sohu_logger.success(f"已点击文章发布并离开发文页: {page.url}")
+
+    async def save_draft(self, page: Page) -> None:
+        """只点「存草稿」，绝不点「发布」。
+
+        搜狐号发文页底栏四个按钮的真实文案是 发布 / 定时发布 / 存草稿 / 预览，
+        元素是 `li.publish-report-btn`。必须精确匹配「存草稿」，
+        否则 `:has-text("发布")` 会误命中「定时发布」。
+
+        点完回内容管理页按标题核对，确认草稿真的落库。
+        """
+        await _dismiss_overlays(page)
+
+        clicked = False
+        candidates = [
+            page.locator('li.publish-report-btn:has-text("存草稿")').first,
+            page.locator('button:has-text("存草稿")').first,
+            page.get_by_role("button", name="存草稿", exact=True).first,
+        ]
+        for btn in candidates:
+            try:
+                if await btn.count() and await btn.is_visible():
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click(force=True, timeout=15000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # 兜底：用 JS 精确匹配自身文本为「存草稿」的元素
+            clicked = await page.evaluate(
+                """() => {
+                    const nodes = Array.from(document.querySelectorAll(
+                        'li, p, button, a, span, div, [role="button"]'
+                    ));
+                    const match = nodes.find(el => {
+                        const own = Array.from(el.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => (n.textContent || '').trim())
+                            .join('');
+                        const t = own || (el.innerText || el.textContent || '').trim();
+                        if (t !== '存草稿') return false;
+                        const r = el.getBoundingClientRect();
+                        const s = getComputedStyle(el);
+                        return r.width > 10 && r.height > 10
+                            && s.display !== 'none' && s.visibility !== 'hidden';
+                    });
+                    if (!match) return false;
+                    match.click();
+                    return true;
+                }"""
+            )
+        if not clicked:
+            raise RuntimeError("未找到可点击的「存草稿」按钮，禁止退化为直接发布")
+
+        sohu_logger.info("已点击搜狐「存草稿」按钮，等待平台响应…")
+        await page.wait_for_timeout(5000)
+
+        # 平台可能弹二次确认
+        for _ in range(4):
+            acted = await page.evaluate(
+                """() => {
+                    const texts = ['确定', '确认', '保存'];
+                    const nodes = Array.from(document.querySelectorAll(
+                        'button, p.positive-button, .positive-button, [role="button"]'
+                    ));
+                    const hit = nodes.find(el =>
+                        texts.includes((el.innerText || el.textContent || '').trim())
+                        && el.offsetParent !== null
+                    );
+                    if (!hit) return '';
+                    hit.click();
+                    return (hit.innerText || hit.textContent || '').trim();
+                }"""
+            )
+            if acted:
+                sohu_logger.info(f"已点击搜狐存草稿确认: {acted}")
+                await page.wait_for_timeout(2000)
+            else:
+                break
+
+        shot = Path(self.account_file).with_name("sohu_article_draft_saved.png")
+        try:
+            await page.screenshot(full_page=True, path=str(shot))
+            sohu_logger.info(f"📸 搜狐存草稿截图已保存: {shot}")
+        except Exception as exc:
+            sohu_logger.debug(f"存草稿截图保存失败: {exc}")
+
+        if not await self._verify_draft_in_list(page):
+            raise RuntimeError(
+                "搜狐号草稿保存未通过核验：内容管理页未找到本期标题，"
+                "不得让调用方误判为已存草稿"
+            )
+        sohu_logger.success(f"✅ 搜狐号草稿核验通过：内容管理页已出现「{self.title}」")
+
+    async def _verify_draft_in_list(self, page: Page) -> bool:
+        """回内容管理页按标题核对草稿是否真的落库。"""
+        for url in (SOHU_CONTENT_LIST_URL, SOHU_FIRST_PAGE_URL):
+            try:
+                await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(6000)
+                body = await page.evaluate("() => document.body.innerText") or ""
+                if self.title and self.title in body:
+                    return True
+            except Exception as exc:
+                sohu_logger.debug(f"搜狐草稿核验跳转 {url} 失败: {exc}")
+        return False
 
     async def verify_publish_result(self, page: Page, title: str) -> str:
         """回后台核对审核状态，返回公开链接；审核未通过则抛出真实原因。
@@ -1405,8 +1559,8 @@ class SoHuArticle(object):
         if not (self.body or "").strip() and not self.tags:
             raise ValueError("文章正文不能为空")
 
-        # 搜狐发文页常出滑块验证，强制有头方便人工处理
-        launch_kwargs = _build_launch_kwargs(False)
+        # 遵循全局无头要求；如需人工处理滑块验证，由调用方显式设置 headless=False。
+        launch_kwargs = _build_launch_kwargs(self.headless)
         browser = await playwright.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             storage_state=f"{self.account_file}",
@@ -1447,11 +1601,16 @@ class SoHuArticle(object):
                 await asyncio.sleep(1)
             sohu_logger.info("🛑 预览结束，关闭浏览器（未点击发布）")
         else:
-            await self.publish(page)
-            await page.wait_for_timeout(3000)
-            sohu_logger.success("文章发布流程完成")
-            # 回后台核对审核状态：审核未通过时没有公开页面，必须据实失败
-            self.published_url = await self.verify_publish_result(page, self.title)
+            if self.is_draft:
+                sohu_logger.info("🛑 【存草稿模式】只点「存草稿」，不点「发布」")
+                await self.publish(page)
+                sohu_logger.success("搜狐文章草稿保存流程完成（未点击发布）")
+            else:
+                await self.publish(page)
+                await page.wait_for_timeout(3000)
+                sohu_logger.success("文章发布流程完成")
+                # 回后台核对审核状态：审核未通过时没有公开页面，必须据实失败
+                self.published_url = await self.verify_publish_result(page, self.title)
 
         await context.storage_state(path=self.account_file)
         sohu_logger.info("cookie 更新完毕")

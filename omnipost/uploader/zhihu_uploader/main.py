@@ -500,9 +500,26 @@ class ZhiHuArticle(object):
         except Exception:
             return 0
 
-    async def _insert_one_image(self, page: Page, path: Path, expected_count: int) -> None:
-        """在已选中的插图位置替换一张 16:9 内文图，并校验图片增量。"""
-        before = await self._editor_image_count(page)
+    @staticmethod
+    async def _modal_upload_state(page: Page) -> tuple[str, int, int]:
+        state = await page.evaluate(
+            """() => {
+                const modal = Array.from(document.querySelectorAll('.Modal-content'))
+                    .find(m => !!(m.offsetWidth || m.offsetHeight || m.getClientRects().length));
+                if (!modal) return ['', 0, 0];
+                return [
+                    (modal.innerText || '').replace(/\\s/g, ''),
+                    modal.querySelectorAll('.DraggableTags-tag').length,
+                    modal.querySelectorAll('.DraggableTags-tag .CircleLoadingBar').length,
+                ];
+            }"""
+        )
+        return str(state[0] or ""), int(state[1] or 0), int(state[2] or 0)
+
+    async def _upload_and_insert_one_image(
+        self, page: Page, path: Path, *, expected_count: int
+    ) -> None:
+        """打开图片弹窗、上传单张图、选中卡片并插入正文。"""
         btn = page.locator(
             'button[aria-label*="图片"], '
             '.Editable-toolbar button:has-text("图片"), '
@@ -513,9 +530,9 @@ class ZhiHuArticle(object):
         await btn.click(force=True, timeout=5000)
         await page.wait_for_timeout(1000)
 
+        # 新版知乎把上传 input 拆成「隐藏文档输入 + 弹窗内本地图片输入」，
+        # 必须限定在可见弹窗中，避免把文件塞给编辑器顶部的文档导入 input。
         file_input = page.locator('.Modal-content input[type="file"]').last
-        if not await file_input.count():
-            file_input = page.locator('input[type="file"][accept*="image"]').last
         if not await file_input.count():
             raise RuntimeError("知乎图片弹窗无文件输入")
         await file_input.set_input_files(str(path))
@@ -524,31 +541,28 @@ class ZhiHuArticle(object):
         uploaded = False
         for _ in range(30):
             await page.wait_for_timeout(1000)
-            state = await page.evaluate(
-                """() => {
-                    const modal = document.querySelector('.Modal-content');
-                    if (!modal) return ['', 0, 0];
-                    return [
-                        (modal.innerText || '').replace(/\\s/g, ''),
-                        modal.querySelectorAll('.DraggableTags-tag').length,
-                        modal.querySelectorAll('.DraggableTags-tag .CircleLoadingBar').length,
-                    ];
-                }"""
-            )
-            last_text = str(state[0] or "")
+            last_text, tags, loading = await self._modal_upload_state(page)
+            # 结构判据优先：已出现卡片且加载动画消失；文案兼容新旧版。
             if (
-                "已上传1张" in last_text
-                and int(state[1] or 0) >= 1
-                and int(state[2] or 0) == 0
+                tags >= 1
+                and loading == 0
+                and re.search(r"已上传\d+张", last_text)
                 and "上传失败" not in last_text
                 and "批量重新上传" not in last_text
             ):
                 uploaded = True
                 break
+            if "上传失败" in last_text or "批量重新上传" in last_text:
+                break
         if not uploaded:
-            raise RuntimeError(f"知乎内文图上传失败: {path.name}，弹窗文本: {last_text[-160:]}")
+            # 知乎偶发把请求卡在上传中，关闭弹窗重试同一张图，不降低配图标准。
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(800)
+            raise RuntimeError(
+                f"知乎内文图上传未完成: {path.name}，弹窗文本: {last_text[-160:]}"
+            )
 
-        card = page.locator('.Modal-content .DraggableTags-tag').first
+        card = page.locator('.Modal-content .DraggableTags-tag').last
         if not await card.count():
             raise RuntimeError(f"知乎图片弹窗无已上传卡片: {path.name}")
         # 关键：新版知乎必须先选中卡片，直接点「插入图片」只会关闭弹窗。
@@ -563,7 +577,7 @@ class ZhiHuArticle(object):
             raise RuntimeError("未找到「插入图片」按钮")
         await insert_btn.click(force=True)
 
-        after = before
+        after = 0
         for _ in range(20):
             await page.wait_for_timeout(500)
             after = await self._editor_image_count(page)
@@ -571,8 +585,29 @@ class ZhiHuArticle(object):
                 break
         if after < expected_count:
             raise RuntimeError(
-                f"内文图 {path.name} 未进入正文，编辑器图片数 {before}→{after}，已中止发布"
+                f"内文图 {path.name} 未进入正文，编辑器图片数 {after}/{expected_count}，已中止发布"
             )
+
+    async def _insert_one_image(self, page: Page, path: Path, expected_count: int) -> None:
+        """在已选中的插图位置替换一张 16:9 内文图，并校验图片增量。"""
+        # 知乎上传服务偶发把第二张图卡在加载动画里；重试整个弹窗上传动作，
+        # 直到该图真正进入编辑器，避免把缺图文章发布出去。
+        last_error = ""
+        for attempt in range(3):
+            try:
+                await self._upload_and_insert_one_image(
+                    page, path, expected_count=expected_count
+                )
+                return
+            except RuntimeError as exc:
+                last_error = str(exc)
+                if not last_error.startswith("知乎内文图上传未完成"):
+                    raise
+                zhihu_logger.warning(
+                    f"知乎内文图第 {attempt + 1} 次上传未完成，准备重试: {path.name}"
+                )
+                await page.wait_for_timeout(1200)
+        raise RuntimeError(f"知乎内文图上传重试 3 次仍失败: {path.name}: {last_error}")
 
     async def _insert_inline_images(self, page: Page) -> None:
         """按母本中的 `[[插图N]]` 精确替换内文图。

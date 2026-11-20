@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -427,6 +428,8 @@ class TouTiaoArticle(object):
         cover_path=None,
         work_statements=None,
         inline_image_paths=None,
+        is_draft=False,
+        prepare_only=False,
     ):
         self.title = (title or "")[:30]
         self.body = body or ""
@@ -434,8 +437,14 @@ class TouTiaoArticle(object):
         self.publish_date = publish_date
         self.account_file = account_file
         self.local_executable_path = LOCAL_CHROME_PATH
+        self.prepare_only = bool(prepare_only)
         self.headless = LOCAL_CHROME_HEADLESS if not dry_run else False
+        if self.prepare_only:
+            self.headless = False
         self.dry_run = bool(dry_run)
+        # is_draft：只存为头条草稿，绝不点「发布」。
+        # 头条没有草稿按钮，但不发发布请求时，其自动保存（save=0）会存进草稿箱。
+        self.is_draft = bool(is_draft)
         self.cover_path = cover_path
         self.inline_image_paths = [Path(p) for p in (inline_image_paths or []) if p]
         self.work_statements = self._normalize_work_statements(work_statements)
@@ -1310,83 +1319,134 @@ class TouTiaoArticle(object):
         await self.insert_topics_in_body(page, editor)
 
     async def _insert_inline_images(self, page: Page) -> None:
-        """在正文末尾上传 2 张 16:9 内文图；少于预期则中止发布。"""
+        """在正文中插入 16:9 内文图；少于预期则中止发布。
+
+        ⚠️ 头条图文编辑器的**正文同一时刻只保留一个图片块**（平台限制）：
+        插第二张时会把第一张的图块**整个替换掉**，不是追加。实测编辑器结构：
+
+            <div class="pgc-img"><img …></div>   ← 真正的图片
+            <div class="img-loading-container"><img …></div>  ← 同一张图的加载副本
+
+        所以：
+          1. 这里只插入**第一张**内文图，多余的图会被平台丢掉；
+          2. 计数必须按「图片块」（.pgc-img）算，不能数 <img> 元素——
+             一个图块会被数成 2，且新图会顶掉旧图导致计数不变。
+
+        另：图片插入后编辑器会重建 DOM，旧的 editor 引用会失效，
+        每次都要重新定位（_find_editor）。
+        """
         paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
         if not paths:
             return
 
+        # 头条正文只放得下一张图，多插会被平台替换掉
+        if len(paths) > 1:
+            toutiao_logger.warning(
+                f"头条正文图片块上限为 1 张（平台限制：插第二张会替换第一张），"
+                f"本次只插入第一张：{paths[0].name}"
+            )
+            paths = paths[:1]
+
         inserted = 0
         for idx, img in enumerate(paths, 1):
-            try:
-                _frame, editor = await self._find_editor(page)
-                if not editor:
-                    raise RuntimeError("未找到正文编辑器")
+            ok = False
+            last_err = ""
+            for attempt in range(1, 3):
                 try:
-                    before = await editor.locator("img").count()
-                except Exception:
-                    before = 0
-                await editor.click(force=True)
-                await page.keyboard.press("ControlOrMeta+End")
-                await page.wait_for_timeout(300)
+                    # 清掉可能残留的图片/素材弹窗
+                    for _ in range(2):
+                        await page.keyboard.press("Escape")
+                        await page.wait_for_timeout(300)
 
-                btn = page.locator(
-                    ".syl-toolbar-tool.image button, .syl-toolbar-tool.image"
-                ).first
-                if not await btn.count():
-                    btn = page.locator('[class*="toolbar"] [class*="image"]').first
-                await btn.click(force=True, timeout=5000)
-                await page.wait_for_timeout(800)
-
-                uploaded = False
-                try:
-                    async with page.expect_file_chooser(timeout=8000) as fc:
-                        local = page.get_by_text("本地上传", exact=True).first
-                        await local.click(force=True)
-                    chooser = await fc.value
-                    await chooser.set_files(str(img))
-                    uploaded = True
-                except Exception:
-                    uploaded = False
-
-                if not uploaded:
-                    file_input = page.locator('input[type="file"][accept*="image"]').last
-                    if await file_input.count():
-                        await file_input.set_input_files(str(img))
-                        uploaded = True
-                if not uploaded:
-                    raise RuntimeError("未找到图片上传入口")
-
-                await page.wait_for_timeout(2500)
-                for label in ("确定", "完成", "确认", "使用"):
-                    ok = page.get_by_role("button", name=label).first
-                    try:
-                        if await ok.count() and await ok.is_visible():
-                            await ok.click(force=True, timeout=3000)
-                            break
-                    except Exception:
-                        continue
-
-                # 以编辑器内 <img> 实际增量为准，避免"点了没插进去"被当成成功
-                after = before
-                for _ in range(16):
+                    _frame, editor = await self._find_editor(page)
+                    if not editor:
+                        raise RuntimeError("未找到正文编辑器")
+                    before = await self._count_image_blocks(editor)
+                    await editor.click(force=True)
+                    await page.keyboard.press("ControlOrMeta+End")
                     await page.wait_for_timeout(500)
+
+                    btn = page.locator(
+                        ".syl-toolbar-tool.image button, .syl-toolbar-tool.image"
+                    ).first
+                    if not await btn.count():
+                        btn = page.locator('[class*="toolbar"] [class*="image"]').first
+                    await btn.click(force=True, timeout=8000)
+                    await page.wait_for_timeout(1200)
+
+                    uploaded = False
                     try:
-                        after = await editor.locator("img").count()
+                        async with page.expect_file_chooser(timeout=10000) as fc:
+                            local = page.get_by_text("本地上传", exact=True).first
+                            await local.click(force=True)
+                        chooser = await fc.value
+                        await chooser.set_files(str(img))
+                        uploaded = True
                     except Exception:
-                        after = before
-                    if after > before:
-                        break
-                if after <= before:
-                    raise RuntimeError(f"编辑器图片数未增加（{before}→{after}）")
-                inserted += 1
-                toutiao_logger.info(f"内文图 {idx} 已进入正文，图片数={after}")
-            except Exception as exc:
-                toutiao_logger.warning(f"内文图 {idx} 插入失败: {exc}")
+                        uploaded = False
+
+                    if not uploaded:
+                        file_input = page.locator('input[type="file"][accept*="image"]').last
+                        if await file_input.count():
+                            await file_input.set_input_files(str(img))
+                            uploaded = True
+                    if not uploaded:
+                        raise RuntimeError("未找到图片上传入口")
+
+                    await page.wait_for_timeout(3000)
+                    for label in ("确定", "完成", "确认", "使用"):
+                        ok_btn = page.get_by_role("button", name=label).first
+                        try:
+                            if await ok_btn.count() and await ok_btn.is_visible():
+                                await ok_btn.click(force=True, timeout=3000)
+                                break
+                        except Exception:
+                            continue
+
+                    # 以「图片块」实际增量为准，避免"点了没插进去"被当成成功
+                    after = before
+                    for _ in range(20):
+                        await page.wait_for_timeout(500)
+                        try:
+                            _f2, editor = await self._find_editor(page)
+                            if editor:
+                                after = await self._count_image_blocks(editor)
+                        except Exception:
+                            after = before
+                        if after > before:
+                            break
+                    if after <= before:
+                        raise RuntimeError(f"编辑器图片块数未增加（{before}→{after}）")
+                    inserted += 1
+                    toutiao_logger.info(
+                        f"内文图 {idx} 已进入正文，图片块数={after}（第 {attempt} 次尝试）"
+                    )
+                    ok = True
+                    break
+                except Exception as exc:
+                    last_err = str(exc)
+                    toutiao_logger.warning(
+                        f"内文图 {idx} 插入失败（第 {attempt}/2 次）: {exc}"
+                    )
+            if not ok:
+                toutiao_logger.warning(f"内文图 {idx} 最终未能插入正文: {last_err}")
 
         if inserted < len(paths):
             raise RuntimeError(
                 f"内文图仅成功插入 {inserted}/{len(paths)} 张，已中止发布，避免正文缺图"
             )
+
+    async def _count_image_blocks(self, editor) -> int:
+        """统计正文编辑器里的**图片块**数量。
+
+        头条一个图片块包含两个 <img>（.pgc-img 与 .img-loading-container 各一份），
+        直接数 <img> 会翻倍；且插第二张会替换第一张导致数量不变，
+        必须按 .pgc-img 这类真正的图片容器来数。
+        """
+        try:
+            return await editor.locator("div.pgc-img").count()
+        except Exception:
+            return 0
 
     async def _confirm_cover_dialog(self, page: Page) -> None:
         """封面裁剪/确认弹窗：尽量点掉「确定/完成/确认」。"""
@@ -1538,6 +1598,11 @@ class TouTiaoArticle(object):
                     const imgs = Array.from(document.querySelectorAll('img'));
                     for (const img of imgs) {
                         if (!isVis(img)) continue;
+                        // 正文编辑器里的内文图不是封面。编辑器随内容增高，
+                        // 其中的 <img> 可能落进封面锚点的矩形范围，
+                        // 曾因此把「已上传内文图」误判成「封面已就绪」，
+                        // 导致真正封面从未上传、服务端拒存（code=7050）。
+                        if (img.closest('[contenteditable="true"], .ProseMirror, .ql-editor, .DraftEditor-root')) continue;
                         const r = img.getBoundingClientRect();
                         if (!inCoverZone(r)) continue;
                         if (r.width < 50 || r.height < 50 || r.width > 360 || r.height > 360) continue;
@@ -1556,6 +1621,7 @@ class TouTiaoArticle(object):
                     if (!preview) {
                         for (const el of all) {
                             if (!isVis(el)) continue;
+                            if (el.closest('[contenteditable="true"], .ProseMirror, .ql-editor, .DraftEditor-root')) continue;
                             const r = el.getBoundingClientRect();
                             if (!inCoverZone(r)) continue;
                             if (r.width < 50 || r.height < 50 || r.width > 360 || r.height > 360) continue;
@@ -1993,9 +2059,11 @@ class TouTiaoArticle(object):
             toutiao_logger.info(
                 f"上传前封面状态: empty={pre_state.get('empty')} ready={pre_state.get('ready')} reason={pre_state.get('reason')}"
             )
-            if pre_state.get("ready") and not pre_state.get("empty"):
-                toutiao_logger.info("展示封面已是真实预览图，跳过重复上传")
-                return
+            # ⚠️ 只要调用方给了本期封面，就必须真正上传。
+            # 早期版本在这里「ready 就跳过」，但 ready 判定会被正文里的内文图
+            # 误命中（头条内文图离「展示封面」锚点很近），导致封面从未上传，
+            # 服务端以缺必填项为由拒存（code=7050）。
+            # 头条草稿页封面本来就是空的，重传成本极低，没必要赌这个判定。
 
             # 策略优先序（基于实测）：
             # 1) article-cover-add 专用路径 / 隐藏 input 直接 set
@@ -2114,6 +2182,188 @@ class TouTiaoArticle(object):
         except Exception as exc:
             toutiao_logger.warning(f"定时设置失败: {exc}")
 
+    async def save_draft(self, page: Page) -> None:
+        """把文章保存为今日头条草稿（绝不点击「发布」）。
+
+        头条图文页没有「存草稿」按钮，只在底部提示「草稿将自动保存」，
+        真正的落库发生在编辑器的自动保存请求里：
+
+            POST https://mp.toutiao.com/mp/agw/article/publish
+            ...&save=0&...&content=<正文>&title=<标题>
+
+        实测结论（2026-11-09 抓包 + 接口回读确认）：
+
+            save=0  → 存草稿，落库后 status=1 / status_desc=草稿 / is_draft=true
+            save=1  → 直接投稿，落库后 status=3 / status_desc=已发布 / is_draft=false
+
+        所以草稿分支**不能改写任何参数**：只要不点「发布」按钮，头条自己的
+        自动保存请求（save=0）就会把内容存进草稿箱。做法是：
+
+          1. 填完标题、正文、内文图、封面、作品声明（缺必填项会存不进去）；
+          2. 触发一次自动保存；
+          3. 等响应 `code=0` 且带 `pgc_id`；
+          4. 回草稿箱按标题回读核验，确认真的落库。
+
+        踩过的两个坑：
+          1. 早期版本以为「草稿将自动保存」是常挂的前端状态（接口返回
+             `code:7050 保存失败`），实测是**缺少必填项**（封面 / 作品声明）
+             导致保存被拒。补齐必填项后草稿正常落库。
+          2. 曾误把 save 改写成 1 想「强制存草稿」，实际 save=1 是直接投稿，
+             造成内容被真实发布。此处严禁再改写 save 参数。
+        """
+        await _dismiss_overlays(page)
+        if self.publish_date != 0 and isinstance(self.publish_date, datetime):
+            await self.set_schedule_time(page, self.publish_date)
+
+        # 这里刻意**不拦截任何请求**。头条自动保存请求自带 save=0（存草稿），
+        # 一旦改写成 save=1 就变成直接投稿。曾因此误发内容，严禁再加拦截。
+        toutiao_logger.info("⏳ 等待头条自动保存请求…（最多 90 秒）")
+
+        # 记录**每一次**保存响应，而不是只看最后一次。
+        #
+        # 踩过的第三个坑：头条的自动保存会连续发多次（内容变化一次发一次），
+        # 其中失败的（code=7050）和成功的混杂在一起。只取「最后一次响应」
+        # 会正好抓到那条失败的，把已经落库的草稿误判为失败。
+        # 实测同一次流程里既有 7050 也有 code=0 + pgc_id，草稿确实在草稿箱里。
+        responses: list[dict] = []
+
+        async def _on_response(resp):
+            if "article/publish" not in resp.url or resp.request.method != "POST":
+                return
+            try:
+                body = await resp.text()
+            except Exception:
+                return
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = {}
+            entry = {
+                "code": data.get("code"),
+                "msg": data.get("message"),
+                "pgc_id": (data.get("data") or {}).get("pgc_id"),
+                "at": asyncio.get_event_loop().time(),
+            }
+            responses.append(entry)
+            toutiao_logger.info(
+                f"  ↳ 收到自动保存响应: code={entry['code']} pgc_id={entry['pgc_id']}"
+            )
+
+        page.on("response", _on_response)
+
+        # 触发自动保存：头条只在**编辑器内容发生变化**时才发自动保存请求，
+        # 单纯失焦（点标题栏）不会触发，实测会一直等到超时。
+        # 所以在正文末尾真实敲一个字符，让编辑器内容发生变化。
+        #
+        # 注意：绝不能对正文做「全选 + 删除」——头条编辑器会真的把正文清空，
+        # 接口随后返回 code=4017「正文不能为空」。
+        async def _trigger_autosave() -> None:
+            try:
+                editor = page.locator('div[contenteditable="true"]').first
+                if await editor.count():
+                    await editor.click(force=True)
+                    await page.keyboard.press("ControlOrMeta+End")
+                    await page.keyboard.type("。")
+            except Exception as exc:
+                toutiao_logger.warning(f"触发头条自动保存失败: {exc}")
+
+        await _trigger_autosave()
+
+        def _has_success() -> bool:
+            return any(
+                r.get("code") == 0 and r.get("pgc_id") not in (None, "0")
+                for r in responses
+            )
+
+        # 头条服务端偶尔会拒掉自动保存（间歇性 7050，实测同一账号前后几次
+        # 交替出现），单次失败不代表存不进去。这里做退避重试：每次失败就
+        # 换一个标点再触发一次，最多 5 轮。
+        attempts = 0
+        wait_seconds = 20
+        max_attempts = 5
+        while attempts < max_attempts and not _has_success():
+            await page.wait_for_timeout(wait_seconds * 1000)
+            attempts += 1
+            if _has_success():
+                break
+            codes = [r.get("code") for r in responses]
+            toutiao_logger.info(
+                f"  自动保存尚未成功（已尝试 {attempts}/{max_attempts} 次，"
+                f"响应 codes={codes}），{wait_seconds}s 后再触发一次"
+            )
+            await _trigger_autosave()
+            wait_seconds = min(wait_seconds + 10, 40)
+
+        shot = Path(self.account_file).with_name("toutiao_article_draft_saved.png")
+        try:
+            await page.screenshot(path=str(shot))
+            toutiao_logger.info(f"📸 头条存草稿截图已保存: {shot}")
+        except Exception:
+            pass
+
+        ok_resp = next(
+            (r for r in responses if r.get("code") == 0 and r.get("pgc_id") not in (None, "0")),
+            None,
+        )
+        if ok_resp is not None:
+            toutiao_logger.success(
+                f"头条保存接口返回成功，pgc_id={ok_resp['pgc_id']}"
+                f"（共收到 {len(responses)} 次保存响应，codes={[r.get('code') for r in responses]}）"
+            )
+        else:
+            # 接口回 7050 不代表没落库：实测有一次整轮都是 7050，
+            # 草稿却实实在在出现在草稿箱里。所以最后以草稿箱回读为准，
+            # 这里的失败只作为警告。
+            toutiao_logger.warning(
+                f"头条保存接口未返回成功（codes={[r.get('code') for r in responses]}），"
+                f"改由草稿箱回读判定"
+            )
+
+        if not await self._verify_draft_in_list(page):
+            raise RuntimeError(
+                "头条草稿保存未通过核验：草稿箱未找到本期标题，不得让调用方误判为已存草稿"
+            )
+        toutiao_logger.success(f"✅ 头条草稿核验通过：草稿箱已出现「{self.title}」")
+
+    async def _verify_draft_in_list(self, page: Page, retries: int = 4) -> bool:
+        """回草稿箱按标题核对草稿是否真的落库。
+
+        头条草稿箱地址是 /profile_v4/manage/draft，
+        列表数据来自接口 /mp/agw/creator_center/draft_list?type=0。
+        这里直接读接口，比解析 DOM 稳。
+
+        草稿落库有服务端延迟，刚保存完立刻查可能查不到，
+        所以失败时重试几次再下结论。
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                await page.goto(
+                    "https://mp.toutiao.com/profile_v4/manage/draft",
+                    timeout=90000,
+                    wait_until="domcontentloaded",
+                )
+                await page.wait_for_timeout(6000)
+                titles = await page.evaluate(
+                    """async () => {
+                        const r = await fetch(
+                            '/mp/agw/creator_center/draft_list?type=0&count=20&app_id=1231',
+                            { credentials: 'include' }
+                        );
+                        const j = await r.json();
+                        return (j.draft_list || []).map(d => d.title);
+                    }"""
+                )
+                if self.title and self.title in (titles or []):
+                    return True
+                toutiao_logger.warning(
+                    f"头条草稿箱未命中「{self.title}」（第 {attempt}/{retries} 次），稍后重试"
+                )
+            except Exception as exc:
+                toutiao_logger.warning(f"头条草稿核验失败: {exc}")
+            if attempt < retries:
+                await page.wait_for_timeout(8000)
+        return False
+
     async def publish(self, page: Page) -> None:
         await _dismiss_overlays(page)
         if self.publish_date != 0 and isinstance(self.publish_date, datetime):
@@ -2193,6 +2443,22 @@ class TouTiaoArticle(object):
             raise RuntimeError(f"点击发布后未确认成功，当前页面: {page.url}")
         toutiao_logger.success(f"已点击文章发布并确认成功，当前页面: {page.url}")
 
+    async def _wait_for_manual_publish(self, page: Page) -> None:
+        """保持已填好的今日头条编辑页打开；不监测发布提示，也不主动点击发布。"""
+        toutiao_logger.info(
+            "⏸️ 内容已填好；请在浏览器窗口人工复核并点击「发布」。"
+            "操作完成后请手动关闭窗口；自动化不会点击发布。"
+        )
+        while True:
+            try:
+                if page.is_closed():
+                    toutiao_logger.info("今日头条编辑页已由人工关闭")
+                    return
+                await page.wait_for_timeout(1000)
+            except Exception:
+                toutiao_logger.info("今日头条窗口已关闭，结束代填等待")
+                return
+
     async def upload(self, playwright: Playwright) -> None:
         if not (self.body or "").strip() and not self.tags:
             raise ValueError("文章正文不能为空")
@@ -2250,7 +2516,17 @@ class TouTiaoArticle(object):
         await self.apply_work_statements(page)
         await _dismiss_overlays(page)
 
-        if self.dry_run:
+        if self.prepare_only:
+            toutiao_logger.info("📸 今日头条代填预览截图已保存")
+            try:
+                await page.screenshot(
+                    full_page=True,
+                    path=str(Path(self.account_file).with_name("toutiao_article_manual_preview.png")),
+                )
+            except Exception:
+                pass
+            await self._wait_for_manual_publish(page)
+        elif self.dry_run:
             toutiao_logger.warning("🛑 【仅预览不发布】已跳过点击发布按钮")
             toutiao_logger.info(
                 "👀 请在浏览器窗口核对：标题、正文、文末话题标签（非纯文本 #）、展示封面、以及作品声明"
@@ -2266,9 +2542,15 @@ class TouTiaoArticle(object):
                 await asyncio.sleep(1)
             toutiao_logger.info("🛑 预览结束，关闭浏览器（未点击发布）")
         else:
-            await self.publish(page)
-            await page.wait_for_timeout(3000)
-            toutiao_logger.success("文章发布流程完成")
+            if self.is_draft:
+                toutiao_logger.info("🛑 【存草稿模式】不点「发布」，靠头条自动保存落草稿")
+                await self.save_draft(page)
+                await page.wait_for_timeout(3000)
+                toutiao_logger.success("头条文章草稿保存流程完成（未点击发布）")
+            else:
+                await self.publish(page)
+                await page.wait_for_timeout(3000)
+                toutiao_logger.success("文章发布流程完成")
 
         await context.storage_state(path=self.account_file)
         toutiao_logger.info("cookie 更新完毕")
