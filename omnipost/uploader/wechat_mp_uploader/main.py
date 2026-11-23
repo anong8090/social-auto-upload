@@ -249,6 +249,8 @@ class WechatMpPost(object):
         author="",
         file_list=None,
         existing_draft_title="",
+        replacement_title="",
+        inline_image_anchors=None,
     ):
         raw_title = (title or "").strip()
         self.title = re.sub(r"^【.*?】\s*", "", raw_title).strip()[:TITLE_MAX_LEN]
@@ -268,6 +270,9 @@ class WechatMpPost(object):
         cover = str(Path(cover_path).resolve()) if cover_path and Path(cover_path).is_file() else ""
         self.cover_path = cover or (self.file_list[0] if self.file_list else "")
         self.existing_draft_title = (existing_draft_title or "").strip()
+        # 修补既有草稿时允许显式换标题；默认仍保留原标题，避免误覆盖。
+        self.replacement_title = (replacement_title or "").strip()[:TITLE_MAX_LEN]
+        self.inline_image_anchors = [str(x).strip() for x in (inline_image_anchors or []) if str(x).strip()]
         self._draft_patch_mode = bool(self.existing_draft_title)
         # 用户明确要求全部走无头，dry_run 也不弹可见窗口
         self.headless = True
@@ -443,22 +448,69 @@ class WechatMpPost(object):
         )
         return editor_page
 
-    async def _insert_inline_images(self, page: Page, editor) -> int:
-        """把当日配图真正插入正文；已有图片时不重复上传。"""
+    async def _insert_inline_images(self, page: Page, editor, force: bool = False) -> int:
+        """把配图插入正文；有 anchors 时按段落定位逐张插入，否则批量插入。"""
         count = await self._editor_image_count(editor)
-        if count:
+        if count and not force:
             wechat_mp_logger.info(f"公众号正文已有 {count} 张图片，跳过重复插图")
             return count
+        if count and force:
+            # 只移除旧图，不删除正文；正文已由调用方重新注入。
+            await editor.evaluate("""(el) => {
+                [...el.querySelectorAll('img')].forEach((img) => {
+                    const block = img.closest('p,section,div,li');
+                    if (block && block !== el) block.remove();
+                    else img.remove();
+                });
+            }""")
+            await page.wait_for_timeout(500)
+            count = await self._editor_image_count(editor)
+
         images = [p for p in (self.file_list or ([self.cover_path] if self.cover_path else [])) if p]
         if not images:
             raise RuntimeError("公众号保存草稿前必须提供正文配图/封面图")
-        images = images[:2]
         file_input = page.locator(
             '#js_editor_insertimage input[type="file"][name="file"][accept*="image"], '
             'input[type="file"][name="file"][accept*="image"]'
         ).first
         if not await file_input.count():
             raise RuntimeError("未定位到公众号编辑器本地图片上传 input")
+
+        anchors = self.inline_image_anchors or []
+        if anchors and len(anchors) == len(images):
+            placed = []
+            for image, anchor in zip(images, anchors):
+                positioned = await editor.evaluate("""(el, anchor) => {
+                    const blocks = [...el.querySelectorAll('p,h2,h3,li')];
+                    const target = blocks.find((node) => (node.innerText || '').includes(anchor));
+                    if (!target) return false;
+                    const range = document.createRange();
+                    range.selectNodeContents(target);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    target.scrollIntoView({ block: 'center' });
+                    return true;
+                }""", anchor)
+                if not positioned:
+                    raise RuntimeError(f"公众号正文未找到配图位置：{anchor[:24]}")
+                before = await self._editor_image_count(editor)
+                await file_input.set_input_files([image], timeout=30000)
+                for _ in range(30):
+                    await page.wait_for_timeout(1000)
+                    count = await self._editor_image_count(editor)
+                    if count > before:
+                        break
+                if count <= before:
+                    raise RuntimeError(f"公众号配图插入未生效：{Path(image).name}")
+                placed.append(Path(image).name)
+            wechat_mp_logger.info(
+                f"公众号正文插图完成，按段落插入 {len(placed)} 张：{', '.join(placed)}"
+            )
+            return count
+
+        # 没有 anchors 时保持原有批量上传行为。
         await file_input.set_input_files(images, timeout=30000)
         for _ in range(30):
             await page.wait_for_timeout(1000)
@@ -470,9 +522,9 @@ class WechatMpPost(object):
         wechat_mp_logger.info(f"公众号正文插图完成，有效图片 {count} 张")
         return count
 
-    async def _set_cover_from_body(self, page: Page) -> None:
+    async def _set_cover_from_body(self, page: Page, force: bool = False) -> None:
         """用正文图设置封面，必须走「从正文选择 → 下一步 → 确认」并回读封面。"""
-        if await self._cover_ready(page):
+        if not force and await self._cover_ready(page):
             wechat_mp_logger.info("公众号封面已存在，跳过重复设封面")
             return
         if not await self._click_or_dom(
@@ -481,11 +533,31 @@ class WechatMpPost(object):
             '.select-cover__btn.js_cover_btn_area',
         ):
             raise RuntimeError("未定位到公众号「拖拽或选择封面」入口")
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1500)
+        # 已有封面时，「从正文选择」入口藏在替换封面弹层里；强制换封面要先点「替换」。
+        for replace_selector in (
+            '#js_cover_area button:has-text("替换"):visible, '
+            '#js_cover_area a:has-text("替换"):visible, '
+            'button:has-text("替换封面"):visible',
+        ):
+            if await self._click_or_dom(page, replace_selector):
+                await page.wait_for_timeout(1500)
+                break
+        picker = page.locator(
+            '.js_cover_null_pop .js_selectCoverFromContent:visible, '
+            '.js_selectCoverFromContent:visible'
+        ).first
+        if not await picker.count() and await self._click_or_dom(
+            page,
+            '.weui-desktop-dialog__wrp:visible .weui-desktop-btn_primary:not(.weui-desktop-btn_disabled):has-text("确定"), '
+            '.weui-desktop-dialog__wrp:visible .weui-desktop-btn_primary:not(.weui-desktop-btn_disabled):has-text("确认")',
+        ):
+            await page.wait_for_timeout(1200)
         if not await self._click_or_dom(
             page,
             '.js_cover_null_pop .js_selectCoverFromContent:visible, '
-            '.js_selectCoverFromContent:visible',
+            '.js_selectCoverFromContent:visible, '
+            '.js_selectCoverFromContent:not([style*="display: none"])',
         ):
             raise RuntimeError("未定位到可见的「从正文选择」入口")
         await page.wait_for_timeout(2200)
@@ -658,15 +730,16 @@ class WechatMpPost(object):
                 '[contenteditable="true"][data-placeholder*="标题"]'
             ).first
 
-            if patch_mode:
+            if patch_mode and not self.replacement_title:
                 wechat_mp_logger.info(
                     f"修补既有草稿，保留原标题：{self.existing_draft_title}"
                 )
             elif await title_input.count() and await title_input.is_visible():
                 await title_input.wait_for(state="visible", timeout=15000)
+                title_to_write = self.replacement_title if patch_mode else self.title
                 await title_input.click()
                 await page.keyboard.press("ControlOrMeta+A")
-                await page.keyboard.insert_text(self.title)
+                await page.keyboard.insert_text(title_to_write)
                 await page.evaluate(
                     """(t) => {
                         const el = document.querySelector('#title');
@@ -679,9 +752,9 @@ class WechatMpPost(object):
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
                     }""",
-                    self.title,
+                    title_to_write,
                 )
-                wechat_mp_logger.info(f"已填写文章标题: {self.title}")
+                wechat_mp_logger.info(f"已填写文章标题: {title_to_write}")
             else:
                 legacy_title = page.locator(
                     'textarea#title:visible, '
@@ -689,8 +762,9 @@ class WechatMpPost(object):
                     'textarea[placeholder*="标题"]:visible'
                 ).first
                 if await legacy_title.count():
-                    await legacy_title.fill(self.title)
-                    wechat_mp_logger.info(f"已填写文章标题（旧版编辑器）: {self.title}")
+                    title_to_write = self.replacement_title if patch_mode else self.title
+                    await legacy_title.fill(title_to_write)
+                    wechat_mp_logger.info(f"已填写文章标题（旧版编辑器）: {title_to_write}")
                 else:
                     raise RuntimeError("未找到微信公众号可见标题编辑器")
 
@@ -710,7 +784,7 @@ class WechatMpPost(object):
                     re.I,
                 )
             )
-            if patch_mode and not body_is_html:
+            if patch_mode and not body_is_html and not self.replacement_title:
                 got = len(((await editor.inner_text()) or "").strip())
                 if got < max(80, int(len(self.body) * 0.6)):
                     raise RuntimeError(
@@ -768,9 +842,8 @@ class WechatMpPost(object):
 
             # 图文硬闸门：上传器必须真正插图、设置非空封面后才能保存。
             # 普通修补保留原文图片；若调用方显式重排了正文，则重新插图。
-            if not patch_mode or body_is_html:
-                await self._insert_inline_images(page, editor)
-            await self._set_cover_from_body(page)
+            await self._insert_inline_images(page, editor, force=patch_mode)
+            await self._set_cover_from_body(page, force=patch_mode)
             await self._assert_media_ready(page, editor)
             await page.wait_for_timeout(1200)
             await self._save_or_publish(page)

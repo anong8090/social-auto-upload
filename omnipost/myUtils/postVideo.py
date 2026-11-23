@@ -900,7 +900,7 @@ def post_article_weibo(title, body, tags, account_file, enableTimer=False, video
     return results[0] if results else ""
 
 
-def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None, existing_draft_title=""):
+def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, videos_per_day=1, daily_times=None, start_days=0, dry_run=False, cover_path="", is_draft=True, file_list=None, existing_draft_title="", replacement_title="", inline_image_anchors=None):
     account_paths = [Path(BASE_DIR / "cookiesFile" / file) for file in account_file]
     cover = _resolve_cover_helper(cover_path)
     # 后台旧调用可能只给了封面、没给 file_list；公众号保存前图文闸门要求正文图。
@@ -931,6 +931,8 @@ def post_article_wechat_mp(title, body, tags, account_file, enableTimer=False, v
             is_draft=is_draft,
             file_list=effective_inline,
             existing_draft_title=existing_draft_title,
+            replacement_title=replacement_title,
+            inline_image_anchors=inline_image_anchors,
         )
         # 公众号上传器内部已强制无头（系统 Chrome + 二维码截图落盘），
         # 这里不能再把 headless 改回 False，否则会弹出可见浏览器。

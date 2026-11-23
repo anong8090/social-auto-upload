@@ -648,6 +648,9 @@ def main(argv: List[str] | None = None) -> int:
                     existing_draft_title=(
                         assets["title"] if args.patch_existing_wechat_draft else ""
                     ),
+                    replacement_title=(
+                        assets["title"] if args.patch_existing_wechat_draft else ""
+                    ),
                 )
             # 草稿箱回读核验：点了存草稿不等于落库。小红书必须读同一个
             # 持久化 profile（留窗模式下直接 attach 到那个可见窗口）。
