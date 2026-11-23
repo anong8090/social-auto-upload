@@ -37,6 +37,7 @@
 | 文稿自检 | 技能 `scripts/check_draft.py` | 标题/段落相似度、配图哈希与视觉查重、超级词、内部标签、身份/数字/空词检查 |
 | 小红书可见草稿窗口 | `publish_ai_share.py --visible-xhs` | 独立 Chrome profile + CDP attach，保留窗口供人工复核 |
 | 公众号草稿回读 | `publish_ai_share.py` / `longform` | 按标题与配图回读草稿箱，未命中抛错 |
+| 公开分级自检 | `publish_ai_share.py` / 技能 `check_draft.py` | 硬拦「首创/原创概念」，提醒「阈值/评测集/定级结果」；词表损坏时拒绝继续 |
 | 个人 IP 发布日志 | `logs/ai_share_<日期>_*.json`、`logs/ai_share_longform_*.json` | 记录每次存草稿结果与回读状态；独立线不写 `publish_history` |
 
 ### 缺口
@@ -56,14 +57,16 @@
 
 ## 三、开发项
 
-### IP-01 公开分级自检（P0，脚本 + 技能）
+### IP-01 公开分级自检（P0，✅ 2026-11-23 完成）
 
 **目标**：把规划中的「可公开 / 延迟公开 / 不公开」落成发布前可执行的检查，硬拦宣称类表述，提醒内部信息类表述。
 
 **涉及文件**
 
-- 新建：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/公开分级词表.json`
+- 新建：`omnipost/scripts/public_level_rules.json`（项目词表，随代码仓跟踪）
+- 新建：`~/.agents/skills/personal-ip-ai-content/references/public-level.json`（技能默认词表）
 - 修改：`omnipost/scripts/publish_ai_share.py`
+- 修改：`omnipost/scripts/publish_ai_share_longform.py`
 - 修改：`~/.agents/skills/personal-ip-ai-content/scripts/check_draft.py`
 - 修改：`~/.agents/skills/personal-ip-ai-content/references/publishing.md`
 
@@ -98,6 +101,7 @@
   - B 含「置信度阈值」→ 通过，但输出提醒；
   - C 干净稿 → 通过，无提醒。
 - 同一份样本分别跑项目脚本与技能 `check_draft.py`，结论一致。
+- 长文入口用 ≥500 字样本重复硬拦/提醒/干净稿三组，结论一致。
 - 词表损坏（非法 JSON）时，两边都拒绝继续，不静默放行。
 
 **边界**
@@ -105,6 +109,13 @@
 - `warn` 不阻断，避免「原创内容」这类正常表述被误杀。
 - 词表变更属于规则变更，需用户确认后生效。
 - 技能侧修改要按 Skills 规范提交并推送 `anong8090/ai-agent-skills`，同时同步到 `~/.agents/skills/` 软链目标。
+
+**完成记录（2026-11-23）**
+
+- 项目侧：`publish_ai_share.py` 新增 `_load_public_level_rules()` 与共用 `check_public_level()`；`precheck()` 返回 `warnings`，`main()` 打印提醒；词表缺失用内置默认值，损坏时拒绝继续。
+- 长文侧：`publish_ai_share_longform.py` 的 `check_content()` 接入同一公开分级检查，长文不再绕过闸门。
+- 技能侧：`check_draft.py` 新增 `--public-level`，默认读取技能内词表；`references/publishing.md` 命令已补参数。
+- 验收：短稿入口、长文入口与技能侧均通过硬拦（首创）、提醒（置信度阈值/评测集）、干净稿三组样本；损坏 JSON 时两侧均退出非 0。
 
 ---
 
@@ -423,3 +434,4 @@
 | 日期 | 变更 | 证据 |
 | --- | --- | --- |
 | 2026-11-23 | 初版：基于定版规划与项目现状拆分 8 个开发项 | 本文档 |
+| 2026-11-23 | IP-01 完成：公开分级硬拦/提醒接入短稿、长文与技能三个入口 | `omnipost/scripts/public_level_rules.json`、`publish_ai_share.py`、`publish_ai_share_longform.py`、技能 `check_draft.py`、`references/publishing.md` |

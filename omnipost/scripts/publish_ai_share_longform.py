@@ -79,6 +79,9 @@ def check_content(day_dir: Path, min_chars: int) -> dict:
     for word in preflight.STATIC_BANNED_WORDS:
         if word in body:
             errors.append(f"正文出现项目零容忍词「{word}」")
+    public_errors, public_warnings = share.check_public_level(body)
+    errors.extend(public_errors)
+    warnings.extend(public_warnings)
     if "瑞信" in body:
         errors.append("正文出现「瑞信」；机构名只放平台简介/账号资料")
     if "河狸云" in body:

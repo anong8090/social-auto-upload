@@ -89,6 +89,63 @@ MAINLINE_TEXT_ROOT = PROJECT_DIR / "河狸云蓝枢_自媒体物料包" / "文�
 CONTENT_LINE_ROOT_NAME = "AI能力分享内容线"
 PUBLISHED_LOG = PROJECT_DIR / "logs" / "ai_share_published.json"
 
+# 公开分级自检：硬拦对外宣称类表述，提醒内部信息类表述。
+# 词表与技能 references/public-level.json 保持同一份口径；词表损坏时拒绝继续。
+PUBLIC_LEVEL_RULES_PATH = Path(__file__).resolve().parent / "public_level_rules.json"
+DEFAULT_PUBLIC_LEVEL_RULES: Dict[str, List[str]] = {
+    "hard_block": [
+        "首创", "独创", "原创概念", "原创理论",
+        "全网首个", "行业首个", "独家方法论",
+    ],
+    "warn": [
+        "原创", "置信度阈值", "评测集", "规则清单原文",
+        "定级结果", "否定性决策", "真实样本", "项目台账", "内部数据",
+    ],
+}
+
+
+def _load_public_level_rules(
+    path: Path = PUBLIC_LEVEL_RULES_PATH,
+) -> Dict[str, List[str]]:
+    """读取公开分级词表；文件缺失时退回内置默认值，格式损坏时拒绝继续。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"⚠️  公开分级词表不存在，使用内置默认值：{path}", file=sys.stderr)
+        return {key: list(values) for key, values in DEFAULT_PUBLIC_LEVEL_RULES.items()}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"公开分级词表不可读或格式错误：{path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"公开分级词表必须是 JSON 对象：{path}")
+
+    rules: Dict[str, List[str]] = {}
+    for key in ("hard_block", "warn"):
+        values = raw.get(key, [])
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item.strip() for item in values
+        ):
+            raise ValueError(f"公开分级词表字段 {key} 必须是非空字符串数组：{path}")
+        rules[key] = [item.strip() for item in values]
+    return rules
+
+
+def check_public_level(text: str) -> Tuple[List[str], List[str]]:
+    """按公开分级词表检查文本，返回（硬拦问题，人工提醒）。"""
+    rules = _load_public_level_rules()
+    problems: List[str] = []
+    warnings: List[str] = []
+    for word in rules["hard_block"]:
+        if word in text:
+            problems.append(
+                f"公开分级硬拦：出现「{word}」，不得对外宣称首创或原创概念"
+            )
+    for word in rules["warn"]:
+        if word in text:
+            warnings.append(
+                f"公开分级提醒：出现「{word}」，确认不属于不公开内容"
+            )
+    return problems, warnings
+
 
 def _normalize_text(raw: str) -> str:
     """归一化为可比对的纯文本：去掉 Markdown 标记、话题标签与空白。"""
@@ -266,12 +323,17 @@ def precheck(day_dir: Path, platforms: List[int]) -> Dict[str, Any]:
     text = content["raw"]
 
     problems: List[str] = []
+    warnings: List[str] = []
     for word in BRAND_EXCLUSIONS:
         if word in text:
             problems.append(f"个人 IP 内容线禁止出现「{word}」（不指定蓝枢）")
     for word in cc.BANNED_WORDS:
         if word in text:
             problems.append(f"命中零容忍词：{word}")
+
+    public_problems, public_warnings = check_public_level(text)
+    problems.extend(public_problems)
+    warnings.extend(public_warnings)
 
     for ptype in platforms:
         low, high = TITLE_LIMITS[ptype]
@@ -312,6 +374,7 @@ def precheck(day_dir: Path, platforms: List[int]) -> Dict[str, Any]:
         "body_chars": body_chars,
         "paragraphs": len(paragraphs),
         "subheadings": len(subheadings),
+        "warnings": warnings,
     }
 
 
@@ -602,6 +665,8 @@ def main(argv: List[str] | None = None) -> int:
         f" | {assets['paragraphs']} 段 | 每日 1 条"
     )
     print(f"🎯 平台：{[PLATFORM_LABELS[p] for p in platforms]}（同一份内容、全部只存草稿）")
+    for item in assets.get("warnings", []):
+        print(f"⚠️  {item}")
     if args.check_only:
         print("🧪 离线自检通过：精炼/去重/每日单条，未启动浏览器、未写数据库、未发布")
         return 0
