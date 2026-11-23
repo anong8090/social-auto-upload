@@ -1,6 +1,7 @@
 # 个人 IP 配图规范
 
-> 适用：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/` 下的短稿与长文。  
+> 适用：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/` 下的短稿与长文。
+>
 > 检查入口：`~/.agents/skills/personal-ip-ai-content/scripts/check_draft.py` 的 `check_images`。
 
 ## 一、规格

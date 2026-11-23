@@ -1,7 +1,9 @@
 # 个人 IP 发布 Runbook
 
-> 适用：`market_for_team` 仓库内、个人 IP 独立线（微信公众号 + 小红书）。  
-> 两条铁律：**只存草稿，不点发布**；**存完必须回读核验**。  
+> 适用：`market_for_team` 仓库内、个人 IP 独立线（微信公众号 + 小红书）。
+>
+> 两条铁律：**只存草稿，不点发布**；**存完必须回读核验**。
+>
 > 与 `~/.agents/skills/personal-ip-ai-content/references/publishing.md` 配套使用。
 
 ## 0. 每次开工前
