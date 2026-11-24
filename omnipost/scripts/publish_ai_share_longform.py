@@ -144,6 +144,11 @@ def main() -> int:
         action="store_true",
         help="按标题打开既有草稿，重新注入正文并按段落位置替换配图，不新建草稿",
     )
+    parser.add_argument(
+        "--existing-title",
+        default="",
+        help="修补既有草稿时用于定位的旧标题；换标题时必填，避免新建重复草稿",
+    )
     args = parser.parse_args()
 
     day_dir = Path(args.dir).expanduser().resolve()
@@ -181,6 +186,9 @@ def main() -> int:
         return 2
 
     body_for_wechat = assets["html"] or assets["body"]
+    # 修补既有草稿时，定位用旧标题、写入用新标题；否则换标题会找不到旧草稿。
+    existing_title = (args.existing_title or "").strip()
+    locate_title = existing_title or assets["title"]
     postVideo.post_article_wechat_mp(
         title=assets["title"],
         body=body_for_wechat,
@@ -190,7 +198,7 @@ def main() -> int:
         file_list=[str(p) for p in assets["images"]],
         is_draft=True,
         dry_run=False,
-        existing_draft_title=assets["title"] if args.patch_existing else "",
+        existing_draft_title=locate_title if args.patch_existing else "",
         replacement_title=assets["title"] if args.patch_existing else "",
         inline_image_anchors=assets["anchors"],
     )
