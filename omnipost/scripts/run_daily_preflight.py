@@ -5,6 +5,7 @@
 职责边界：
 - 只读取账号与 Cookie 文件状态、写 logs/preflight/ logs/link_health/ logs/violations/ logs/review/
 - 写 platform_feedback 的巡检健康字段与人工复核结论
+- 闹钟解除后回收知乎、微博、公众号效果；不含贴吧。失败不改退出码、不发飞书、不回填主线台账
 - 绝不发布内容、改账号业务表、重新绑定账号或自动生效合规规则
 
 退出码：
@@ -55,6 +56,9 @@ RETRY_BACKOFF_SECONDS = (0, 2, 5)
 LOCK_STALE_SECONDS = MAX_RUNTIME_SECONDS + 60
 ESCALATION_AFTER_DAYS = 2
 SUCCEEDED_STATES = frozenset({"success", "attention_needed"})
+# 每日效果回收只含这三家。贴吧（10）用户明确先不补，也不要每天去撞安全验证。
+DAILY_EFFECT_PLATFORMS = (9, 11, 12)
+EFFECT_STATS_LOG_DIR = PROJECT_DIR / "logs" / "effect_stats"
 
 
 def _now() -> datetime:
@@ -246,6 +250,65 @@ def _run_violation_feedback() -> Dict[str, Any]:
     result["unverified_records_ignored"] = signals.get("unverified_count", 0)
     result["human_reviewed_count"] = signals.get("human_reviewed_count", 0)
     return result
+
+
+def _needs_attention_exit(failed: List[Dict[str, Any]], summary: Dict[str, Any]) -> bool:
+    """退出码 1 只看账号、链路和复核。效果回收失败不在这里。"""
+    return bool(
+        failed
+        or summary.get("link_health_verified_abnormal", 0) > 0
+        or summary.get("review_sync_failed")
+        or summary.get("review_conflicts", 0) > 0
+    )
+
+
+def _write_effect_failure(outcome: Dict[str, Any]) -> None:
+    EFFECT_STATS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = _now().strftime("%Y%m%d_%H%M%S")
+    path = EFFECT_STATS_LOG_DIR / f"daily_fail_{stamp}.json"
+    payload = {
+        "fetched_at": _now().strftime("%Y-%m-%d %H:%M:%S"),
+        "daily": True,
+        "ok": False,
+        "platforms": outcome.get("platforms"),
+        "exit_code": outcome.get("exit_code"),
+        "error": outcome.get("error"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    outcome["log"] = str(path)
+
+
+def _run_effect_stats() -> Dict[str, Any]:
+    """回收知乎、微博、公众号效果。调用方必须已解除账号预检的 SIGALRM。
+
+    不打开贴吧，不发飞书，不改退出码。异常吞掉并写入 logs/effect_stats。
+    """
+    import asyncio
+    import collect_effect_stats  # scripts 目录已在 sys.path 中
+
+    started = time.monotonic()
+    outcome: Dict[str, Any] = {
+        "ok": False,
+        "platforms": list(DAILY_EFFECT_PLATFORMS),
+        "exit_code": None,
+        "error": None,
+    }
+    try:
+        if 10 in DAILY_EFFECT_PLATFORMS:
+            raise RuntimeError("每日效果回收不得包含贴吧")
+        outcome["exit_code"] = asyncio.run(
+            collect_effect_stats.collect(list(DAILY_EFFECT_PLATFORMS), False)
+        )
+        outcome["ok"] = outcome["exit_code"] == 0
+        if not outcome["ok"]:
+            outcome["error"] = f"collect 退出码 {outcome['exit_code']}"
+            _write_effect_failure(outcome)
+    except Exception as exc:  # noqa: BLE001
+        outcome["error"] = f"{exc.__class__.__name__}: {exc}"[:300]
+        _write_effect_failure(outcome)
+        print(f"⚠️ 效果回收异常: {outcome['error']}", file=sys.stderr)
+    outcome["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    return outcome
 
 
 def _mark_resolved_issues(now: datetime) -> None:
@@ -494,6 +557,10 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️ 违规聚合异常: {preflight_notify.redact_error(exc, webhook, secret)}", file=sys.stderr)
 
+        # 步骤 5：效果回收。账号预检的 SIGALRM 只活在 _run_check 的 finally 里，这里已经解除。
+        # 开 Chrome 可能超过 300 秒，不能放回那个闹钟。失败不进飞书告警，也不改退出码。
+        effect_result = _run_effect_stats()
+
         failed = [r for r in results if not r.get("ok")]
         issue_signature = error_reason or ",".join(str(r["platform_type"]) for r in failed)
         streak = 1 + _consecutive_failure_days(now, issue_signature) if failed else 1
@@ -633,6 +700,10 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             "review_sync_failed": bool(
                 review_error or (not review_skipped and not review_result.get("ok"))
             ),
+            "effect_stats_ok": bool(effect_result.get("ok")),
+            "effect_stats_exit_code": effect_result.get("exit_code"),
+            "effect_stats_error": effect_result.get("error"),
+            "effect_stats_platforms": effect_result.get("platforms"),
         }
         finished_at = _now().isoformat(timespec="seconds")
         result_payload = {
@@ -652,7 +723,8 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
             "access": "local-only",
             "allowed_writes": [
                 "logs/preflight/", "logs/link_health/", "logs/violations/", "logs/review/",
-                "omnipost/db/database.db（仅 publish_history 健康字段、platform_feedback、幂等 schema 补齐）",
+                "logs/effect_stats/",
+                "omnipost/db/database.db（publish_history 健康字段、platform_feedback、effect_snapshots、幂等 schema 补齐）",
                 "飞书多维表格「蓝枢发布链路人工复核台」（待复核记录与回写状态）",
             ],
             "forbidden_actions": [
@@ -717,13 +789,9 @@ def _run_once(args: argparse.Namespace, task_id: str, window: str, now: datetime
                 f"观察词候选 {summary['violation_observed_terms']} 个"
                 f"（任务 {task_id}）"
             )
-        # 待人工复核不单独制造「异常退出码」；复核同步故障与已验证异常需要显露
-        return 1 if (
-            failed
-            or summary["link_health_verified_abnormal"] > 0
-            or summary["review_sync_failed"]
-            or summary["review_conflicts"] > 0
-        ) else 0
+        # 待人工复核不单独制造「异常退出码」；复核同步故障与已验证异常需要显露。
+        # 效果回收失败不在这个判断里。
+        return 1 if _needs_attention_exit(failed, summary) else 0
 
 
 def _status_check(args: argparse.Namespace, task_id: str, window: str, today: datetime) -> int:
