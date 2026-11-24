@@ -4,11 +4,11 @@
 
 替代根目录下 20+ 个 `_publish_*_epNN.py` 一次性脚本。能力：
 - 按素材目录自动发现母本 A/B 与 6 张配图；
-- 发布前预检（封禁平台、账号、cookie 文件），自动从可用池随机抽 5 台；
+- 发布前预检（封禁平台、账号、cookie 文件），从可用池随机抽平台，并固定追加 2 个贴吧；
 - 每平台独立执行，单个失败不影响其余；
-- 成功/失败都写入 publish_history（含期数、选题、公开链接）；
-- 按「期数 + 平台」幂等，已成功发布过的默认跳过；
-- 头条（`type=7`）禁止任何浏览器自动化，只产出「待发内容包」供人工发布。
+- 成功/失败都写入 publish_history（含期数、选题、公开链接、贴吧吧名）；
+- 按「期数 + 平台」幂等；贴吧按「期数 + 吧名」幂等，已成功发布过的默认跳过；
+- 今日头条不进自动选台。显式指定时默认只代填，不自动存草稿、不点发布。
 
 用法示例：
     python scripts/publish_episode.py --episode 15 --seed 20261105
@@ -26,7 +26,7 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 OMNIPOST_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -49,20 +49,21 @@ LONG_FORM_PLATFORMS = (5, 7, 8, 9, 12, 13, 14, 15)
 SHORT_FORM_PLATFORMS = (10, 11)
 
 # 禁止自动化操作浏览器的平台：只产出「待发内容包」，由人工到后台发布。
-# 2026-11-09 实测头条草稿链路已打通（见 toutiao_uploader.save_draft）：
-# 发文页自动保存请求 POST /mp/agw/article/publish 带 save 参数，
-# save=0 是存草稿、save=1 是直接投稿；只要不点「发布」，头条自己的自动保存
-# 就会把内容存进草稿箱（is_draft=true / status_desc=草稿）。
-# 因此头条不再走内容包，改为正常存草稿。
-# 保留本常量作为兜底：若头条草稿链路再次失效，可临时把它改回 (7,)。
+# 头条不进这个名单：它仍会打开可见编辑页，但默认只代填，不自动存草稿。
 MANUAL_PACKAGE_PLATFORMS = ()
 
 # auto 选台只从「发布链路已实测打通、且能采集公开链接」的平台池中抽取。
 # 12 微信公众号、13 网易号、14 大鱼号的登录/发布链路尚未完成 E2E 验证。
-# 7 今日头条自 2026-11-09 起草稿链路实测打通，加入可自动选台池。
-# 8 搜狐号于 2026-11-10 被平台警告，随机选台暂停使用；显式指定时仍走既有链路，
-# 但默认不再把它算作有效候选，避免一稿五投的随机名额被警告账号占用。
-AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 9, 10, 11, 15)
+# 7 今日头条：2026-11-09 起 save=0 被账号级 7050 拒绝，退出自动选台。
+#   显式 --platforms 7 默认走代填（可见窗口填好，不发保存请求、不点发布）。
+#   只有 --toutiao-save-draft 才恢复 save=0，且不能与 --publish 同用。
+# 8 搜狐号于 2026-11-10 被平台警告，随机选台暂停使用。
+# 10 贴吧不占随机名额：每天固定追加 2 个吧，见 FIXED_TIEBA_BARS。
+AUTO_PUBLISHABLE_PLATFORMS = (5, 9, 11, 15)
+TOUTIAO_PLATFORM = 7
+TIEBA_PLATFORM = 10
+FIXED_TIEBA_BARS = ("建筑", "土木工程")
+TIEBA_FALLBACK_BAR = "市政工程"
 
 # 微信公众号只承接个人 IP 独立线（publish_ai_share.py），2026-11-12 用户明确
 # 「不要发蓝枢的内容」。主线显式 --platforms 12 也必须硬拦截，不能靠选台遗漏规避。
@@ -392,9 +393,8 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
             inline_image_paths=inline, is_draft=is_draft, **common,
         )
     elif platform_type == 7:
-        # 2026-11-09 实测：头条草稿链路已打通——不点「发布」，靠编辑器自动保存
-        # 请求（save=0）落进草稿箱，再回草稿箱按标题回读核验。
-        # 草稿模式下由人工复核后自行发布。
+        # 默认 prepare_only=True：可见窗口代填，不发 save=0、不点发布。
+        # 只有调用方显式关掉 prepare_only 且 is_draft=True，才会走 save=0。
         return post_article_toutiao(
             title, body, tags, account_list,
             work_statements=["引用AI"],
@@ -619,27 +619,95 @@ def export_manual_package(
 # ---------------------------------------------------------------- 主流程
 
 
-def resolve_platforms(args, assets: Dict[str, Any]) -> List[int]:
+def parse_tieba_bars(explicit: str) -> List[str]:
+    """把 `--tieba-kw` 拆成吧名。支持英文逗号和中文逗号，去重并保持顺序。"""
+    seen: List[str] = []
+    for part in re.split(r"[,，]", explicit or ""):
+        name = part.strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def default_tieba_bars(unavailable: Optional[Iterable[str]] = None) -> List[str]:
+    """每天两个吧：优先建筑、土木工程，已被本期发布过的用市政工程补位。"""
+    blocked = {str(name).strip() for name in (unavailable or ()) if str(name).strip()}
+    chosen: List[str] = []
+    for name in (*FIXED_TIEBA_BARS, TIEBA_FALLBACK_BAR):
+        if name in blocked:
+            continue
+        chosen.append(name)
+        if len(chosen) == 2:
+            break
+    return chosen
+
+
+def resolve_jobs(args, episode: str) -> List[Dict[str, Any]]:
+    """决定本轮要跑的发布任务。
+
+    每个任务是 `{platform_type, tieba_kw}`。贴吧同一平台类型会拆成多条，
+    每条一个吧，避免「期数 + 平台」幂等把第二个吧误判成重复发布。
+
+    auto：随机池不含头条和贴吧，再追加两个贴吧。
+    显式平台：按传入顺序；包含贴吧且没写 `--tieba-kw` 时，同样用每天的两个吧。
+    """
+    explicit_bars = parse_tieba_bars(getattr(args, "tieba_kw", "") or "")
     if args.platforms != "auto":
-        requested = [int(x) for x in args.platforms.split(",") if x.strip()]
+        requested = [int(x) for x in str(args.platforms).split(",") if x.strip()]
         forbidden = [p for p in requested if p in MAINLINE_FORBIDDEN_PLATFORMS]
         if forbidden:
             reasons = "；".join(MAINLINE_FORBIDDEN_PLATFORMS[p] for p in forbidden)
             raise SystemExit(f"❌ 主线平台硬拦截：{reasons}；请改用 publish_ai_share.py")
-        return [p for p in requested if p not in preflight.BANNED_PLATFORMS]
+        requested = [p for p in requested if p not in preflight.BANNED_PLATFORMS]
+        bars = explicit_bars or default_tieba_bars()
+        jobs: List[Dict[str, Any]] = []
+        for ptype in requested:
+            if ptype == TIEBA_PLATFORM:
+                for bar in bars:
+                    jobs.append({"platform_type": ptype, "tieba_kw": bar})
+            else:
+                jobs.append({"platform_type": ptype, "tieba_kw": ""})
+        return jobs
 
+    named, unscoped = publish_record.tieba_published_state(DB_PATH, episode)
     picked = preflight.pick_random_platforms(
         DB_PATH, Path(BASE_DIR),
         count=args.count,
         pool=AUTO_PUBLISHABLE_PLATFORMS,
-        # 头条已禁止任何浏览器自动化：auto 选台必须在抽样前排除，
-        # 避免「随机 5 平台」被人工内容包占掉一个名额（用户显式指定时仍可单独出包）。
         exclude=MANUAL_PACKAGE_PLATFORMS,
         seed=args.seed,
     )
-    if len(picked) < args.count:
-        print(f"⚠️ 可用平台只有 {len(picked)} 个（目标 {args.count} 个），请先补绑账号")
-    return picked
+    # 随机池本身只有 4 个平台，默认 count=5 不应当成「账号没绑够」。
+    # 只在池内账号未就绪、实际抽不满时提醒。
+    expected = min(args.count, len(AUTO_PUBLISHABLE_PLATFORMS))
+    if len(picked) < expected:
+        print(
+            f"⚠️ 随机池可用平台只有 {len(picked)} 个"
+            f"（池内应有 {expected} 个，不含固定的 2 个贴吧）"
+        )
+    jobs = [{"platform_type": ptype, "tieba_kw": ""} for ptype in picked]
+    if explicit_bars:
+        bars = explicit_bars
+    elif unscoped:
+        # 仍放进任务列表，由主循环按「未记录吧名」跳过并写进结果，不静默丢掉。
+        bars = list(FIXED_TIEBA_BARS)
+        print("⚠️ 该期已有未记录吧名的贴吧成功发布，本轮贴吧任务会跳过，避免重复发帖")
+    else:
+        bars = default_tieba_bars(named)
+        if len(bars) < 2:
+            print(
+                f"⚠️ 该期还能发的贴吧只剩 {len(bars)} 个"
+                "（建筑 / 土木工程 / 市政工程中已发布的不再发）"
+            )
+    for bar in bars:
+        jobs.append({"platform_type": TIEBA_PLATFORM, "tieba_kw": bar})
+    return jobs
+
+
+def _job_label(platform_name: str, ptype: int, tieba_kw: str) -> str:
+    if ptype == TIEBA_PLATFORM and tieba_kw:
+        return f"{platform_name}·{tieba_kw}"
+    return platform_name
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -648,7 +716,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dir", help="直接指定该期文案目录（默认按 --episode 自动发现）")
     parser.add_argument("--base", default=str(DEFAULT_MATERIAL_ROOT), help="物料包根目录")
     parser.add_argument("--platforms", default="auto", help="auto 或逗号分隔的平台类型，如 5,7,9,11")
-    parser.add_argument("--count", type=int, default=5, help="auto 模式下抽几个平台")
+    parser.add_argument("--count", type=int, default=5, help="auto 模式下随机抽取几个平台（不含固定的 2 个贴吧）")
     parser.add_argument("--seed", type=int, help="随机种子，便于复现")
     parser.add_argument("--title", help="覆盖自动解析出的标题")
     parser.add_argument("--dry-run", action="store_true", help="只填表不提交（会打开平台编辑页，慎用）")
@@ -675,17 +743,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--force-retry-failed", action="store_true",
         help="仅今日头条：显式重试已失败且确认未发布的同篇内容；已发布记录仍硬拦截",
     )
-    parser.add_argument("--tieba-kw", default="", help="贴吧目标吧名（type=10 必填）")
+    parser.add_argument(
+        "--tieba-kw", default="",
+        help="贴吧吧名。省略时发「建筑」和「土木工程」；多个吧用逗号分隔，写了就只发这些吧",
+    )
     parser.add_argument(
         "--patch-existing-dayu-draft", action="store_true",
         help="修补大鱼号本篇既有草稿：打开草稿编辑页补齐内文图/封面并保存，不新建重复草稿",
     )
     parser.add_argument(
         "--toutiao-prepare-only", action="store_true",
-        help="今日头条安全代填：可见浏览器填好内容后由人工复核发布，自动化不点发布、不触发保存请求",
+        help="今日头条代填（默认已是这个行为）：可见浏览器填好后由人工发布，不发保存请求、不点发布",
+    )
+    parser.add_argument(
+        "--toutiao-save-draft", action="store_true",
+        help="显式恢复头条 save=0 自动存草稿。账号仍可能被平台拒绝；不能与 --publish 或 --toutiao-prepare-only 同用",
     )
     parser.add_argument("--rule-check", action="store_true", help="仅校验合规规则是否可信，不加载素材/不发布")
     args = parser.parse_args(argv)
+
+    if args.toutiao_save_draft and args.toutiao_prepare_only:
+        print("❌ --toutiao-save-draft 与 --toutiao-prepare-only 不能同时使用", file=sys.stderr)
+        return 2
+
+    if args.toutiao_save_draft and not args.draft:
+        print("❌ --toutiao-save-draft 只恢复 save=0 存草稿，不能与 --publish 同时使用", file=sys.stderr)
+        return 2
 
     if args.toutiao_prepare_only and not args.draft:
         print("❌ --toutiao-prepare-only 不能与 --publish 同时使用（代填模式绝不点发布）", file=sys.stderr)
@@ -722,21 +805,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("❌ 未能解析出标题，请用 --title 显式指定")
         return 2
 
-    platforms = resolve_platforms(args, assets)
-    if not platforms:
+    jobs = resolve_jobs(args, args.episode)
+    platforms: List[int] = []
+    for job in jobs:
+        if job["platform_type"] not in platforms:
+            platforms.append(job["platform_type"])
+    if not jobs:
         print("❌ 没有可用平台")
         return 2
 
     print(f"📦 第 {args.episode} 期 | 标题: {title}")
     print(f"🖼  封面: {assets['cover'] or '无'} | 内文图: {len(assets['inline'])} 张")
-    print(f"🎯 本轮平台: {[preflight.PLATFORM_NAMES.get(p, p) for p in platforms]}")
+    print("🎯 本轮: " + "、".join(
+        _job_label(
+            str(preflight.PLATFORM_NAMES.get(job["platform_type"], job["platform_type"])),
+            job["platform_type"],
+            job["tieba_kw"],
+        )
+        for job in jobs
+    ))
 
     # 离线预检：只做合规判定，不启动浏览器、不写数据库、不碰平台编辑页。
     # 「只是做测试」请用这个模式，不要用 --dry-run（后者会真的打开平台编辑页并填表）。
     if args.check_only:
         blocked = 0
-        for ptype in platforms:
-            pname = preflight.PLATFORM_NAMES.get(ptype, str(ptype))
+        for job in jobs:
+            ptype = job["platform_type"]
+            pname = _job_label(
+                str(preflight.PLATFORM_NAMES.get(ptype, ptype)),
+                ptype,
+                job["tieba_kw"],
+            )
             body = (
                 assets["long_body_by_platform"].get(ptype, assets["long_body"])
                 if ptype in LONG_FORM_PLATFORMS
@@ -776,13 +875,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  {icon} {c['platform_name']}: {c['reason']}")
 
     results: List[Dict[str, Any]] = []
-    for check in checks:
-        ptype = check["platform_type"]
-        pname = check["platform_name"]
+    check_by_type = {c["platform_type"]: c for c in checks}
+    for job in jobs:
+        ptype = job["platform_type"]
+        tieba_kw = str(job.get("tieba_kw") or "")
+        check = check_by_type.get(ptype)
+        if check is None:
+            results.append({
+                "platform": str(ptype), "type": ptype, "status": "skipped",
+                "tieba_kw": tieba_kw, "reason": "预检没有返回该平台",
+            })
+            continue
+        pname = _job_label(check["platform_name"], ptype, tieba_kw)
 
         # 待发内容包平台不需要 cookie（不碰浏览器），预检失败也不影响出包
         if not check["ok"] and ptype not in MANUAL_PACKAGE_PLATFORMS:
-            results.append({"platform": pname, "type": ptype, "status": "skipped", "reason": check["reason"]})
+            results.append({
+                "platform": pname, "type": ptype, "status": "skipped",
+                "tieba_kw": tieba_kw, "reason": check["reason"],
+            })
             continue
 
         existing = None
@@ -809,6 +920,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                         ),
                     })
                     continue
+        elif ptype == TIEBA_PLATFORM and not args.force:
+            # 贴吧按吧名幂等，不能按平台类型挡：同一期要发两个不同的吧。
+            if not tieba_kw:
+                results.append({
+                    "platform": pname, "type": ptype, "status": "blocked",
+                    "reason": "贴吧任务缺少吧名",
+                })
+                continue
+            named_bars, unscoped_tieba = publish_record.tieba_published_state(DB_PATH, args.episode)
+            if unscoped_tieba:
+                results.append({
+                    "platform": pname, "type": ptype, "status": "already_published",
+                    "tieba_kw": tieba_kw,
+                    "reason": "该期已有未记录吧名的贴吧成功发布，无法确认是哪个吧，禁止再发",
+                })
+                continue
+            if tieba_kw in named_bars:
+                results.append({
+                    "platform": pname, "type": ptype, "status": "already_published",
+                    "tieba_kw": tieba_kw,
+                    "reason": f"该期贴吧「{tieba_kw}」已发布，禁止重复发帖",
+                })
+                continue
         elif not args.force:
             existing = publish_record.find_published_record(DB_PATH, args.episode, ptype)
             if existing:
@@ -875,7 +1009,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         #            换浏览器/换 profile 就看不到，等于没存，只能直接发布；
         #   微博(11)、百度贴吧(10)——平台本身没有真草稿入口，
         #            草稿模式只能做到「填好但不发布」，无实质意义。
-        # 头条(7) 自 2026-11-09 起草稿链路已打通，走正常存草稿。
+        # 头条(7) 不在自动选台里。显式指定时默认代填：不发 save=0、不点发布。
+        # 只有 --toutiao-save-draft 才恢复自动存草稿。
         DIRECT_PUBLISH_PLATFORMS = (9, 11, 10)
         draft_only = bool(args.draft) or ptype in MANUAL_PACKAGE_PLATFORMS
         if args.draft and ptype in DIRECT_PUBLISH_PLATFORMS:
@@ -884,6 +1019,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"  ℹ️ {pname} 不支持平台侧草稿（草稿仅存本地浏览器/无草稿入口），"
                 f"本次按真实发布执行"
             )
+        use_prepare = ptype == TOUTIAO_PLATFORM and not args.toutiao_save_draft
+        if use_prepare and not args.draft:
+            print(f"  ℹ️ {pname} 不随 --publish 自动投稿，改为代填（不发保存请求、不点发布）")
+        if use_prepare or args.dry_run:
+            opening_status = publish_record.STATUS_PREVIEW
+        elif draft_only:
+            opening_status = publish_record.STATUS_DRAFT
+        else:
+            opening_status = publish_record.STATUS_PUBLISHING
 
         history_id = publish_record.create_record(
             DB_PATH,
@@ -894,10 +1038,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             title=platform_title,
             content=audit_body,
             files=assets["gallery"],
-            status=publish_record.STATUS_PREVIEW if args.dry_run
-            else (publish_record.STATUS_DRAFT if draft_only else publish_record.STATUS_PUBLISHING),
+            status=opening_status,
             episode=args.episode,
             topic=assets["topic"],
+            tieba_kw=tieba_kw or None,
         )
 
         # 禁止自动发布的平台：只产出待发内容包，全程不启动浏览器
@@ -939,9 +1083,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             direct_url = str(
                 _dispatch(
                     ptype, assets, platform_title, body, account_file,
-                    dry_run=args.dry_run, is_draft=draft_only, tieba_kw=args.tieba_kw,
+                    dry_run=args.dry_run,
+                    is_draft=True if use_prepare else draft_only,
+                    tieba_kw=tieba_kw,
                     patch_existing_dayu_draft=args.patch_existing_dayu_draft,
-                    toutiao_prepare_only=args.toutiao_prepare_only,
+                    toutiao_prepare_only=use_prepare,
                 ) or ""
             ).strip()
         except Exception as exc:  # noqa: BLE001
@@ -964,6 +1110,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             results.append({"platform": pname, "type": ptype, "status": "failed", "reason": error_msg, "failure_code": code})
             print(f"  ❌ {pname} 发布失败 [{code}]: {exc}")
+            continue
+
+        if use_prepare:
+            note = "今日头条代填结束：未发送保存请求、未点击发布。请人工在编辑页发布后再补链接。"
+            publish_record.finish_record(
+                DB_PATH, history_id, publish_record.STATUS_PREVIEW, error_msg=note,
+            )
+            results.append({
+                "platform": pname, "type": ptype, "status": "prepared", "reason": note,
+            })
+            print(f"  ⏸️ {pname} 代填结束（未存草稿、未发布）")
             continue
 
         if args.dry_run or draft_only:
@@ -1040,6 +1197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "episode": args.episode,
         "title": title,
         "platforms": platforms,
+        "jobs": jobs,
         "results": results,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1050,11 +1208,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     published = sum(1 for r in results if r["status"] == "published")
     drafted = sum(1 for r in results if r["status"] == "draft")
     packaged = sum(1 for r in results if r["status"] == "manual_package")
+    prepared = sum(1 for r in results if r["status"] == "prepared")
     print(
         f"\n📊 自动发布 {published} 个平台，已存草稿 {drafted} 个平台，"
-        f"待发内容包 {packaged} 个，明细已写入 {out}"
+        f"头条代填 {prepared} 个，待发内容包 {packaged} 个，明细已写入 {out}"
     )
-    return 0 if (published or drafted or packaged or args.dry_run) else 1
+    return 0 if (published or drafted or packaged or prepared or args.dry_run) else 1
 
 
 def asyncio_run_preflight(platforms: List[int], verify_cookie: bool) -> List[Dict[str, Any]]:

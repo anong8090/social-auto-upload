@@ -621,9 +621,92 @@ def test_sohu_upload_respects_global_headless_setting():
 def test_auto_pool_excludes_warned_sohu():
     """搜狐号被平台警告后，主线随机选台不得继续抽中它。"""
     source = (OMNIPOST_DIR / "scripts/publish_episode.py").read_text(encoding="utf-8")
-    assert "AUTO_PUBLISHABLE_PLATFORMS = (5, 7, 9, 10, 11, 15)" in source
+    assert "AUTO_PUBLISHABLE_PLATFORMS = (5, 9, 11, 15)" in source
     assert "被平台警告" in source
     print("✅ 主线随机选台：已排除被警告的搜狐号")
+
+
+def test_daily_tieba_pair_and_toutiao_stays_out_of_auto():
+    """每天固定两个贴吧；头条不进 auto，显式指定时默认代填而不是 save=0。"""
+    import sqlite3
+    import tempfile
+    from types import SimpleNamespace
+
+    from myUtils import publish_record as pr
+
+    assert pe.AUTO_PUBLISHABLE_PLATFORMS == (5, 9, 11, 15)
+    assert 7 not in pe.AUTO_PUBLISHABLE_PLATFORMS
+    assert 10 not in pe.AUTO_PUBLISHABLE_PLATFORMS
+    assert pe.default_tieba_bars() == ["建筑", "土木工程"]
+    assert pe.default_tieba_bars({"建筑"}) == ["土木工程", "市政工程"]
+    assert pe.parse_tieba_bars("建筑,土木工程，建筑") == ["建筑", "土木工程"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "publish.db"
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """CREATE TABLE publish_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform_type INTEGER, platform_name TEXT, account_name TEXT,
+                    content_type TEXT, title TEXT, content TEXT, tags TEXT, files TEXT,
+                    tieba_fid TEXT, tieba_kw TEXT, product_id INTEGER,
+                    status TEXT, error_msg TEXT, published_url TEXT,
+                    platform_item_id TEXT, screenshot_dir TEXT,
+                    topic TEXT, published_at TEXT, created_at TEXT
+                )"""
+            )
+        pr.ensure_publish_history_schema(db)
+        pr.create_record(
+            db, platform_type=10, platform_name="百度贴吧·建筑", account_name="测试",
+            content_type="article", title="已发建筑", status=pr.STATUS_PUBLISHED,
+            episode="40", tieba_kw="建筑",
+        )
+        named, unscoped = pr.tieba_published_state(db, "40")
+        assert named == {"建筑"} and unscoped is False
+        pr.create_record(
+            db, platform_type=10, platform_name="百度贴吧", account_name="测试",
+            content_type="article", title="旧帖没记吧名", status=pr.STATUS_PUBLISHED,
+            episode="41",
+        )
+        named_old, unscoped_old = pr.tieba_published_state(db, "41")
+        assert unscoped_old is True
+        assert "旧" not in "".join(named_old)
+
+    original_pick = pe.preflight.pick_random_platforms
+    original_state = pe.publish_record.tieba_published_state
+    try:
+        pe.preflight.pick_random_platforms = lambda *args, **kwargs: [5, 11]
+        pe.publish_record.tieba_published_state = lambda *args, **kwargs: (set(), False)
+        auto = SimpleNamespace(platforms="auto", count=5, seed=1, tieba_kw="")
+        jobs = pe.resolve_jobs(auto, "40")
+        assert [job["platform_type"] for job in jobs] == [5, 11, 10, 10]
+        assert [job["tieba_kw"] for job in jobs if job["platform_type"] == 10] == ["建筑", "土木工程"]
+
+        pe.publish_record.tieba_published_state = lambda *args, **kwargs: ({"建筑"}, False)
+        shifted = pe.resolve_jobs(auto, "40")
+        assert [job["tieba_kw"] for job in shifted if job["platform_type"] == 10] == ["土木工程", "市政工程"]
+
+        pe.publish_record.tieba_published_state = lambda *args, **kwargs: (set(), True)
+        blocked = pe.resolve_jobs(auto, "41")
+        assert [job["tieba_kw"] for job in blocked if job["platform_type"] == 10] == ["建筑", "土木工程"]
+
+        one_bar = SimpleNamespace(platforms="10", count=5, seed=None, tieba_kw="建筑")
+        assert pe.resolve_jobs(one_bar, "40") == [{"platform_type": 10, "tieba_kw": "建筑"}]
+
+        no_tieba = SimpleNamespace(platforms="5,9", count=5, seed=None, tieba_kw="")
+        assert [job["platform_type"] for job in pe.resolve_jobs(no_tieba, "40")] == [5, 9]
+
+        toutiao = SimpleNamespace(platforms="7", count=5, seed=None, tieba_kw="")
+        assert pe.resolve_jobs(toutiao, "40") == [{"platform_type": 7, "tieba_kw": ""}]
+    finally:
+        pe.preflight.pick_random_platforms = original_pick
+        pe.publish_record.tieba_published_state = original_state
+
+    source = (OMNIPOST_DIR / "scripts/publish_episode.py").read_text(encoding="utf-8")
+    assert "use_prepare = ptype == TOUTIAO_PLATFORM and not args.toutiao_save_draft" in source
+    assert "未发送保存请求、未点击发布" in source
+    assert "ptype == TIEBA_PLATFORM and not args.force" in source
+    print("✅ 每日两个贴吧写入选台；头条退出 auto，默认代填")
 
 
 def test_ai_share_xhs_readback_regressions():
@@ -783,6 +866,7 @@ def main():
     test_sohu_ai_declaration_wording_matches_page()
     test_sohu_upload_respects_global_headless_setting()
     test_auto_pool_excludes_warned_sohu()
+    test_daily_tieba_pair_and_toutiao_stays_out_of_auto()
     test_link_collector_item_id_and_public_guard()
     test_qiehao_title_match_exact()
     test_compliance_blocks_missing_inline_images()

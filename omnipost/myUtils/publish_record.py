@@ -250,6 +250,39 @@ def find_published_record(
         return None
 
 
+def tieba_published_state(
+    db_path: Path, episode: str | int
+) -> tuple[set[str], bool]:
+    """该期已成功发布的贴吧吧名，以及是否存在未记录吧名的成功帖。
+
+    旧记录没写 tieba_kw 时，无法证明下一帖不是同一个吧，调用方应整段跳过。
+    查询失败返回空集和 False，不把数据库故障当成「已经发过」。
+    """
+    ep = _as_episode(episode)
+    if not ep:
+        return set(), False
+    try:
+        with _connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT tieba_kw FROM publish_history
+                WHERE episode = ? AND platform_type = ? AND status = ?
+                """,
+                (ep, 10, STATUS_PUBLISHED),
+            ).fetchall()
+    except Exception:
+        return set(), False
+    named: set[str] = set()
+    unscoped = False
+    for row in rows:
+        text = str(row["tieba_kw"] or "").strip()
+        if text:
+            named.add(text)
+        else:
+            unscoped = True
+    return named, unscoped
+
+
 def find_any_attempt_record(
     db_path: Path, episode: str | int, platform_type: int
 ) -> Optional[Dict[str, Any]]:
