@@ -1,0 +1,42 @@
+{
+  "line": "personal",
+  "out": "样例",
+  "images": [
+    {
+      "file": "01_16x9_三张卡片.png",
+      "size": "16x9",
+      "layout": "cards",
+      "kicker": "不是算错",
+      "title": "一个问题，三个答案",
+      "footer": "三种都可以成立，不能收成一个数",
+      "cards": [
+        {"label": "粒度", "color": "blue", "lines": ["一次验收", "一张单据", "一个批次"]},
+        {"label": "时间", "color": "teal", "lines": ["验收当天", "签字那天", "入账那天"]},
+        {"label": "完成", "color": "orange", "lines": ["现场通过", "资料齐全", "财务确认"]}
+      ]
+    },
+    {
+      "file": "02_16x9_左右对照.png",
+      "size": "16x9",
+      "layout": "split",
+      "kicker": "答案太顺",
+      "title": "通常已经改过问题",
+      "footer": "顺，不是可以发出去的信号",
+      "left": {"title": "一个干脆的数", "lines": ["选定哪一种粒度", "选定哪一天", "选定怎样算完成"]},
+      "center": {"lines": ["停下", "先问清"]},
+      "right": {"title": "两种正经交法", "lines": ["只追问一个点", "或并列写出口径"]}
+    },
+    {
+      "file": "03_3x4_三行.png",
+      "size": "3x4",
+      "layout": "rows",
+      "kicker": "问数怎么交卷",
+      "title": "数字回到规格",
+      "rows": [
+        {"label": "模型", "color": "blue", "text": "听懂，并指出口径"},
+        {"label": "程序", "color": "teal", "text": "按规格取数和计算"},
+        {"label": "回核", "color": "orange", "text": "每个数字对回结果"}
+      ]
+    }
+  ]
+}

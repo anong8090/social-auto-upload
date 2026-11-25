@@ -1,0 +1,17 @@
+{
+  "line": "mainline",
+  "out": "样例",
+  "images": [
+    {
+      "file": "04_16x9_主线封面.png",
+      "size": "16x9",
+      "layout": "cover",
+      "kicker": "会审意见",
+      "title": "跟到关闭",
+      "logo": true,
+      "shot": "01.png",
+      "points": ["记成一条", "分到一个人", "关掉才算完"],
+      "footer": "没关掉的，不算处理完"
+    }
+  ]
+}

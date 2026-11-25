@@ -42,7 +42,7 @@
 
 ## 五、视觉工艺（强制）
 
-与技能 `personal-ip-ai-content` 的 `references/image-craft.md` 同一套，不要等用户再说明。参考实现：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/长文-Agent不是聊天框/生成配图.py`。
+与技能 `personal-ip-ai-content` 的 `references/image-craft.md` 同一套，不要等用户再说明。生成入口：`河狸云蓝枢_自媒体物料包/配图工坊/render.py`，规格 `line` 用 `personal`。不要再复制各期自己的 `生成配图.py`。
 
 - 画布 `1920×1080`，按微信缩到约 390px 后仍能读。说明文字不小于 40px，标题约 92px。
 - 苹方 PingFang 的 medium / semibold。不用 STHeiti 细体堆小字。
