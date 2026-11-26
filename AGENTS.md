@@ -217,16 +217,17 @@
 
 1. **内容规则**：每日单独指定内容，主题为「河狸云 AI 能力分享」，**不指定（不提及）蓝枢 / Planora**；两个平台发**同一份内容**；**只能存草稿**，绝不发布。
    - **个人 IP 调性**：以「一个做工程数字化产品的人，今天想明白的一件小事」为第一人称视角，重判断、边界与反思，轻功能清单和功能宣讲；不套用主线「痛点 1/2/3 → 解决方案 → 避坑清单」的结构。
-   - **精炼硬闸门**：`内容.md` 去掉 Markdown 标记与话题标签后的正文为 **180~320 个中文字符**，最多 3 个自然段，最多 1 个小标题；明显短于蓝枢母本 A（300~500 字）与母本 B（800~1100 字）。
+   - **平台形态分流（2026-11-26 用户明确）**：微信公众号文章按**长文**制作，不套每日 180~320 字的短稿闸门；默认 500 字以上、2~3 个小标题、3 张 16:9 横图按段落穿插。小红书继续使用 180~320 字精炼稿与 3:4 竖图。需要同一判断双平台发布时，先写公众号长文，再单独提炼小红书短稿，禁止把短稿加一张竖图直接当公众号文章。
+   - **精炼硬闸门（仅小红书/每日短稿）**：`内容.md` 去掉 Markdown 标记与话题标签后的正文为 **180~320 个中文字符**，最多 3 个自然段，最多 1 个小标题；明显短于蓝枢母本 A（300~500 字）与母本 B（800~1100 字）。
    - **不重复硬闸门**：禁止复用主线母本的标题、正文段落、话题标签与配图；`precheck` 会把当期内容与 `publish_history` 主线历史、个人 IP 历史、`文案合集/` 历史母本做标题/段落/句子相似度比对，命中即拒绝。近期选题按日期登记，避免同题换皮。
    - **深度思考闸门（2026-11-23 用户明确）**：个人 IP 文章必须基于新的具体判断，不能只在「AI 分水岭 / 场景先于答案 / 先说不知道」等相近论点上换标题重复。每次写作前先列出近期已发标题与核心论点，查阅 Obsidian（`/Users/anong/Library/Mobile Documents/iCloud~md~obsidian/Documents/瑞信产品/`，优先 `11-新媒体与分享`、`09-指南与技能库`）与可访问的 muse 沟通思考，提炼一个**尚未写过、有边界或反常识的判断**；若 muse 未找到或不可访问，如实说明，不得声称已查阅。
    - **视角边界**：可讲河狸云 AI 的产品判断、可信边界、工程现场观察与行业方法；涉及具体功能阶段时沿用今早公众号/官网已公开口径，不把规划写成上线，不引用客户名、内部数据、演示数据或未授权截图。
 2. **主线边界不变**：`myUtils/preflight.py` 的 `BANNED_PLATFORMS[1]`（小红书账号封禁）与 `DEFAULT_POOL`（不含 1）**继续生效**，主线 `publish_episode.py` 不得放行小红书；独立线走专用脚本，不改动这些拦截。主线飞书台账不再把 E 列固定视作小红书列，D~H 按当期实际成功平台动态填链接。
    - **2026-11-12 追加边界**：微信公众号(`type=12`)也不得承接蓝枢主线，`publish_episode.py` 的 `MAINLINE_FORBIDDEN_PLATFORMS[12]` 对显式指定硬拦截，auto 随机池不含 12；微信公众号只由本节独立线 `publish_ai_share.py` 发布有深度的 AI 应用思考，且不回填主线台账、不占用主线完成数。
-3. **专用脚本**：`omnipost/scripts/publish_ai_share.py`
-   - 仅允许 `--platforms 1,12`；**不提供 `--publish`**，传入 `--publish` / `--no-draft` / `--direct` 直接报错退出；两个平台都强制 `is_draft=True`。
-   - 素材目录：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/<YYYY-MM-DD>/`，含 `内容.md`（首行 `# 标题`）+ 当日专属配图；**配图里也不得出现蓝枢字样**，不得直接复用主线物料图（主线头图底部带「河狸云蓝枢」）。每日目录只允许一份 `内容.md`，从目录层落实「每天一条」。
-   - 发布前离线自检：标题红线（小红书 ≤ 20 字、公众号 ≤ 64 字）、零容忍词、品牌排除词、精炼字数/段落、主线历史与历史母本重复度、配图路径不得复用主线；任一不通过即中止。
+3. **专用脚本**：每日短稿走 `omnipost/scripts/publish_ai_share.py`；公众号长文走 `omnipost/scripts/publish_ai_share_longform.py`。两者**均不提供 `--publish`**，传入 `--publish` / `--no-draft` / `--direct` 直接报错退出；两个平台都强制 `is_draft=True`。
+   - `publish_ai_share.py` 仅允许 `--platforms 1,12`，只接每日短稿目录 `AI能力分享内容线/<YYYY-MM-DD>/`；`publish_ai_share_longform.py` 只接公众号长文目录 `AI能力分享内容线/长文-<主题>/`，读 `内容.md` + `正文排版.html` + `配图位置.json` + 3 张 16:9 图。禁止用短稿脚本给公众号存 3:4 竖图文章。
+   - 素材目录：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/<YYYY-MM-DD>/`，含 `内容.md`（首行 `# 标题`）+ 当日专属配图；**配图里也不得出现蓝枢字样**，不得直接复用主线物料图（主线头图底部带「河狸云蓝枢」）。每日目录只允许一份 `内容.md`，从目录层落实「每天一条」。长文另起 `长文-<主题>/` 目录，不占用短稿目录。
+   - 发布前离线自检：标题红线（小红书 ≤ 20 字、公众号 ≤ 64 字）、零容忍词、品牌排除词、按平台形态检查字数/段落（短稿 180~320 字，公众号长文 ≥500 字 + 3 张 16:9 + `配图位置.json`）、主线历史与历史母本重复度、配图路径不得复用主线；任一不通过即中止。
    - 存完草稿后**回平台草稿箱按本期标题回读核验**，未命中如实报错，不得只凭 toast/截图宣称成功。
    - 默认全程无头浏览器；公众号走系统 Chrome（bundled Chromium 打开 `mp.weixin.qq.com` 必 `Page crashed`）。
    - ⚠️ **小红书草稿可见性例外（2026-11-09 用户确认方案 A）**：小红书草稿只存在**当前浏览器 profile 的 IndexedDB**，换浏览器/换 profile 就看不到，无头填完人工基本看不到。因此独立线提供 `--visible-xhs`：用**独立进程**拉起可见 Chrome（`--user-data-dir=omnipost/browser_profiles/xiaohongshu` + `--remote-debugging-port=9333`），Playwright 通过 `connect_over_cdp` attach 填草稿，结束后**只断开 CDP、不关闭窗口**，草稿就留在那个可见窗口里供人工复核后自行发布。**其余平台仍无头**，此例外仅限小红书。
@@ -234,16 +235,26 @@
      - Playwright 自己 `launch` 的 Chrome 会在 driver 退出时被一并杀掉，**留窗必须走独立进程 + attach**（实测 `browser.close()` 只断 CDP，窗口存活）。
      - 草稿回读核验必须 attach 到**同一个持久化 profile**；早期用 `new_context(storage_state=...)` 的临时 context 读不到 IndexedDB 草稿，会误判。
    ```bash
+   # 每日短稿（小红书/短图文公众号）
    omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09 --check-only
    omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09
    # 小红书专用可见窗口（方案 A）
    omnipost/.venv/bin/python omnipost/scripts/publish_ai_share.py --date 2026-11-09 --platforms 1 --visible-xhs
+   # 公众号长文（3 张 16:9，按段落插图）
+   omnipost/.venv/bin/python omnipost/scripts/publish_ai_share_longform.py \
+     --dir "河狸云蓝枢_自媒体物料包/AI能力分享内容线/长文-<主题>" --check-only
+   omnipost/.venv/bin/python omnipost/scripts/publish_ai_share_longform.py \
+     --dir "河狸云蓝枢_自媒体物料包/AI能力分享内容线/长文-<主题>"
+   # 既有草稿原位修补，不新建重复草稿
+   omnipost/.venv/bin/python omnipost/scripts/publish_ai_share_longform.py \
+     --dir "河狸云蓝枢_自媒体物料包/AI能力分享内容线/长文-<主题>" \
+     --patch-existing --existing-title "<草稿箱当前标题>"
    ```
 4. **账号实测（2026-11-09）**：
    - 小红书（`type=1`）cookie 有效，创作者后台「Mason」可打开，发布页显示「草稿箱(0)」，上传器 `xiaohongshu_uploader/main.py` 已实现「暂存离开 / 存草稿」分支。但 `user_info.status=0`，且项目铁律仍记其封禁——**独立线是否实跑须由用户明确确认，不得擅自解禁或存草稿**。
    - 微信公众号（`type=12`）cookie 会过期；`cookie_auth` 会准确返回 `False`，`wechat_mp_cookie_gen` 在无头模式下等二维码图片真正加载后裁图（`*.login_qr.png`）供人工扫码，不弹可见浏览器。**登录进程必须持续等待扫码并保存新 cookie**，否则用户扫到的二维码不会落库（2026-11-10 已修复）。草稿箱回读必须先从后台链接提取当前 `token`，再拼接 `action=list_card` 地址；固定 URL 会显示「请重新登录」。新版编辑器首次进入有教育提示弹窗遮挡标题框，保存按钮也可能在视口外，上传器需关闭弹窗并对「保存为草稿」按钮做 DOM click 兜底。
    - ⚠️ **公众号草稿箱与图文实测（2026-11-10）**：新版后台真实草稿箱链接是 `type=77&action=list_card`，必须从当前后台 `a[href*="action=list_card"][href*="type=77"]` 取完整 href；`type=9` 打开的是「发表记录」。草稿卡片标题会把普通空格渲染成 NBSP（`\xa0` / `&nbsp;`），按标题回读必须做空白归一化，并优先定位 `.publish_card_container`；hover 卡片后才有可见的「编辑」入口，点卡片标题会打开临时预览页。
    - ⚠️ **公众号图文内容不完整**：只填标题/正文就存草稿，草稿箱会提示「图文内容不完整，请补充封面图、标题或者正文」。上传器必须用 `input[type="file"][name="file"][accept*="image"]` 真实插入正文图，再走「拖拽或选择封面 → 从正文选择 → 精确点 `li.appmsg_content_img_item .appmsg_content_img.cover` → 下一步 → 编辑封面确认」，最后回读 computed `background-image` 真实非空；`url("")` 不算封面。保存前必须同时校验「正文图片≥1 + 封面非空」，存完还要回草稿箱按本期标题与配图证据回读，未命中如实抛错。
-   - ⚠️ **公众号既有草稿修补**：重跑/纠错不得新建重复草稿。`omnipost/scripts/publish_ai_share.py --date <YYYY-MM-DD> --platforms 12 --patch-existing-wechat-draft` 只从 `type=77` 草稿箱精确打开本期 `appmsgid`，保留原标题与原文，仅补正文图/封面并点「保存为草稿」。`sau_backend.py` 等后台旧调用若只给封面没给 `file_list`，`post_article_wechat_mp()` 会把已解析封面补作正文图来源，绝不放行无图草稿。只读复核重新打开编辑器时，需检查整个 `contenteditable` 与 `img[data-src]` / 公众号素材域名；用不存在的正文片段定位编辑器会得到 `imgs=[]` 的假阴性。
+   - ⚠️ **公众号既有草稿修补**：重跑/纠错不得新建重复草稿。短稿用 `publish_ai_share.py --date <YYYY-MM-DD> --platforms 12 --patch-existing-wechat-draft` 原位补正文图/封面；公众号文章升级为长文时用 `publish_ai_share_longform.py --dir <长文目录> --patch-existing --existing-title <草稿箱当前标题>`，按标题精确打开本期 `appmsgid`，重排正文并按锚点插图，不得新建同题草稿。找不到标题必须抛错。`sau_backend.py` 等后台旧调用若只给封面没给 `file_list`，`post_article_wechat_mp()` 会把已解析封面补作正文图来源，绝不放行无图草稿。只读复核重新打开编辑器时，需检查整个 `contenteditable` 与 `img[data-src]` / 公众号素材域名；用不存在的正文片段定位编辑器会得到 `imgs=[]` 的假阴性。
 5. **每日节奏建议（个人 IP，不与主线混排）**：一条只讲一个判断，按「现场观察 / 产品边界 / 可信机制 / 工程方法 / 行业反思 / 一个反常识问题」轮换；公众号与小红书用同一份精炼母本，但配图和标题人工复核后再发布，追求克制、连续、可积累，而不是把主线长文压缩后重发。
 6. **未做事项**：飞书台账回填、OmniPost `publish_history` / `publish_drafts` 入库、6 张配图生成、每日选题自动生成——均待用户确认内容线正式启用后再接。
