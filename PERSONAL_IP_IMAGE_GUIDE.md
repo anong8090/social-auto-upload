@@ -3,6 +3,8 @@
 > 适用：`河狸云蓝枢_自媒体物料包/AI能力分享内容线/` 下的短稿与长文。
 >
 > 检查入口：`~/.agents/skills/personal-ip-ai-content/scripts/check_draft.py` 的 `check_images`。
+> 生成入口：`河狸云蓝枢_自媒体物料包/配图工坊/render.py`（规格 `line` 用 `personal`）。
+> 校验入口：`~/.agents/skills/personal-ip-ai-content/scripts/validate_images.py`（v2.4.4+）。
 
 ## 一、规格
 
@@ -53,7 +55,35 @@
 - 公众号文章默认按长文制作：3 张 16:9 横图，按 `配图位置.json` 穿插在段落后，不堆在文首或文末。`01_3x4_*.png` 是小红书短稿规格，不得直接用于公众号文章。
 - 公众号长文走 `omnipost/scripts/publish_ai_share_longform.py`，短稿走 `omnipost/scripts/publish_ai_share.py`；脚本选择错误会把低配竖图带进公众号。
 
-## 六、检查命令
+## 六、整篇模式生成（v2.4.4+ 推荐）
+
+长文配图建议使用「父规格」+ `--mode episode` 一次性生成 3 张图：
+
+```bash
+python3 河狸云蓝枢_自媒体物料包/配图工坊/render.py \
+  <父规格.json> --mode episode
+```
+
+父规格示例（见 `references/image-craft.md`）：
+- 自动分配互不相同版式（从 `cards/split/rows/statement/compare/path` 无放回抽取）
+- 自动按固定色序分配色块（navy→blue→teal→orange，不撞色）
+- 自动生成文件名、kicker、footer
+- 输出联排预览图 `preview_联排.png` 供快速确认
+- 自动写入 `assets/image-registry.json` 做跨期去重
+
+## 七、自动化校验（v2.4.4+ 新增）
+
+落盘前/发布前建议跑一遍：
+
+```bash
+RENDER_DIR=/path/to/配图工坊 python3 ~/.agents/skills/personal-ip-ai-content/scripts/validate_images.py \
+  --dir <长文目录> --mode longform \
+  --registry /path/to/配图工坊/assets/image-registry.json
+```
+
+校验项：尺寸比例、跨期去重（SHA-256 + 感知哈希）、色块对比度、版式唯一性、禁词、文本溢出预检。
+
+## 八、检查命令
 
 ```bash
 # 短稿
