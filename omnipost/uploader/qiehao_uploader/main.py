@@ -291,25 +291,40 @@ class QiehaoPost(object):
         editor = page.locator('div.ProseMirror[contenteditable="true"]').first
         before = await editor.locator("img").count() if await editor.count() else 0
 
-        btn = page.locator("exeditor-toolbar-button").first
+        # 用精确标识定位「插入图片」按钮，避免 DOM 顺序变化后误点其他工具。
+        btn = page.locator('exeditor-toolbar-button[data-toolbar-item-of="imagePlugin"]').first
         if not await btn.count():
+            qiehao_logger.warning("企鹅号未找到「插入图片」工具栏按钮")
             return False
         await btn.click(force=True)
         await page.wait_for_timeout(1800)
 
         dialog = page.locator(".omui-dialog-wrapper.open").first
+        # 等弹窗真正出现（第二次插图时 DOM 重建可能慢于固定等待）
+        for _ in range(10):
+            if await dialog.count():
+                break
+            await page.wait_for_timeout(500)
         tab = dialog.locator(".omui-tab__label:has-text('本地上传')").first
         if await tab.count():
             await tab.click(force=True)
             await page.wait_for_timeout(1500)
         file_input = dialog.locator('input[type="file"][accept*="image"]').first
         if not await file_input.count():
+            qiehao_logger.warning(
+                f"企鹅号图片弹窗未找到文件输入框（img {before}→?），弹窗摘要: "
+                f"{(await dialog.inner_text())[:100] if await dialog.count() else '无弹窗'}"
+            )
             return False
         await file_input.set_input_files(image_path)
         # 等图片真正上传完成：确认按钮从 disabled 变为可用才算上传成功。
         # 旧代码固定等 4 秒后 force 点击禁用按钮，图片从未插入编辑器。
         confirm = dialog.locator("button:has-text('确认')").first
         if not await confirm.count():
+            qiehao_logger.warning(
+                f"企鹅号图片上传后未找到「确认」按钮，弹窗摘要: "
+                f"{(await dialog.inner_text())[:120] if await dialog.count() else '无弹窗'}"
+            )
             return False
         for _ in range(30):
             if await confirm.count() and not await confirm.is_disabled():
@@ -728,7 +743,39 @@ class QiehaoPost(object):
                     qiehao_logger.info("已点击企鹅号「存草稿」按钮，等待平台确认…")
                 else:
                     qiehao_logger.info("已点击企鹅号发布按钮，等待平台确认…")
-                await page.wait_for_timeout(6000)
+                await page.wait_for_timeout(2000)
+                # 企鹅号保存前会弹「AI生成声明」二次确认，不处理草稿不会落库。
+                ai_dialog = page.locator('.omui-dialog-wrapper.open:has-text("AI生成声明")').first
+                if await ai_dialog.count():
+                    # 配图均由 AI 生成：勾选素材卡片后提交声明。
+                    thumbs = ai_dialog.locator('section.omui-thumb')
+                    for i in range(await thumbs.count()):
+                        try:
+                            await thumbs.nth(i).click(force=True, timeout=3000)
+                        except Exception:
+                            pass
+                    submit = ai_dialog.locator("button:has-text('提交')").first
+                    if await submit.count() and not await submit.is_disabled():
+                        await submit.click(force=True)
+                        await page.wait_for_timeout(2000)
+                        qiehao_logger.info("已提交企鹅号 AI 生成声明弹窗")
+                        # 平台在 AI 声明弹窗后会关闭首次「存草稿」请求，
+                        # 编辑器左下角「已保存」只是本地草稿，必须再点一次才进平台草稿箱。
+                        action_btn2 = page.locator('button:has-text("存草稿"), button:has-text("保存草稿")').first
+                        if await action_btn2.count() and await action_btn2.is_visible():
+                            await action_btn2.click(force=True)
+                            await page.wait_for_timeout(3000)
+                            qiehao_logger.info("AI 声明后再次点击「存草稿」，确保草稿落库")
+                            # 二次点击可能再弹一次声明，若出现则直接提交
+                            dlg2 = page.locator('.omui-dialog-wrapper.open:has-text("AI生成声明")').first
+                            if await dlg2.count():
+                                submit2 = dlg2.locator("button:has-text('提交')").first
+                                if await submit2.count() and not await submit2.is_disabled():
+                                    await submit2.click(force=True)
+                                    await page.wait_for_timeout(2000)
+                    else:
+                        qiehao_logger.warning("企鹅号 AI 生成声明弹窗提交按钮不可用")
+                await page.wait_for_timeout(4000)
                 done_shot = Path(self.account_file).parent / "qiehao_article_done.png"
                 await page.screenshot(path=str(done_shot))
                 qiehao_logger.success(f"🎉 企鹅号发布流程结束！截图: {done_shot}")
