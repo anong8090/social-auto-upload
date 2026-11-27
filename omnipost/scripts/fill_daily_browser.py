@@ -53,6 +53,26 @@ class ChromeScriptError(RuntimeError):
     pass
 
 
+JS_DISABLED_HINT = (
+    "Chrome 还没开「允许 Apple 事件中的 JavaScript」。\n"
+    "   菜单：查看 → 开发者 → 允许 Apple 事件中的 JavaScript，打开后重跑。"
+)
+
+
+def _is_js_disabled(message: str) -> bool:
+    return "执行 JavaScript 的功能已关闭" in message or "Apple 事件中的 JavaScript" in message
+
+
+def assert_js_enabled() -> None:
+    """先确认能执行 JS，否则后面所有等待都会误报成「页面元素未出现」。"""
+    try:
+        js_eval(1, "'ok'")
+    except ChromeScriptError as exc:
+        if _is_js_disabled(str(exc)):
+            raise ChromeScriptError(JS_DISABLED_HINT) from exc
+        raise
+
+
 def osascript(script: str) -> str:
     proc = subprocess.run(
         ["osascript", "-e", script], capture_output=True, text=True, timeout=120
@@ -91,19 +111,27 @@ def open_tab(url: str) -> int:
 
 def wait_ready(tab_index: int, selector: str, timeout: int = 45) -> None:
     deadline = time.time() + timeout
+    last_url = ""
     while time.time() < deadline:
         try:
             ready = js_eval(
                 tab_index,
-                f"JSON.stringify({{state: document.readyState, hit: !!document.querySelector({json.dumps(selector)})}})",
+                "JSON.stringify({href: location.href, state: document.readyState, "
+                f"hit: !!document.querySelector({json.dumps(selector)})}})",
             )
             data = json.loads(ready or "{}")
+            last_url = data.get("href") or last_url
             if data.get("hit"):
                 return
-        except ChromeScriptError:
-            pass
+        except ChromeScriptError as exc:
+            # 开关没开时必须立刻失败，不能被当成「页面还没加载好」继续等
+            if _is_js_disabled(str(exc)):
+                raise ChromeScriptError(JS_DISABLED_HINT) from exc
         time.sleep(1.5)
-    raise ChromeScriptError(f"页面元素未出现：{selector}（可能是没登录或页面改版）")
+    raise ChromeScriptError(
+        f"页面元素未出现：{selector}\n   当前地址：{last_url or '(空)'}\n"
+        "   如果是登录页，请先在这个标签页里登录；若是发布页，可能是页面改版。"
+    )
 
 
 XHS_JS = r"""
@@ -265,8 +293,10 @@ def main() -> int:
     payload_url = f"{BRIDGE}/payload?dir={quote(args.dir)}&kind={args.kind}"
     try:
         osascript(f'tell application "{CHROME}" to get URL of active tab of front window')
+        # 先确认 JS 通道，否则会在后面误报成「页面元素未出现」
+        assert_js_enabled()
     except ChromeScriptError as exc:
-        print(f"❌ 无法访问 Chrome：{exc}", file=sys.stderr)
+        print(f"❌ {exc}", file=sys.stderr)
         return 2
 
     print(f"🌐 打开 {args.platform} 发布页…")

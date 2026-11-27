@@ -57,35 +57,81 @@ async function loadDirs() {
   if (preferred) select.value = preferred;
 }
 
+async function tryPayload(source) {
+  const kind = source.startsWith("长文-") ? "long" : "daily";
+  let res;
+  try {
+    res = await fetch(`${BRIDGE}/payload?dir=${encodeURIComponent(source)}&kind=${kind}`);
+  } catch (err) {
+    const netError = new Error(
+      `连不上桥接服务（${err.message || err}）\n请先启动：\n` +
+        "omnipost/.venv/bin/python omnipost/scripts/xhs_fill_bridge.py"
+    );
+    netError.network = true;
+    throw netError;
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) {
+    const gateError = new Error(body.error || `HTTP ${res.status}`);
+    gateError.status = res.status;
+    throw gateError;
+  }
+  return body;
+}
+
 async function loadPayload() {
-  const source = $("source").value;
-  if (!source) {
+  const select = $("source");
+  if (!select.value) {
     setStatus("没有可选的内容目录");
     return;
   }
-  const kind = source.startsWith("长文-") ? "long" : "daily";
   setStatus("正在读取…");
   payload = null;
   $("fill").disabled = true;
-  try {
-    const res = await fetch(
-      `${BRIDGE}/payload?dir=${encodeURIComponent(source)}&kind=${kind}`
-    );
-    const body = await res.json();
-    if (!res.ok || !body.ok) throw new Error(body.error || `HTTP ${res.status}`);
-    payload = body;
-    $("title").textContent = body.title;
-    $("meta").textContent = `${body.images.length} 张配图 · 正文 ${body.body_chars} 字${
-      body.tags.length ? ` · ${body.tags.length} 个话题` : ""
-    }`;
-    setStatus(body.warnings.length ? body.warnings.join("\n") : "内容已就绪，可填入当前页。");
-    $("fill").disabled = false;
-  } catch (err) {
-    setStatus(
-      `读取失败：${err.message || err}\n请确认桥接服务已启动：\n` +
-        "omnipost/.venv/bin/python omnipost/scripts/xhs_fill_bridge.py"
-    );
+
+  const skipped = [];
+  let index = select.selectedIndex;
+  for (let attempts = 0; attempts < 4 && index < select.options.length; attempts += 1) {
+    const source = select.options[index].value;
+    try {
+      const body = await tryPayload(source);
+      payload = body;
+      $("title").textContent = body.title;
+      $("meta").textContent = `${body.images.length} 张配图 · 正文 ${body.body_chars} 字${
+        body.tags.length ? ` · ${body.tags.length} 个话题` : ""
+      }`;
+      const lines = [];
+      if (skipped.length) {
+        lines.push(`已跳过不合规的目录：`);
+        lines.push(...skipped.map((s) => `  · ${s}`));
+      }
+      lines.push(body.warnings.length ? body.warnings.join("\n") : "内容已就绪，可填入当前页。");
+      setStatus(lines.join("\n"));
+      $("fill").disabled = false;
+      return;
+    } catch (err) {
+      if (err.network) {
+        setStatus(`读取失败：${err.message}`);
+        return;
+      }
+      if (err.status === 422) {
+        // 合规闸门拒绝：自动换下一个候选，不再让用户猜哪一期能用
+        skipped.push(`${source}（${err.message.replace(/^合规自检未通过：/, "")}）`);
+        if (index + 1 < select.options.length) {
+          index += 1;
+          select.selectedIndex = index;
+          continue;
+        }
+      }
+      setStatus(`读取失败：${err.message || err}`);
+      return;
+    }
   }
+  setStatus(
+    "这些目录都没通过合规自检：\n  · " +
+      skipped.join("\n  · ") +
+      "\n请先改稿，或换一个内容来源。"
+  );
 }
 
 async function ensureContentScript(tabId, platform) {
