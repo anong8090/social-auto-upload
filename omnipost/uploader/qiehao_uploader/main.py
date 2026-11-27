@@ -87,13 +87,16 @@ def _is_public_qiehao_url(url: str) -> bool:
 
 
 async def _has_auth_cookie(context) -> bool:
-    """企鹅号登录成功后通常会有 om_token 或 uin / skey。"""
+    """企鹅号认证 cookie。平台新版改用 omtoken/omaccesstoken，旧版为 om_token/uin/skey。"""
     try:
         cookies = await context.cookies()
     except Exception:
         return False
     names = {c.get("name") for c in cookies}
-    return bool(names & {"om_token", "uin", "skey", "p_skey", "pt4_token"})
+    return bool(names & {
+        "om_token", "omtoken", "omaccesstoken", "userid",
+        "uin", "skey", "p_skey", "pt4_token",
+    })
 
 
 async def _wait_until_logged_in(page: Page, context, timeout_ms: int = 200_000) -> bool:
@@ -303,12 +306,19 @@ class QiehaoPost(object):
         if not await file_input.count():
             return False
         await file_input.set_input_files(image_path)
-        await page.wait_for_timeout(4000)
-
+        # 等图片真正上传完成：确认按钮从 disabled 变为可用才算上传成功。
+        # 旧代码固定等 4 秒后 force 点击禁用按钮，图片从未插入编辑器。
         confirm = dialog.locator("button:has-text('确认')").first
         if not await confirm.count():
             return False
-        await confirm.click(force=True)
+        for _ in range(30):
+            if await confirm.count() and not await confirm.is_disabled():
+                break
+            await page.wait_for_timeout(1000)
+        else:
+            qiehao_logger.warning(f"企鹅号图片上传后「确认」按钮始终不可用: {image_path}")
+            return False
+        await confirm.click()
         await page.wait_for_timeout(2500)
 
         after = await editor.locator("img").count() if await editor.count() else 0

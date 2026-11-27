@@ -50,28 +50,56 @@ async def login_qiehao():
         print("⏳ 请在打开的浏览器窗口中完成企鹅号扫码登录（微信或QQ扫码）...")
 
         logged_in = False
+        auth_names: set[str] = set()
+        auth_cookie_names = {"om_token", "omtoken", "omaccesstoken", "userid", "uin", "skey", "p_skey", "pt4_token"}
         for sec in range(600):
             await asyncio.sleep(1)
             cur_url = page.url.lower()
-            # 对齐 qiehao_uploader._has_auth_cookie：
-            # URL 进入 /main 即代表扫码登录完成；凭证名可能随平台改用 pt4_token。
-            if "main" in cur_url or ("om.qq.com" in cur_url and "userauth" not in cur_url and "login" not in cur_url):
+            # 新版企鹅号把登录态放在 localStorage(OM_qq_user_key)，不是 cookie；
+            # 旧版是 om_token/uin/skey 等 cookie。两者任一成立且已进入后台即视为登录。
+            cookies = await context.cookies()
+            auth_names = {c.get("name") for c in cookies} & auth_cookie_names
+            try:
+                user_key = await page.evaluate("() => localStorage.getItem('OM_qq_user_key')")
+            except Exception:
+                user_key = None
+            in_backend = "main" in cur_url or (
+                "om.qq.com" in cur_url and "userauth" not in cur_url and "login" not in cur_url
+            )
+            if in_backend and (auth_names or user_key):
+                source = "cookie" if auth_names else "localStorage:OM_qq_user_key"
                 logged_in = True
-                print(f"✅ 检测到企鹅号后台页面（登录成功）！URL: {page.url}")
+                print(f"✅ 检测到企鹅号登录成功！URL: {page.url} | 凭证来源: {source} | cookie: {sorted(auth_names)}")
                 break
 
             if sec > 0 and sec % 30 == 0:
-                print(f"⏳ 等待登录中... 已过 {sec} 秒，当前 URL: {page.url}")
+                print(f"⏳ 等待登录中... 已过 {sec} 秒，当前 URL: {page.url} | cookie凭证: {sorted(auth_names)} | userKey: {'有' if user_key else '无'}")
 
         if not logged_in:
             print("❌ 登录超时（600秒）")
             await browser.close()
             return False
 
-        await page.wait_for_timeout(3000)
+        # 保存前强制刷新后台页，确认登录态在新加载后仍然成立（避免 SSO 跳转瞬间的假成功）。
+        verified = False
+        for _ in range(10):
+            await page.wait_for_timeout(1500)
+            try:
+                await page.goto("https://om.qq.com/main", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                continue
+            await page.wait_for_timeout(1500)
+            if "userauth" not in page.url.lower() and "login" not in page.url.lower():
+                verified = True
+                break
+        if not verified:
+            print(f"❌ 登录态未稳定：刷新后仍跳转登录页（{page.url}），拒绝保存不完整 cookie")
+            await browser.close()
+            return False
+
         cookies = await context.cookies()
-        auth_names = sorted({c.get("name") for c in cookies} & {"om_token", "uin", "skey", "p_skey", "pt4_token"})
-        print(f"🔑 登录会话凭证: {auth_names if auth_names else '未识别到标准凭证名（后台页面 /main 本身可作有效判据）'}")
+        auth_names = {c.get("name") for c in cookies} & auth_cookie_names
+        print(f"🔑 登录会话凭证: {sorted(auth_names)}")
         await context.storage_state(path=str(COOKIE_FILE))
         print(f"💾 Cookie 已保存至: {COOKIE_FILE}")
 
