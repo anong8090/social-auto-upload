@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""「河狸云 AI 能力分享」独立个人 IP 内容线：小红书 + 微信公众号，只存草稿。
+"""「河狸云 AI 能力分享」独立个人 IP 内容线：小红书 + 今日头条 + 微信公众号，只存草稿。
 
 与主线 `publish_episode.py` 完全隔离：
 
@@ -8,8 +8,10 @@
 - 主线是「蓝枢」一稿五投，随机抽 5 台；小红书在主线里被 `preflight.BANNED_PLATFORMS`
   硬拦截（AGENTS.md 记其为封禁账号）。本脚本不动主线的封禁表与候选池。
 - 本内容线**不指定（不提及）蓝枢**，只讲河狸云的 AI 能力分享，每日单独指定内容。
-- 两个平台发**同一份内容**，都**只存草稿**，绝不点击「发布 / 发表 / 发送」。
-- 全程无头浏览器，不干扰用户工作。
+- 各平台发**同一份内容**，都**只存草稿**，绝不点击「发布 / 发表 / 发送」。
+- 今日头条（7）2026-11-27 起从蓝枢主线剥离，改由本内容线承接：
+  走编辑器自动保存（save=0）进草稿箱，不点「预览并发布」。
+- 默认全程无头浏览器，不干扰用户工作。
 
 素材约定（每天一个目录，由人工/上游生成）：
 
@@ -61,15 +63,15 @@ from scripts import compliance_check as cc  # noqa: E402
 
 MATERIAL_ROOT = PROJECT_DIR / "河狸云蓝枢_自媒体物料包" / "AI能力分享内容线"
 CONTENT_LINE = "河狸云AI能力分享（个人IP）"
-ALLOWED_PLATFORMS = (1, 12)  # 小红书 / 微信公众号
-PLATFORM_LABELS = {1: "小红书", 12: "微信公众号"}
+ALLOWED_PLATFORMS = (1, 7, 12)  # 小红书 / 今日头条 / 微信公众号
+PLATFORM_LABELS = {1: "小红书", 7: "今日头条", 12: "微信公众号"}
 
 # 独立内容线独有的红线：正文/标题不得出现「蓝枢」及其产品名。
 # 用户明确要求「不指定蓝枢」，这里在零容忍词之外单独加一道闸门。
 BRAND_EXCLUSIONS = ("蓝枢", "Planora", "河狸云·蓝枢")
 
-# 小红书标题 20 字、公众号 64 字（与 preflight.TITLE_LIMITS 中 12 一致）
-TITLE_LIMITS = {1: (1, 20), 12: (1, 64)}
+# 小红书标题 20 字、头条 30 字、公众号 64 字
+TITLE_LIMITS = {1: (1, 20), 7: (1, 30), 12: (1, 64)}
 
 # 个人 IP 线比蓝枢母本更精炼：去掉 Markdown 标记与话题标签后，
 # 中文正文 180~320 字、最多 3 个自然段、最多 1 个小标题。
@@ -145,6 +147,19 @@ def check_public_level(text: str) -> Tuple[List[str], List[str]]:
                 f"公开分级提醒：出现「{word}」，确认不属于不公开内容"
             )
     return problems, warnings
+
+
+def to_plain_text(raw: str) -> str:
+    """把 Markdown 正文转成平台编辑器里的纯文本。
+
+    头条图文编辑器是富文本，直接灌入 `## 小标题` 会原样显示成井号。
+    公众号走 正文排版.html，不需要这一步。
+    """
+    text = re.sub(r"(?m)^#{1,6}\s*", "", raw)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"(?m)^[-*]\s+", "· ", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    return text.strip()
 
 
 def _normalize_text(raw: str) -> str:
@@ -458,6 +473,59 @@ def _wechat_token(href: str) -> str:
     return match.group(1) if match else ""
 
 
+def _readback_toutiao_draft(title: str, retries: int = 4) -> bool:
+    """回今日头条草稿箱按标题核对是否落库（只读，不保存、不发布）。
+
+    头条图文没有「存草稿」按钮，草稿落库靠编辑器自动保存请求里的 `save=0`。
+    这里只读 `/mp/agw/creator_center/draft_list`，和上传器 `save_draft()`
+    使用的是同一个判据，避免「接口报错但其实已落库」被误判为失败。
+    """
+    import asyncio
+    from playwright.async_api import async_playwright
+    from conf import LOCAL_CHROME_PATH
+    from utils.base_social_media import set_init_script
+
+    cookie = OMNIPOST_DIR / "cookiesFile" / _account_files(7)[0]
+
+    async def _run() -> bool:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True, channel="chrome",
+                **({"executable_path": LOCAL_CHROME_PATH} if LOCAL_CHROME_PATH else {}),
+            )
+            ctx = await browser.new_context(
+                storage_state=str(cookie), viewport={"width": 1440, "height": 900}, locale="zh-CN"
+            )
+            ctx = await set_init_script(ctx)
+            try:
+                page = await ctx.new_page()
+                await page.goto(
+                    "https://mp.toutiao.com/profile_v4/manage/draft",
+                    timeout=90000, wait_until="domcontentloaded",
+                )
+                for attempt in range(1, retries + 1):
+                    await page.wait_for_timeout(4000)
+                    titles = await page.evaluate(
+                        """async () => {
+                            const r = await fetch(
+                                '/mp/agw/creator_center/draft_list?type=0&count=20&app_id=1231',
+                                { credentials: 'include' }
+                            );
+                            const j = await r.json();
+                            return (j.draft_list || []).map(d => d.title || '');
+                        }"""
+                    )
+                    if title in (titles or []):
+                        return True
+                    if attempt < retries:
+                        await page.wait_for_timeout(6000)
+                return False
+            finally:
+                await browser.close()
+
+    return asyncio.run(_run())
+
+
 def _readback_drafts(ptype: int, title: str, cdp_endpoint: str = "", require_image: bool = False) -> bool:
     """存完草稿后回平台草稿箱按本期标题回读核验。
 
@@ -626,7 +694,10 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="河狸云 AI 能力分享独立内容线（只存草稿）")
     parser.add_argument("--date", default=date.today().isoformat(), help="内容日期 YYYY-MM-DD")
     parser.add_argument("--dir", default="", help="直接指定内容目录（覆盖 --date）")
-    parser.add_argument("--platforms", default="1,12", help="平台类型，仅允许 1,12")
+    parser.add_argument(
+        "--platforms", default="1,12",
+        help="平台类型，仅允许 1(小红书)、7(今日头条)、12(微信公众号)；默认 1,12",
+    )
     parser.add_argument("--check-only", action="store_true", help="只做离线合规自检")
     parser.add_argument("--tags", default="", help="逗号分隔话题标签")
     parser.add_argument(
@@ -674,8 +745,8 @@ def main(argv: List[str] | None = None) -> int:
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
     cdp_endpoint = ""
     if args.visible_xhs and 1 in platforms:
-        # 用户明确选择方案 A：小红书用专用可见窗口，存完草稿保留窗口。
-        # 其余平台（公众号）继续走无头，不受影响。
+        # 小红书用专用可见窗口，存完草稿保留窗口。
+        # 其余平台（头条/公众号）继续走无头，不受影响。
         try:
             cdp_endpoint = _start_visible_xhs_window()
         except Exception as exc:
@@ -700,6 +771,22 @@ def main(argv: List[str] | None = None) -> int:
                     cdp_endpoint=cdp_endpoint,
                     keep_window_open=bool(cdp_endpoint),
                 )
+            elif ptype == 7:
+                # 头条正文同一时刻只保留 1 个图片块：封面用第一张，内文只用第二张。
+                # is_draft=True 走编辑器自动保存（save=0），由上传器内部回读核验；
+                # 绝不传 publish/prepare_only，避免误投稿或挂起等待人工。
+                postVideo.post_article_toutiao(
+                    title=assets["title"],
+                    body=to_plain_text(assets["body"]),
+                    tags=tags,
+                    account_file=accounts,
+                    cover_path=assets["images"][0],
+                    inline_image_paths=assets["images"][1:2],
+                    work_statements=["引用AI"],
+                    is_draft=True,
+                    prepare_only=False,
+                    dry_run=False,
+                )
             else:
                 postVideo.post_article_wechat_mp(
                     title=assets["title"],
@@ -719,12 +806,15 @@ def main(argv: List[str] | None = None) -> int:
                 )
             # 草稿箱回读核验：点了存草稿不等于落库。小红书必须读同一个
             # 持久化 profile（留窗模式下直接 attach 到那个可见窗口）。
-            hit = _readback_drafts(
-                ptype,
-                assets["title"],
-                cdp_endpoint if ptype == 1 else "",
-                require_image=(ptype == 12),
-            )
+            if ptype == 7:
+                hit = _readback_toutiao_draft(assets["title"])
+            else:
+                hit = _readback_drafts(
+                    ptype,
+                    assets["title"],
+                    cdp_endpoint if ptype == 1 else "",
+                    require_image=(ptype == 12),
+                )
             status = "已存草稿（标题与配图回读核验通过）" if hit else "存草稿未通过回读核验"
             if not hit:
                 raise RuntimeError(

@@ -2287,6 +2287,14 @@ class TouTiaoArticle(object):
             if _has_success():
                 break
             codes = [r.get("code") for r in responses]
+            # 账号级 7050：自动保存请求由头条页面自己发出（不是我们拼的参数），
+            # 封面、内文图、作品声明都齐全仍然连续被拒，多试无益。
+            # 2026-11-27 复测仍是此现象，草稿箱无新稿。早停，避免空转两分半。
+            if attempts >= 2 and codes and all(c == 7050 for c in codes):
+                toutiao_logger.error(
+                    "头条自动保存连续返回 code=7050（账号级拒绝，非参数缺失）：停止重试"
+                )
+                break
             toutiao_logger.info(
                 f"  自动保存尚未成功（已尝试 {attempts}/{max_attempts} 次，"
                 f"响应 codes={codes}），{wait_seconds}s 后再触发一次"
@@ -2320,8 +2328,15 @@ class TouTiaoArticle(object):
             )
 
         if not await self._verify_draft_in_list(page):
+            blocked = responses and all(r.get("code") == 7050 for r in responses)
+            hint = (
+                "；保存接口全程返回 code=7050（账号级拒绝），参数层面无法修复，"
+                "请改用「填入你日常浏览器 + 人工点预览并发布」"
+                if blocked else ""
+            )
             raise RuntimeError(
                 "头条草稿保存未通过核验：草稿箱未找到本期标题，不得让调用方误判为已存草稿"
+                + hint
             )
         toutiao_logger.success(f"✅ 头条草稿核验通过：草稿箱已出现「{self.title}」")
 
