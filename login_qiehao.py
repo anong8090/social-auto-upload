@@ -53,15 +53,12 @@ async def login_qiehao():
         for sec in range(600):
             await asyncio.sleep(1)
             cur_url = page.url.lower()
+            # 对齐 qiehao_uploader._has_auth_cookie：
+            # URL 进入 /main 即代表扫码登录完成；凭证名可能随平台改用 pt4_token。
             if "main" in cur_url or ("om.qq.com" in cur_url and "userauth" not in cur_url and "login" not in cur_url):
-                try:
-                    cookies = await context.cookies()
-                    if any(c.get("name") in ("om_token", "uin", "skey", "p_skey") for c in cookies):
-                        logged_in = True
-                        print(f"✅ 检测到企鹅号登录成功！URL: {page.url}")
-                        break
-                except Exception:
-                    pass
+                logged_in = True
+                print(f"✅ 检测到企鹅号后台页面（登录成功）！URL: {page.url}")
+                break
 
             if sec > 0 and sec % 30 == 0:
                 print(f"⏳ 等待登录中... 已过 {sec} 秒，当前 URL: {page.url}")
@@ -72,6 +69,9 @@ async def login_qiehao():
             return False
 
         await page.wait_for_timeout(3000)
+        cookies = await context.cookies()
+        auth_names = sorted({c.get("name") for c in cookies} & {"om_token", "uin", "skey", "p_skey", "pt4_token"})
+        print(f"🔑 登录会话凭证: {auth_names if auth_names else '未识别到标准凭证名（后台页面 /main 本身可作有效判据）'}")
         await context.storage_state(path=str(COOKIE_FILE))
         print(f"💾 Cookie 已保存至: {COOKIE_FILE}")
 

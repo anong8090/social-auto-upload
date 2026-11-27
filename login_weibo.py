@@ -54,21 +54,21 @@ async def login_weibo():
         logged_in = False
         for sec in range(600):
             await asyncio.sleep(1)
-            # 校验 SUB cookie
+            # 对齐 weibo_uploader._has_auth_cookie：SUB 只是会话起点，
+            # 上传器还要求 ALF / SSOLoginState 等会话凭证，且页面不能停在登录页。
+            cur_url = page.url.lower()
+            login_page = any(k in cur_url for k in ("/login", "passport", "visitor", "newlogin", "openlogin"))
             try:
                 cookies = await context.cookies()
-                if any(c.get("name") == "SUB" and c.get("value") for c in cookies):
+                names = {c.get("name") for c in cookies}
+                has_sub = "SUB" in names
+                has_session = bool(names & {"SSOLoginState", "ALF", "unick", "wvr", "WBStorage"})
+                if has_sub and has_session and not login_page and "weibo.com" in cur_url:
                     logged_in = True
-                    print(f"✅ 检测到 SUB 登录凭证，登录成功！URL: {page.url}")
+                    print(f"✅ 检测到微博登录会话凭证（SUB + 会话 cookie），登录成功！URL: {page.url}")
                     break
             except Exception:
                 pass
-
-            cur_url = page.url.lower()
-            if "weibo.com" in cur_url and "/login" not in cur_url and "passport" not in cur_url and "visitor" not in cur_url:
-                logged_in = True
-                print(f"✅ 检测到已离开登录页，登录成功！URL: {page.url}")
-                break
 
             if sec > 0 and sec % 30 == 0:
                 print(f"⏳ 等待登录中... 已过 {sec} 秒，当前 URL: {page.url}")

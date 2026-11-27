@@ -15,5 +15,22 @@
       "layout": "path",
       "theme": "模型只选路，不算数"
     }
+  },
+  "影子期不是延迟上线": {
+    "01_16x9_影子期不是延迟上线.png": {
+      "hash": "c4534bd63fc89339",
+      "layout": "compare",
+      "theme": "影子期不是延迟上线"
+    },
+    "02_16x9_影子期不是延迟上线.png": {
+      "hash": "a7e3161511dda4fc",
+      "layout": "cards",
+      "theme": "影子期只记两笔账"
+    },
+    "03_16x9_影子期不是延迟上线.png": {
+      "hash": "545d739e59df30ae",
+      "layout": "path",
+      "theme": "影子期要有退出条件"
+    }
   }
 }

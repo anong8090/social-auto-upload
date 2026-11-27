@@ -7,7 +7,10 @@
 """
 
 import asyncio
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from conf import BASE_DIR
 from uploader.zhihu_uploader.main import zhihu_setup
