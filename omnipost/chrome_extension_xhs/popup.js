@@ -2,6 +2,13 @@ const BRIDGE = "http://127.0.0.1:5419";
 
 const $ = (id) => document.getElementById(id);
 
+// 内容脚本会逐步回传进度，弹窗开着时实时显示，避免长时间停在「正在填入…」
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "LX_PROGRESS") {
+    setStatus(`正在填入：${msg.text}`);
+  }
+});
+
 const PLATFORMS = {
   xhs: {
     label: "小红书（上传图文页）",
@@ -33,9 +40,21 @@ async function detectPlatform() {
   const url = (tab && tab.url) || "";
   const key = Object.keys(PLATFORMS).find((k) => PLATFORMS[k].match.test(url));
   platform = key ? { key, tab, ...PLATFORMS[key] } : null;
-  $("platform").textContent = platform
-    ? `当前页：${platform.label}`
-    : "当前页不是小红书/头条发布页，请先打开对应页面";
+  if (!platform) {
+    $("platform").textContent = "当前页不是小红书/头条发布页，请先打开对应页面";
+    return platform;
+  }
+  let connected = false;
+  try {
+    const pong = await chrome.tabs.sendMessage(platform.tab.id, { type: platform.ping });
+    connected = !!(pong && pong.ok);
+  } catch (_) {
+    connected = false;
+  }
+  platform.connected = connected;
+  $("platform").textContent =
+    `当前页：${platform.label} · ` +
+    (connected ? "页面脚本已连接" : "页面脚本未注入（填入时自动注入，建议先刷新页面）");
   return platform;
 }
 
@@ -137,9 +156,26 @@ async function loadPayload() {
 async function ensureContentScript(tabId, platform) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: platform.ping });
+    return "已连接页面脚本";
   } catch (_) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: [platform.file] });
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: [platform.file] });
+      // 让新注入的脚本完成监听注册，再发填入指令
+      await new Promise((r) => setTimeout(r, 200));
+      return "已注入页面脚本";
+    } catch (err) {
+      throw new Error(
+        `注入页面脚本失败：${err.message || err}\n请刷新这个发布页（Cmd+R）后再试`
+      );
+    }
   }
+}
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
 }
 
 async function fillCurrentTab() {
@@ -147,11 +183,12 @@ async function fillCurrentTab() {
   setStatus("正在填入…");
   $("fill").disabled = true;
   try {
-    await ensureContentScript(platform.tab.id, platform);
-    const result = await chrome.tabs.sendMessage(platform.tab.id, {
-      type: platform.fill,
-      payload,
-    });
+    const linked = await ensureContentScript(platform.tab.id, platform);
+    const result = await withTimeout(
+      chrome.tabs.sendMessage(platform.tab.id, { type: platform.fill, payload }),
+      180000,
+      `${linked}，但填入超过 180 秒没有返回。请刷新发布页后重试。`
+    );
     if (!result || !result.ok) throw new Error((result && result.error) || "填入失败");
     setStatus(result.steps.join("\n"));
   } catch (err) {

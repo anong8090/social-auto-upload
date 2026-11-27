@@ -220,8 +220,15 @@
 1. **内容规则**：每日单独指定内容，主题为「河狸云 AI 能力分享」，**不指定（不提及）蓝枢 / Planora**；同一份内容分发到各平台；**只能存草稿**，绝不发布。
    - **今日头条（2026-11-27 新增）**：从蓝枢主线剥离，改由本内容线承接。短稿 `publish_ai_share.py --platforms 7`、长文 `publish_ai_share_longform.py --platforms 7` 均走 `save=0` 存草稿并回读核验；正文先经 `to_plain_text()` 清掉 `##` 与加粗标记（头条编辑器是富文本，会原样显示井号）。
    - **头条草稿被账号级 `7050` 拒绝时**：不要改参数、不要用 `save=1` 探测。
-   - **日常浏览器直填（首选）**：Chrome 需开启「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」。内容由 `omnipost/scripts/xhs_fill_bridge.py` 只读提供，`omnipost/scripts/fill_daily_browser.py` 用 AppleScript 直接在用户正在用的 Chrome 标签页填入标题/正文/配图/声明，不点发布。小红书与头条共用这条链路。
-   - **备选**：Chrome 扩展 `omnipost/chrome_extension_xhs/`（不想开上述开关时用），行为相同。
+   - **日常浏览器直填（2026-11-27 已实测跑通）**：
+     1. 启动只读桥接：`omnipost/.venv/bin/python omnipost/scripts/xhs_fill_bridge.py`；
+     2. Chrome 加载扩展 `omnipost/chrome_extension_xhs/`（一次性）；
+     3. 打开地址即自动填入，不需要点弹窗：
+        `https://creator.xiaohongshu.com/publish/publish?target=image&lx_fill=<目录>&lx_kind=<daily|long>`
+        头条同理，打开 `https://mp.toutiao.com/profile_v4/graphic/publish?lx_fill=<目录>&lx_kind=long`。
+     4. 标签页标题实时反映进度，结束时为 `填入完成·N 步（未发布）` 或 `填入失败·原因`；可用 AppleScript 只读标题来监控，无需调试端口。
+     5. 人复核后自己点「暂存离开」/「预览并发布」，自动化绝不点发布。
+   - **AppleScript 直填（备选）**：`omnipost/scripts/fill_daily_browser.py`。需要 Chrome 开启「查看 → 开发者 → 允许 Apple 事件中的 JavaScript」；该开关关闭时脚本会直接报缺开关，不会误报成页面问题。
    - **个人 IP 调性**：以「一个做工程数字化产品的人，今天想明白的一件小事」为第一人称视角，重判断、边界与反思，轻功能清单和功能宣讲；不套用主线「痛点 1/2/3 → 解决方案 → 避坑清单」的结构。
    - **平台形态分流（2026-11-26 用户明确）**：微信公众号文章按**长文**制作，不套每日 180~320 字的短稿闸门；默认 500 字以上、2~3 个小标题、3 张 16:9 横图按段落穿插。小红书继续使用 180~320 字精炼稿与 3:4 竖图。需要同一判断双平台发布时，先写公众号长文，再单独提炼小红书短稿，禁止把短稿加一张竖图直接当公众号文章。
    - **精炼硬闸门（仅小红书/每日短稿）**：`内容.md` 去掉 Markdown 标记与话题标签后的正文为 **180~320 个中文字符**，最多 3 个自然段，最多 1 个小标题；明显短于蓝枢母本 A（300~500 字）与母本 B（800~1100 字）。
