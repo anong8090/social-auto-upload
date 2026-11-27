@@ -15,8 +15,11 @@ from typing import List
 
 from playwright.async_api import Page, Playwright, async_playwright
 
-from conf import LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from utils.log import sohu_logger
+
+# 与 publish_episode / 其他上传器一致的插图位置标记
+INLINE_MARKER_RE = re.compile(r"\[\[插图(\d+)\]\]")
 
 
 async def _prepare_context(context):
@@ -61,6 +64,65 @@ SOHU_INFO_SOURCE_OPTIONS = (
 SOHU_INFO_SOURCE_DEFAULT = "无需声明"
 # AI 声明对应的选项，供「必须勾上 AI 声明」的场景直接引用
 SOHU_INFO_SOURCE_AI = "含有AI生成内容"
+
+
+def find_draft_edit_url(account_files, title: str, *, headless: bool = True) -> str:
+    """按标题从搜狐号内容管理页找出既有草稿的编辑入口，供原位修补使用。
+
+    只读内容管理页，不修改、不新建、不删除任何平台草稿。返回编辑页 URL。
+    """
+    async def _find() -> str:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                **_build_launch_kwargs(headless=headless)
+            )
+            try:
+                for name in account_files:
+                    path = Path(BASE_DIR) / "cookiesFile" / name
+                    if not path.is_file():
+                        continue
+                    context = await browser.new_context(
+                        storage_state=str(path),
+                        viewport={"width": 1440, "height": 900},
+                    )
+                    context = await _prepare_context(context)
+                    page = await context.new_page()
+                    await page.goto(
+                        SOHU_FIRST_PAGE_URL, timeout=90000,
+                        wait_until="domcontentloaded",
+                    )
+                    await page.wait_for_timeout(6000)
+                    item = page.locator("li.content-item").filter(has_text=title).first
+                    if not await item.count():
+                        continue
+                    edit = item.locator(".article-content-util .item-btn").filter(
+                        has_text="编辑"
+                    ).first
+                    if not await edit.count():
+                        continue
+                    preview = item.locator('a[href*="articlepreview"]').first
+                    href = await preview.get_attribute("href") or ""
+                    match = re.search(r"id=(\d+)", href)
+                    if not match:
+                        continue
+                    await edit.click()
+                    await page.wait_for_timeout(4000)
+                    url = page.url
+                    if "addarticle" in url and "id=" not in url:
+                        # 部分版本编辑按钮打开新标签页
+                        for ctx in browser.contexts:
+                            for candidate in ctx.pages:
+                                if candidate is not page and "addarticle" in candidate.url:
+                                    if "id=" in candidate.url:
+                                        return candidate.url
+                    if match.group(1) in url or "addarticle" in url:
+                        return url
+                    return f"{SOHU_FIRST_PAGE_URL}?editId={match.group(1)}"
+            finally:
+                await browser.close()
+            return ""
+
+    return asyncio.run(_find())
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
@@ -216,6 +278,8 @@ class SoHuArticle(object):
         info_source=None,
         inline_image_paths=None,
         is_draft=False,
+        existing_draft_url="",
+        patch_existing_draft=False,
     ):
         self.title = (title or "").strip()[:72]
         if len(self.title) < 5:
@@ -238,6 +302,10 @@ class SoHuArticle(object):
             str(Path(p).resolve()) for p in (inline_image_paths or [])
             if p and Path(p).is_file()
         ]
+        # 既有草稿补丁：打开平台侧草稿编辑页，重排正文与插图后保存，
+        # 绝不新建第二篇同题草稿。
+        self.existing_draft_url = str(existing_draft_url or "").strip()
+        self.patch_existing_draft = bool(patch_existing_draft)
 
     @staticmethod
     def _normalize_cover_paths(cover_path, cover_paths) -> list[str]:
@@ -329,6 +397,15 @@ class SoHuArticle(object):
                 continue
         if not title_field:
             raise RuntimeError("未找到搜狐号文章标题输入框")
+
+        if self.patch_existing_draft:
+            actual = await title_field.input_value()
+            if (actual or "").strip() != self.title:
+                raise RuntimeError(
+                    f"搜狐既有草稿标题不匹配：期望「{self.title}」，实际「{(actual or '')[:40]}」"
+                )
+            sohu_logger.info(f"保留搜狐既有草稿标题: {actual}")
+            return
 
         await title_field.click(force=True)
         await title_field.fill("")
@@ -586,6 +663,59 @@ class SoHuArticle(object):
                 await self._dismiss_upload_mask(page)
             finally:
                 await self._dismiss_upload_mask(page)
+
+    async def _fill_body_with_inline_images(self, page: Page) -> None:
+        """按 `[[插图N]]` 标记把内文图插到母本指定位置（而非统一堆在文末）。
+
+        逐段输入正文，遇到标记就上传对应图片；最后回读编辑器确认标记已消失、
+        图片数量正确。任何一步失败都中止，避免把位置标记或残缺正文存进草稿。
+        """
+        paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
+        parts = INLINE_MARKER_RE.split(self.body or "")
+        expected = [int(x) for x in INLINE_MARKER_RE.findall(self.body or "")]
+        if not expected or sorted(expected) != list(range(1, len(paths) + 1)):
+            raise RuntimeError(
+                f"搜狐插图标记与内文图数量不一致: markers={expected}, images={len(paths)}"
+            )
+
+        _frame, editor = await self._find_editor(page)
+        if not editor:
+            raise RuntimeError("未找到搜狐号正文编辑器")
+        await editor.click(force=True)
+        await page.keyboard.press("ControlOrMeta+a")
+        await page.keyboard.press("Delete")
+        await page.wait_for_timeout(300)
+
+        async def type_chunk(text: str) -> None:
+            lines = text.strip("\n").splitlines()
+            for idx, line in enumerate(lines):
+                if idx:
+                    await page.keyboard.press("Enter")
+                if line.strip():
+                    await page.keyboard.insert_text(line)
+
+        for i in range(0, len(parts), 2):
+            if parts[i].strip():
+                await type_chunk(parts[i])
+            if i + 1 >= len(parts):
+                break
+            marker_no = int(parts[i + 1])
+            # 在标记位置上传对应图片（复用批量上传弹窗的单图路径）
+            before = await self._editor_image_count(page)
+            await self._upload_images_at_once(page, [paths[marker_no - 1]])
+            after = await self._editor_image_count(page)
+            if after <= before:
+                raise RuntimeError(f"搜狐插图 {marker_no} 未进入正文（img {before}→{after}）")
+            sohu_logger.info(f"搜狐插图 {marker_no} 已插入到正文指定位置")
+
+        actual = await editor.inner_text()
+        left = INLINE_MARKER_RE.findall(actual or "")
+        if left:
+            raise RuntimeError(f"搜狐正文插图标记未被替换: {left}")
+        total = await self._editor_image_count(page)
+        if total < len(paths):
+            raise RuntimeError(f"搜狐正文图片数不足: {total}/{len(paths)}")
+        sohu_logger.info(f"搜狐正文按标记插入 {len(paths)} 张内文图，图片总数={total}")
 
     async def _insert_inline_images(self, page: Page) -> None:
         """把 16:9 内文配图插入正文末尾。
@@ -1521,6 +1651,22 @@ class SoHuArticle(object):
         return False
 
     async def _open_article_editor(self, page: Page) -> None:
+        if self.patch_existing_draft:
+            if not self.existing_draft_url:
+                raise RuntimeError("搜狐既有草稿修补缺少编辑页 URL")
+            sohu_logger.info(f"打开搜狐既有草稿编辑页: {self.existing_draft_url}")
+            await page.goto(
+                self.existing_draft_url, timeout=90000,
+                wait_until="domcontentloaded",
+            )
+            await page.wait_for_timeout(5000)
+            await _dismiss_overlays(page)
+            if _is_login_url(page.url):
+                raise RuntimeError("搜狐号 cookie 已失效，请重新登录")
+            if not await self._wait_publish_form(page, timeout_sec=90):
+                raise RuntimeError("搜狐既有草稿编辑页未就绪，禁止新建同题草稿")
+            return
+
         opened = False
 
         # 1) 优先菜单进入（探测证实：点击「发布内容」会到 addarticle）
@@ -1587,8 +1733,12 @@ class SoHuArticle(object):
 
         await self.fill_title(page)
         await page.wait_for_timeout(500)
-        await self.fill_body(page)
-        await self._insert_inline_images(page)
+        if INLINE_MARKER_RE.search(self.body or ""):
+            # 带插图标记：逐段输入正文并在标记位置插图，不再统一堆到文末。
+            await self._fill_body_with_inline_images(page)
+        else:
+            await self.fill_body(page)
+            await self._insert_inline_images(page)
         await self.fill_tags(page)
         await self.handle_cover(page)
         await self.apply_info_source(page)

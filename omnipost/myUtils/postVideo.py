@@ -487,6 +487,8 @@ def post_article_sohu(
     cover_paths=None,
     inline_image_paths=None,
     is_draft=False,
+    existing_draft_url="",
+    patch_existing_draft=False,
 ):
     """搜狐号图文文章发布（type=8, contentType=article）。
 
@@ -564,6 +566,8 @@ def post_article_sohu(
             info_source=info_source,
             inline_image_paths=inline_image_paths,
             is_draft=is_draft,
+            existing_draft_url=existing_draft_url,
+            patch_existing_draft=patch_existing_draft,
         )
         # dry_run 默认也使用 headless 模式（LOCAL_CHROME_HEADLESS=True），不弹窗
         # 如需调试可见窗口，请显式传入 headless=False

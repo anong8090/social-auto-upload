@@ -67,8 +67,11 @@ TIEBA_FALLBACK_BAR = "市政工程"
 
 # 微信公众号只承接个人 IP 独立线（publish_ai_share.py），2026-11-12 用户明确
 # 「不要发蓝枢的内容」。主线显式 --platforms 12 也必须硬拦截，不能靠选台遗漏规避。
+# 2026-11-27 用户决定把公众号、小红书、今日头条一起做成个人 IP：
+# 头条（7）同样退出蓝枢主线，改由个人 IP 独立线存草稿。
 MAINLINE_FORBIDDEN_PLATFORMS = {
     12: "微信公众号仅用于个人 IP 独立线，禁止发布蓝枢主线内容",
+    7: "今日头条已转为个人 IP 独立线（publish_ai_share.py），禁止发布蓝枢主线内容",
 }
 
 # 2026-11-18 第23期今日头条重复发布复盘：
@@ -314,9 +317,9 @@ def load_assets(episode: str, material_root: Path, explicit_dir: Optional[Path])
             gallery = [cover]
 
     inline_count = len(inline or [])
-    # 知乎、企鹅号、大鱼号上传器已支持按标记把图片精确插到母本指定位置；
+    # 知乎、企鹅号、大鱼号、搜狐号上传器已支持按标记把图片精确插到母本指定位置；
     # 其余平台仍沿用原正文（图片追加到末尾），避免把位置标记发到线上。
-    inline_marker_platforms = (9, 14, 15)
+    inline_marker_platforms = (8, 9, 14, 15)
     # 专属母本只对部分平台存在；支持精确插图的平台即使回退到通用母本，
     # 也必须保留 [[插图N]]，否则上传器会静默写出 0 张内文图的草稿。
     long_body_with_markers = _body_with_inline_markers(long_raw, inline_count)
@@ -359,7 +362,9 @@ from scripts.compliance_check import compliance_check, ComplianceRuleError
 
 def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
               account_list: List[str], *, dry_run: bool, is_draft: bool, tieba_kw: str = "",
-              patch_existing_dayu_draft: bool = False, toutiao_prepare_only: bool = False) -> None:
+              patch_existing_dayu_draft: bool = False,
+              patch_existing_sohu_draft: bool = False,
+              toutiao_prepare_only: bool = False) -> None:
     """调用对应平台的 post_article_*。导入放在函数内，避免 CLI 启动即加载全部浏览器依赖。"""
     from myUtils.postVideo import (
         post_article_baijiahao,
@@ -406,12 +411,22 @@ def _dispatch(platform_type: int, assets: Dict[str, Any], title: str, body: str,
     elif platform_type == 8:
         # 搜狐号发文页只有一个「必选声明」单选组，选项真实文案是「含有AI生成内容」。
         # 传旧文案「包含AI创作内容」选不中，AI 声明会静默缺失。
+        existing_sohu_url = ""
+        if patch_existing_sohu_draft:
+            from uploader.sohu_uploader.main import find_draft_edit_url
+            existing_sohu_url = find_draft_edit_url(
+                account_list, title, headless=True
+            )
+            if not existing_sohu_url:
+                raise RuntimeError(f"搜狐号草稿箱未找到本期标题，无法修补既有草稿: {title}")
         return post_article_sohu(
             title, body, tags, account_list,
             cover_paths=[cover] if cover else [],
             inline_image_paths=inline,
             info_source="含有AI生成内容",
             is_draft=is_draft,
+            existing_draft_url=existing_sohu_url,
+            patch_existing_draft=patch_existing_sohu_draft,
             **common,
         )
     elif platform_type == 9:
@@ -752,6 +767,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="修补大鱼号本篇既有草稿：打开草稿编辑页补齐内文图/封面并保存，不新建重复草稿",
     )
     parser.add_argument(
+        "--patch-existing-sohu-draft", action="store_true",
+        help="修补搜狐号本篇既有草稿：打开草稿编辑页重排正文内文图并保存，不新建重复草稿",
+    )
+    parser.add_argument(
         "--toutiao-prepare-only", action="store_true",
         help="今日头条代填（默认已是这个行为）：可见浏览器填好后由人工发布，不发保存请求、不点发布",
     )
@@ -1087,6 +1106,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     is_draft=True if use_prepare else draft_only,
                     tieba_kw=tieba_kw,
                     patch_existing_dayu_draft=args.patch_existing_dayu_draft,
+                    patch_existing_sohu_draft=args.patch_existing_sohu_draft,
                     toutiao_prepare_only=use_prepare,
                 ) or ""
             ).strip()
