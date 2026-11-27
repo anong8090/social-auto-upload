@@ -137,10 +137,18 @@ async def _cookie_auth_ok(page: Page) -> bool:
     url = page.url
     if _is_login_url(url):
         return False
+    # mp.sohu.com 的游客首页也有「发布内容」链接，不能只看域名/链接判有效。
+    # 必须确认已登录：内容管理页、创作中心，或页面不再出现「登录」入口。
+    if "contentManagement" in url or "mp.sohu.com/home" in url:
+        if await _has_dashboard_markers(page):
+            return True
     if await _has_dashboard_markers(page):
-        return True
-    if "mp.sohu.com" in url and not _is_login_url(url):
-        return True
+        try:
+            body = (await page.locator("body").inner_text())[:300] or ""
+            if "登录" not in body and ("创作中心" in body or "内容管理" in body or "我的搜狐号" in body):
+                return True
+        except Exception:
+            pass
     return False
 
 
