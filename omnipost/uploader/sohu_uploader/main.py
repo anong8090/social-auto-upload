@@ -544,11 +544,16 @@ class SoHuArticle(object):
         except Exception:
             return 0
 
-    async def _open_image_dialog(self, page: Page) -> None:
-        """点击工具栏图片按钮，直到上传弹窗的 file input 出现。"""
-        editor = page.locator(".ql-editor").first
-        await editor.click(force=True)
-        await page.wait_for_timeout(500)
+    async def _open_image_dialog(self, page: Page, focus_editor: bool = True) -> None:
+        """点击工具栏图片按钮，直到上传弹窗的 file input 出现。
+
+        focus_editor=False 用于「先全文粘贴、再定位插图」的流程：此时选区已经
+        落在目标段落，再点击编辑器会把光标重置到文首/文末，导致图片堆在一起。
+        """
+        if focus_editor:
+            editor = page.locator(".ql-editor").first
+            await editor.click(force=True)
+            await page.wait_for_timeout(500)
 
         btn = None
         for sel in (
@@ -606,9 +611,9 @@ class SoHuArticle(object):
             pass
         await page.wait_for_timeout(1000)
 
-    async def _upload_images_at_once(self, page: Page, paths: List[Path]) -> None:
+    async def _upload_images_at_once(self, page: Page, paths: List[Path], focus_editor: bool = True) -> None:
         """弹窗支持多选：一次选中全部配图，避免第二张被残留遮罩拦截。"""
-        await self._open_image_dialog(page)
+        await self._open_image_dialog(page, focus_editor=focus_editor)
         file_input = page.locator('.win-mask input[type="file"]').last
         await file_input.set_input_files([str(p) for p in paths])
 
@@ -667,8 +672,9 @@ class SoHuArticle(object):
     async def _fill_body_with_inline_images(self, page: Page) -> None:
         """按 `[[插图N]]` 标记把内文图插到母本指定位置（而非统一堆在文末）。
 
-        逐段输入正文，遇到标记就上传对应图片；最后回读编辑器确认标记已消失、
-        图片数量正确。任何一步失败都中止，避免把位置标记或残缺正文存进草稿。
+        先一次性粘贴完整正文（保留段落顺序），再**从后往前**把图片插到锚点段落
+        末尾。倒序是为了避免前面的插图改变后面段落的 DOM 位置；插图时不再点击
+        编辑器，否则 Quill 会把光标重置，导致图片叠在一起、后续正文错位。
         """
         paths = [Path(p) for p in self.inline_image_paths if Path(p).is_file()]
         parts = INLINE_MARKER_RE.split(self.body or "")
@@ -681,32 +687,55 @@ class SoHuArticle(object):
         _frame, editor = await self._find_editor(page)
         if not editor:
             raise RuntimeError("未找到搜狐号正文编辑器")
-        await editor.click(force=True)
-        await page.keyboard.press("ControlOrMeta+a")
-        await page.keyboard.press("Delete")
-        await page.wait_for_timeout(300)
 
-        async def type_chunk(text: str) -> None:
-            lines = text.strip("\n").splitlines()
-            for idx, line in enumerate(lines):
-                if idx:
-                    await page.keyboard.press("Enter")
-                if line.strip():
-                    await page.keyboard.insert_text(line)
+        # 标记行只作为锚点，正文先完整粘贴一次，避免出现「文字没输完就插图」的错位。
+        clean_body = "\n".join(
+            line for line in (self.body or "").splitlines()
+            if not INLINE_MARKER_RE.fullmatch(line.strip())
+        )
+        await self._paste_or_type_text(page, editor, clean_body.strip())
+        await page.wait_for_timeout(1000)
 
-        for i in range(0, len(parts), 2):
-            if parts[i].strip():
-                await type_chunk(parts[i])
-            if i + 1 >= len(parts):
-                break
-            marker_no = int(parts[i + 1])
-            # 在标记位置上传对应图片（复用批量上传弹窗的单图路径）
+        # 锚点用插图标记后的首段文字定位；倒序插入，前面的插入不影响后面的选区。
+        # 不能用插图前一段：`End` 只到视觉行尾，长段落会被图片截断、尾句掉到图片后面。
+        anchors = []
+        for i in range(1, len(parts), 2):
+            marker_no = int(parts[i])
+            prev_part = parts[i - 1] if i > 0 else ""
+            # 插图落在插图标记前的最后一段：通常是完整的一节末尾段落，
+            # 不会因为插图切断长段落；下一节标题另起一段，图片自然与后文隔开。
+            prev_lines = [line.strip() for line in prev_part.splitlines() if line.strip()]
+            anchors.append((marker_no, prev_lines[-1] if prev_lines else ""))
+
+        for marker_no, anchor in reversed(anchors):
+            if not anchor:
+                raise RuntimeError(f"搜狐插图 {marker_no} 找不到锚点段落")
+            para = editor.locator("p").filter(has_text=anchor).last
+            if not await para.count():
+                raise RuntimeError(f"搜狐插图 {marker_no} 锚点段落未写入正文: {anchor[:30]}")
+            # DOM Range 把选区放到段落全部文本的末尾；keyboard.End 只到视觉行尾，
+            # 会在长段落中间插图，把尾句挤到图片之后。
+            await para.evaluate(
+                """el => {
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    el.focus({ preventScroll: true });
+                }"""
+            )
+            await page.wait_for_timeout(300)
             before = await self._editor_image_count(page)
-            await self._upload_images_at_once(page, [paths[marker_no - 1]])
+            # focus_editor=False：保留上面点出来的光标，不能再点编辑器重置选区。
+            await self._upload_images_at_once(
+                page, [paths[marker_no - 1]], focus_editor=False
+            )
             after = await self._editor_image_count(page)
             if after <= before:
                 raise RuntimeError(f"搜狐插图 {marker_no} 未进入正文（img {before}→{after}）")
-            sohu_logger.info(f"搜狐插图 {marker_no} 已插入到正文指定位置")
+            sohu_logger.info(f"搜狐插图 {marker_no} 已插入到「{anchor[:18]}」段后")
 
         actual = await editor.inner_text()
         left = INLINE_MARKER_RE.findall(actual or "")
@@ -715,7 +744,32 @@ class SoHuArticle(object):
         total = await self._editor_image_count(page)
         if total < len(paths):
             raise RuntimeError(f"搜狐正文图片数不足: {total}/{len(paths)}")
-        sohu_logger.info(f"搜狐正文按标记插入 {len(paths)} 张内文图，图片总数={total}")
+        # 每图都必须独占一个图片段落，且各图片段落之间夹着正文段落，
+        # 否则视觉上仍是「连在一起」。
+        top_nodes = await editor.evaluate(
+            """() => Array.from(document.querySelector('.ql-editor').childNodes)
+                .map(n => ({
+                    image: (n.matches?.('img') || n.classList?.contains('ql-image-container')
+                            || !!n.querySelector?.('img')),
+                    text: (n.textContent || '').replace(/\\s+/g, ' ').trim(),
+                }))"""
+        )
+        image_indexes = [i for i, node in enumerate(top_nodes) if node["image"]]
+        if len(image_indexes) != len(paths):
+            raise RuntimeError(f"搜狐内文图数量不符: {len(image_indexes)}/{len(paths)}")
+        for prev, nxt in zip(image_indexes, image_indexes[1:]):
+            # 搜狐的 Quill 图片块常带一个空的抓取占位 P；只要求图片块之间
+            # 至少有一个非空正文节点即可，不要求紧邻的下一节点就是正文。
+            between = [node["text"] for node in top_nodes[prev + 1:nxt] if node["text"]]
+            if nxt - prev < 2 or not between:
+                raise RuntimeError(
+                    "搜狐内文图之间缺少正文段落，图片仍连在一起: "
+                    f"indexes={image_indexes}"
+                )
+        sohu_logger.info(
+            f"搜狐正文按标记插入 {len(paths)} 张内文图，图片总数={total}，"
+            f"图片顶层节点索引={image_indexes}"
+        )
 
     async def _insert_inline_images(self, page: Page) -> None:
         """把 16:9 内文配图插入正文末尾。
